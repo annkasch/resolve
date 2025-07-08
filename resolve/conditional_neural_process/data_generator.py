@@ -176,6 +176,8 @@ class DataGeneration(object):
         self.dataloader="None"
         self.config_file=config_file
         self.files_per_batch = files_per_batch
+        self.feature_mean = None
+        self.feature_std = None
 
         _phi_key="phi"
         _theta_key="theta"
@@ -196,12 +198,17 @@ class DataGeneration(object):
                     self.mixup_augment_data(file,config_file["cnp_settings"]["use_beta"],signal_condition)
                     _phi_key="phi_mixedup"
                     _target_key="target_mixedup"
-
+        
         self.parameters={'phi': {'key': _phi_key,'label_key': "phi_labels",'selected_labels': _names_phi}, 
                         'theta': {'key': _theta_key,'label_key': "theta_headers",'selected_labels': _names_theta}, 
                         'target': {'key': _target_key,'label_key': "target_headers",'selected_labels': self._names_target}}
+        
+        
 
     def set_loader(self):
+        if self.feature_mean is None or self.feature_std is None:
+            self.compute_feature_stats()
+        
         dataset = HDF5Dataset(self.path_to_files, self._batch_size, files_per_batch=self.files_per_batch, parameters=self.parameters)
         self.dataloader = DataLoader(dataset, batch_size=None, num_workers=self.config_file["cnp_settings"]["number_of_walkers"], prefetch_factor=2) 
 
@@ -358,6 +365,73 @@ class DataGeneration(object):
                 del f["signal_condition"]
             f.create_dataset("signal_condition", data=np.array(condition_strings, dtype="S"))
 
+    def compute_feature_stats(self):
+        """
+        Computes the global mean and std of features (theta + phi),
+        using the feature key currently set in self.parameters['phi']['key'].
+        
+        This supports both original and mixup-augmented data, depending on whether
+        mixup was enabled during DataGeneration init (via parameter overwriting).
+        
+        Stores:
+            self.feature_mean: torch.Tensor of shape (1, D)
+            self.feature_std:  torch.Tensor of shape (1, D)
+        """
+        phi_key = self.parameters['phi']['key']
+
+        file_list = sorted([
+            os.path.join(self.path_to_files, f)
+            for f in os.listdir(self.path_to_files)
+            if f.endswith(".h5")
+        ])
+
+        sum_features = None
+        sum_squared = None
+        total_count = 0
+
+        for file in tqdm(file_list, desc="Computing global feature mean"):
+            with h5py.File(file, "r") as f:
+                if phi_key not in f:
+                    print(f"Warning: '{phi_key}' not found in {file}. Skipping.")
+                    continue
+
+                # Read selected phi features
+                phi_indices = utils.read_selected_indices(file, self.parameters['phi'])
+                phi = np.array(f[phi_key][:, phi_indices])
+
+                # Read and broadcast theta
+                if self.parameters['theta']['selected_labels']:
+                    theta_indices = utils.read_selected_indices(file, self.parameters['theta'])
+                    theta_data = f[self.parameters['theta']['key']]
+                    if len(theta_data.shape) == 1:
+                        theta = np.tile(theta_data[theta_indices], (phi.shape[0], 1))
+                    else:
+                        theta = theta_data[:, theta_indices]
+                    features = np.hstack([theta, phi])
+                else:
+                    features = phi
+
+                # Accumulate sum and sum of squares
+                if sum_features is None:
+                    sum_features = np.sum(features, axis=0)
+                    sum_squared = np.sum(features ** 2, axis=0)
+                else:
+                    sum_features += np.sum(features, axis=0)
+                    sum_squared += np.sum(features ** 2, axis=0)
+
+                total_count += features.shape[0]
+
+        if total_count == 0:
+            raise ValueError(f"No samples found using key '{phi_key}'")
+
+        mean = sum_features / total_count
+        std = np.sqrt((sum_squared / total_count) - (mean ** 2) + 1e-8)
+
+        self.feature_mean = torch.tensor(mean, dtype=torch.float32).unsqueeze(0)
+        self.feature_std = torch.tensor(std, dtype=torch.float32).unsqueeze(0)
+
+        print("Feature mean/std computation completed.")
+    
     def format_batch_for_cnp(self,batch, context_is_subset=True):
         """
         Formats a batch into the query format required for CNP training with dynamic batch splitting.
@@ -383,11 +457,8 @@ class DataGeneration(object):
         # Split batch into input (X) and target (Y) features
         batch_x = batch[:,:self.feature_size]  # All features except last column (input features)
         # Z-score normalization for input features
-        if not hasattr(self, 'feature_mean') or not hasattr(self, 'feature_std'):
-            self.feature_mean = batch_x.mean(dim=0, keepdim=True)
-            self.feature_std = batch_x.std(dim=0, keepdim=True) + 1e-8  # add epsilon to avoid division by zero
-
-        batch_x = (batch_x - self.feature_mean) / self.feature_std
+        if self.feature_mean is None or self.feature_std is None:
+            batch_x = (batch_x - self.feature_mean) / self.feature_std
 
         batch_y = batch[:,self.feature_size:self.feature_size+self.target_size]   # Last column is the target (output values)
 
