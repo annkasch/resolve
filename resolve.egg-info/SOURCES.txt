@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 resolve.egg-info/PKG-INFO
 resolve.egg-info/SOURCES.txt

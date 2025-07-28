@@ -13,6 +13,7 @@ def set_random_seed(seed=42):
     random.seed(seed)           # Python's built-in random module
     np.random.seed(seed)        # NumPy random seed
     torch.manual_seed(seed)     # PyTorch random seed
+    torch.cuda.manual_seed_all(seed)  # if using GPU
 
     # Ensures reproducibility on GPU
     if torch.cuda.is_available():

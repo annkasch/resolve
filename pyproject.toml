@@ -28,7 +28,8 @@ dependencies = [
     "emukit==0.4.11",
     "backports.tarfile",
     "pymc==5.22.0",
-    "snap"
+    "snap",
+    "seaborn"
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

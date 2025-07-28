@@ -150,7 +150,6 @@ class HDF5Dataset(IterableDataset):
 
             # If all files and rows (from k*i to k*(i+1)) are read, reshuffle files for the row block
             if self.epoch_counter >= self.total_cycles_per_epoch:
-                print("Finished full dataset pass. Starting new epoch! ")
                 self.shuffle_files()
                 break
 
@@ -167,8 +166,7 @@ class DataGeneration(object):
         config_file,
         path_to_files,
         batch_size,
-        files_per_batch,
-        use_data_augmentation = False,
+        files_per_batch
     ):
         self._context_ratio = config_file["cnp_settings"]["context_ratio"]
         self._batch_size = batch_size
@@ -178,206 +176,283 @@ class DataGeneration(object):
         self.files_per_batch = files_per_batch
         self.feature_mean = None
         self.feature_std = None
+        self.use_normalization = config_file["feature_settings"]["use_normalization"]
 
         _phi_key="phi"
         _theta_key="theta"
         _target_key="target"
-        _names_theta=config_file["simulation_settings"]["theta_headers"]
+        self._names_theta=config_file["simulation_settings"]["theta_headers"]
         _names_phi=config_file["simulation_settings"]["phi_labels"]
         self._names_target =config_file["simulation_settings"]["target_headers"]
         self.feature_size,self.target_size=utils.get_feature_and_label_size(config_file)
         
         if not any(f.endswith(".h5") for f in os.listdir(path_to_files)):
             utils.convert_all_csv_to_hdf5(config_file)
-        
-        if mode != "testing":
-            if use_data_augmentation == "mixup":
+        self.parameters={'phi': {'key': _phi_key,'label_key': "phi_labels",'selected_labels': _names_phi}, 
+                        'theta': {'key': _theta_key,'label_key': "theta_headers",'selected_labels': self._names_theta}, 
+                        'target': {'key': _target_key,'label_key': "target_headers",'selected_labels': self._names_target}}
+
+        if mode == "training":
                 signal_condition = config_file["simulation_settings"]["signal_condition"]
                 files = sorted([os.path.join(path_to_files, f) for f in os.listdir(path_to_files) if f.endswith(".h5")])
-                for file in tqdm(files, total=len(files), desc="Data Augmentation in Progress"):
-                    self.mixup_augment_data(file,config_file["cnp_settings"]["use_beta"],signal_condition)
-                    _phi_key="phi_mixedup"
-                    _target_key="target_mixedup"
-        
-        self.parameters={'phi': {'key': _phi_key,'label_key': "phi_labels",'selected_labels': _names_phi}, 
-                        'theta': {'key': _theta_key,'label_key': "theta_headers",'selected_labels': _names_theta}, 
-                        'target': {'key': _target_key,'label_key': "target_headers",'selected_labels': self._names_target}}
-        
-        
+                for file in tqdm(files, total=len(files), desc="Data Processing in Progress"):
+                    self.split_and_mixup_augment(file,config_file["cnp_settings"]["split_ratio"] ,config_file["cnp_settings"]["use_beta"],signal_condition, config_file["cnp_settings"]["mixup_ratio"])
+                self.parameters["phi"]["key"]="phi_train"
+                self.parameters["target"]["key"]="target_train"
+        elif mode == "validation":
+                self.parameters["phi"]["key"]="phi_val"
+                self.parameters["target"]["key"]="target_val"
+        elif mode == "testing":
+                self.parameters["phi"]["key"]="phi_test"
+                self.parameters["target"]["key"]="target_test"
+        elif mode == "prediction":
+                self.parameters["phi"]["key"]="phi"
+                self.parameters["target"]["key"]="target"
 
     def set_loader(self):
-        if self.feature_mean is None or self.feature_std is None:
+        if (self.feature_mean is None or self.feature_std is None) and self.use_normalization != False:
             self.compute_feature_stats()
-        
+            self.config_file["feature_settings"]["x_mean"] = self.feature_mean.numpy().tolist()
+            self.config_file["feature_settings"]["x_std"] = self.feature_std.numpy().tolist()
+            
         dataset = HDF5Dataset(self.path_to_files, self._batch_size, files_per_batch=self.files_per_batch, parameters=self.parameters)
         self.dataloader = DataLoader(dataset, batch_size=None, num_workers=self.config_file["cnp_settings"]["number_of_walkers"], prefetch_factor=2) 
+        # write the feature mean and std from the training set to the config file
 
-    def mixup_augment_data(self,filename, use_beta,condition_strings, seed=42):
+
+    def split_and_mixup_augment(self, filename, split_ratio, use_beta, condition_strings, mixup_ratio=0.):
         """
-        Augments an imbalanced dataset using the "mixup" method for HDF5 files.
+        Splits the dataset into train/validation/test sets and optionally applies mixup augmentation.
 
-        Each background event is combined with a randomly drawn signal event using a weighted sum.
-        The ratio is drawn from either a uniform distribution or a beta distribution.
+        This function reads feature, label, and optional weight data from an HDF5 file, splits it into
+        60% training, 20% validation, and 20% test sets, and optionally augments the training set
+        using mixup (a weighted combination of signal and background events).
+        The signal events used in mixup are selected based on logical conditions applied to the
+        label columns.
 
         Args:
-            filename (str): Path to the HDF5 file.
-            use_beta (list or None): Distribution from which the ratio is drawn.
-                - `None`: Uniform distribution in [0,1].
-                - `[z1, z2]`: Beta distribution B(z1, z2).
-            config_file (dict): Preloaded YAML config dictionary.
+            filename (str): Path to the HDF5 file containing datasets.
+            use_beta (list or tuple or None): If provided, specifies the Beta distribution parameters
+                `[alpha, beta]` for sampling mixup weights. If None, mixup weights are sampled uniformly.
+            mixup_ratio (float): Fraction (between 0 and 1) of training samples to replace with mixup-augmented
+                samples. Set to 0.0 to disable mixup.
+            condition_strings (list of str): Logical conditions to define which events are considered "signal".
+                Example: ['Class==1', 'Energy>0.5']
 
         Returns:
-            None: Updates the existing HDF5 file with new datasets.
+            None. The function modifies the input HDF5 file in-place by creating or overwriting the following datasets:
+                - 'phi_train', 'phi_val', 'phi_test'
+                - 'target_train', 'target_val', 'target_test'
+                - 'weights_train', 'weights_val', 'weights_test' (if weights exist)
+                - 'signal_condition' (records the applied condition strings)
         """
-        np.random.seed(seed)  # Set the seed for reproducibility
+        combined = [
+            f"split_ratio='{split_ratio}'"
+            f"condition='{condition_strings}'",
+            f"use_beta={use_beta}",
+            f"mixup_ratio={mixup_ratio}"
+        ]
+
         with h5py.File(filename, "a") as f:  # Open in append mode
-            # Check if mixup datasets already exist
-            if "phi_mixedup" in f and "target_mixedup" in f:
-                if "signal_condition" in f:
-                    existing_conditions = [s.decode("utf-8") for s in f["signal_condition"][:]]
-                    if existing_conditions == condition_strings:
-                        #print("skip mixup augmentation, already exists")
-                        return
-            phi = np.array(f["phi"])  # Feature data
-            target = np.array(f["target"])  # Labels
+
+            # Check if split + mixup was already done with identical metadata
+            if all(key in f for key in ("phi_train", "target_train", "training_metadata")):
+                existing_metadata = [s.decode("utf-8") for s in f["training_metadata"][:]]
+                if existing_metadata == combined:
+                    #print("Skipping split and mixup augmentation — already exists with matching metadata.")
+                    return
+            
+            phi = np.array(f[self.parameters["phi"]["key"]])  # Feature data
+            target = np.array(f[self.parameters["target"]["key"]])  # Labels
             has_weights = "weights" in f  # Check if "weights" dataset exists
             weights = np.array(f["weights"]) if has_weights else None
 
-            # Identify background (0) and signal (1) indices
-            background_indices = np.where(target == 0)[0]
-            all_target_names = f["target_headers"][:]
-            all_target_names=[label.decode("utf-8") for label in all_target_names]
-
-            # Function to parse condition strings dynamically
-            '''
-            def parse_condition(condition_str, columns):
-                print(condition_str, columns)
-                """Parses condition strings and returns (column index, condition lambda)."""
-                match = re.match(r"(\S+)\s*(==|!=|<=|>=|<|>)\s*(\S+)", condition_str)
-                if not match:
-                    raise ValueError(f"Invalid condition format: {condition_str}")
-
-                column_name, operator, value = match.groups()
-                if column_name not in columns:
-                    raise ValueError(f"Column {column_name} not found in target!")
-                
-                column_idx = columns.index(column_name)  # Get the column index
-
-                # Convert condition string to a lambda function
-                return column_idx, lambda x: eval(f"x {operator} {value}", {"x": x})
-            '''
-
-            def parse_condition(condition_str, columns):
-                """
-                Parses condition strings like 'BBH Events==1' or 'some name>=value'
-                and returns (column index, condition lambda).
-                """
-                # Supported operators, ordered by length to match longest first
-                operators = ['==', '!=', '>=', '<=', '>', '<']
-
-                # Try each operator and see if it's in the string
-                for op in operators:
-                    if op in condition_str:
-                        parts = condition_str.split(op)
-                        if len(parts) != 2:
-                            raise ValueError(f"Invalid condition format: {condition_str}")
-                        column_name = parts[0].strip()
-                        value_str = parts[1].strip()
-                        break
-                else:
-                    raise ValueError(f"No valid operator found in: {condition_str}")
-
-                if column_name not in columns:
-                    raise ValueError(f"Column '{column_name}' not found in target!")
-
-                column_idx = columns.index(column_name)
-                
-                # Try to convert value to number
-                try:
-                    value = float(value_str) if '.' in value_str else int(value_str)
-                except ValueError:
-                    value = f'"{value_str}"'  # Quote string for eval
-
-                # Return column index and lambda condition
-                return column_idx, lambda x: eval(f"x {op} {value}", {"x": x})
-            # Convert conditions to apply on NumPy target array
-            conditions = np.ones(target.shape[0], dtype=bool)  # Start with all True
-
-            for cond_str in condition_strings:
-                col_idx, cond_func = parse_condition(cond_str, all_target_names)  # Get index and condition
-
-                if np.ndim(target) > 1:
-                    conditions &= cond_func(target[:, col_idx])  # Apply condition to the correct dimension
-                else:
-                    conditions &= cond_func(target[:])
+            splits = self.split_data(phi, target, weights, split_ratio)
+            (phi_train, phi_val, phi_test,
+            target_train, target_val, target_test,
+            weights_train, weights_val, weights_test) = splits
             
-            # Find matching indices
-            signal_indices = np.where(conditions)[0]
-            if len(signal_indices) == 0:
-                ValueError(f"No signal samples found for conditions: {condition_strings} in file {filename}")
-                return
+
+            if mixup_ratio > 0.:
+                # Identify background (0) and signal (1) indices
+                background_indices = np.where(target_train == 0)[0]
+                all_target_names = [label.decode("utf-8") for label in f[self.parameters["target"]["label_key"]][:]]
+
+                # Function to parse condition strings dynamically
+                def parse_condition(condition_str, columns):
+                    """
+                    Parses condition strings like 'BBH Events==1' or 'some name>=value'
+                    and returns (column index, condition lambda).
+                    """
+                    # Supported operators, ordered by length to match longest first
+                    operators = ['==', '!=', '>=', '<=', '>', '<']
+
+                    # Try each operator and see if it's in the string
+                    for op in operators:
+                        if op in condition_str:
+                            parts = condition_str.split(op)
+                            if len(parts) != 2:
+                                raise ValueError(f"Invalid condition format: {condition_str}")
+                            column_name = parts[0].strip()
+                            value_str = parts[1].strip()
+                            break
+                    else:
+                        raise ValueError(f"No valid operator found in: {condition_str}")
+
+                    if column_name not in columns:
+                        raise ValueError(f"Column '{column_name}' not found in target!")
+
+                    column_idx = columns.index(column_name)
+                    
+                    # Try to convert value to number
+                    try:
+                        value = float(value_str) if '.' in value_str else int(value_str)
+                    except ValueError:
+                        value = f'"{value_str}"'  # Quote string for eval
+
+                    # Return column index and lambda condition
+                    return column_idx, lambda x: eval(f"x {op} {value}", {"x": x})
+                # Convert conditions to apply on NumPy target array
+                conditions = np.ones(target_train.shape[0], dtype=bool)  # Start with all True
+
+                for cond_str in condition_strings:
+                    col_idx, cond_func = parse_condition(cond_str, all_target_names)  # Get index and condition
+
+                    if np.ndim(target_train) > 1:
+                        conditions &= cond_func(target_train[:, col_idx])  # Apply condition to the correct dimension
+                    else:
+                        conditions &= cond_func(target_train[:])
+                
+                # Find matching indices
+                signal_indices = np.where(conditions)[0]
+                if len(signal_indices) == 0:
+                    raise ValueError(f"No signal samples found for conditions: {condition_strings} in file {filename}")
+                
+                # All indices in the dataset
+                all_indices = np.arange(target_train.shape[0])
+                all_indices_new = np.random.choice(all_indices, size=int(len(all_indices) * (1.-mixup_ratio)), replace=True)
+                # Background indices are those NOT in signal_indices
+                background_indices = np.setdiff1d(all_indices, signal_indices)
+                background_indices = np.random.choice(background_indices, size=int(len(all_indices) * mixup_ratio), replace=True)
+
+                if len(background_indices) == 0 or len(signal_indices) == 0:
+                    raise ValueError("Dataset must contain both signal (1) and background (0) samples.")
+
+                # Randomly pair each background sample with a signal sample
+                sampled_signal_indices = np.random.choice(signal_indices, size=len(background_indices), replace=True)
+
+                # Generate mixup ratios
+                mixup_margin = self.config_file["cnp_settings"]["mixup_margin"]
+                if use_beta and isinstance(use_beta, (list, tuple)) and len(use_beta) == 2:
+                    if mixup_margin > 0.:
+                        # Use uniform distribution if margin > 0
+                        alpha = np.random.beta(1., 1., size=(len(background_indices), 1))
+                    else:
+                        alpha = np.random.beta(use_beta[0], use_beta[1], size=(len(background_indices), 1))
+                else:
+                    alpha = np.random.beta(1., 1., size=(len(background_indices), 1))
+
+                # Perform mixup augmentation
+                phi_train_mix = alpha * phi_train[sampled_signal_indices] + (1 - alpha) * phi_train[background_indices]
+                
+                # If weights are present, compute and concatenate
+                if has_weights:
+                    weights_train = weights_train.reshape(-1, 1) if weights_train.ndim == 1 else weights_train
+                    weights_train_mix = alpha * weights_train[sampled_signal_indices] + (1 - alpha) * weights_train[background_indices]
+                    weights_train = np.concatenate((weights_train[all_indices_new], weights_train_mix), axis=0)
+
+                alpha = np.where(alpha >= 1. - mixup_margin, 1., np.where(alpha <= mixup_margin, 0., alpha))
+                target_train = target_train.reshape(-1, 1) if target_train.ndim == 1 else target_train
+                target_train_mix = alpha * target_train[sampled_signal_indices] + (1 - alpha) * target_train[background_indices]
+
+                # Concatenate original data
+                phi_train = np.concatenate((phi_train[all_indices_new], phi_train_mix), axis=0)
+                target_train = np.concatenate((target_train[all_indices_new], target_train_mix), axis=0)
+
+                
+
+                # Shuffle everything using the same permutation
+                permutation = np.random.permutation(phi_train.shape[0])
+                phi_train = phi_train[permutation]
+                target_train = target_train[permutation]
+                if has_weights:
+                    weights_train = weights_train[permutation]
             
-            # All indices in the dataset
-            all_indices = np.arange(target.shape[0])
-
-            # Background indices are those NOT in signal_indices
-            background_indices = np.setdiff1d(all_indices, signal_indices)
-        
-            if len(background_indices) == 0 or len(signal_indices) == 0:
-                #print(f"Dataset must contain both signal (1) and background (0) samples. {filename}")
-                #shutil.move(filename, './binary-black-hole/in/data/lf/v1.1/run/run/run/zero_signal')
-                #return
-                raise ValueError("Dataset must contain both signal (1) and background (0) samples.")
-
-            # Randomly pair each background sample with a signal sample
-            sampled_signal_indices = np.random.choice(signal_indices, size=len(background_indices), replace=True)
-
-            # Generate mixup ratios
-            if use_beta and isinstance(use_beta, (list, tuple)) and len(use_beta) == 2:
-                alpha = np.random.beta(use_beta[0], use_beta[1], size=(len(background_indices), 1))
-            else:
-                alpha = np.random.uniform(0, 1, size=(len(background_indices), 1))
-
-            # Perform mixup augmentation
-            phi_mixedup = alpha * phi[sampled_signal_indices] + (1 - alpha) * phi[background_indices]
-            target_mixedup = alpha * target[sampled_signal_indices] + (1 - alpha) * target[background_indices]
-
-            # Apply mixup to weights if they exist
-            weights_mixedup = None
-            if has_weights:
-                weights_mixedup = alpha * weights[sampled_signal_indices] + (1 - alpha) * weights[background_indices]
-
             # Store new datasets in the same file
-            if "phi_mixedup" in f:
-                del f["phi_mixedup"]
-            f.create_dataset("phi_mixedup", data=phi_mixedup, compression="gzip")
-
-            if "target_mixedup" in f:
-                del f["target_mixedup"]
-            f.create_dataset("target_mixedup", data=target_mixedup, compression="gzip")
+            # Define data splits and corresponding variable names
+            datasets = {
+                "phi_train": phi_train,
+                "phi_val": phi_val,
+                "phi_test": phi_test,
+                "target_train": target_train,
+                "target_val": target_val,
+                "target_test": target_test,
+            }
 
             if has_weights:
-                if "weights_mixedup" in f:
-                    del f["weights_mixedup"]
-                f.create_dataset("weights_mixedup", data=weights_mixedup, compression="gzip")
-            
-            if "signal_condition" in f:
-                del f["signal_condition"]
-            f.create_dataset("signal_condition", data=np.array(condition_strings, dtype="S"))
+                datasets.update({
+                    "weights_train": weights_train,
+                    "weights_val": weights_val,
+                    "weights_test": weights_test,
+                })
 
-    def compute_feature_stats(self):
+            # Write datasets to file (delete if they already exist)
+            for name, data in datasets.items():
+                if name in f:
+                    del f[name]
+                f.create_dataset(name, data=data, compression="gzip")
+            
+            if "training_metadata" in f:
+                del f["training_metadata"]
+            f.create_dataset("training_metadata", data=np.array(combined, dtype="S"))
+
+    def split_data(self, phi, target, weights, split_ratio):
+        # Shuffle indices
+        N = phi.shape[0]
+        indices = np.arange(N)
+        np.random.seed(42)   # for reproducibility
+        np.random.shuffle(indices)
+
+        # Compute split sizes
+        n_train = int(split_ratio[0] * N)
+        n_val = int(split_ratio[1] * N)
+
+        # Apply split
+        train_idx = indices[:n_train]
+        val_idx = indices[n_train:n_train + n_val]
+        test_idx = indices[n_train + n_val:]
+
+        phi_train, target_train = phi[train_idx], target[train_idx]
+        phi_val, target_val = phi[val_idx], target[val_idx]
+        phi_test, target_test = phi[test_idx], target[test_idx]
+
+        if weights != None:
+            weights_train = weights[train_idx]
+            weights_val = weights[val_idx]
+            weights_test = weights[test_idx]
+        else:
+            weights_train = weights_val = weights_test = None    
+        
+        return phi_train, phi_val, phi_test, target_train, target_val, target_test, weights_train, weights_val, weights_test
+    
+    def compute_feature_stats(self, use_indices=True):
         """
-        Computes the global mean and std of features (theta + phi),
+        Computes global statistics (mean/std or min/max) for normalization of features (theta + phi),
         using the feature key currently set in self.parameters['phi']['key'].
-        
-        This supports both original and mixup-augmented data, depending on whether
-        mixup was enabled during DataGeneration init (via parameter overwriting).
-        
+
+        Supports both z-score and min-max normalization, depending on:
+            self.parameters['normalization'] = 'zscore' or 'minmax'
+
         Stores:
-            self.feature_mean: torch.Tensor of shape (1, D)
-            self.feature_std:  torch.Tensor of shape (1, D)
+            For z-score:
+                self.feature_mean: torch.Tensor of shape (1, D)
+                self.feature_std:  torch.Tensor of shape (1, D)
+            For min-max:
+                self.feature_min: torch.Tensor of shape (1, D)
+                self.feature_max: torch.Tensor of shape (1, D)
         """
-        phi_key = self.parameters['phi']['key']
+        phi_key = self.parameters["phi"]["key"]
+        normalization = self.use_normalization
 
         file_list = sorted([
             os.path.join(self.path_to_files, f)
@@ -389,48 +464,78 @@ class DataGeneration(object):
         sum_squared = None
         total_count = 0
 
-        for file in tqdm(file_list, desc="Computing global feature mean"):
+        global_min = None
+        global_max = None
+
+        for file in tqdm(file_list, desc="Computing global feature stats"):
             with h5py.File(file, "r") as f:
                 if phi_key not in f:
                     print(f"Warning: '{phi_key}' not found in {file}. Skipping.")
                     continue
 
-                # Read selected phi features
-                phi_indices = utils.read_selected_indices(file, self.parameters['phi'])
-                phi = np.array(f[phi_key][:, phi_indices])
+                phi = np.array(f[phi_key])
+ 
+                if use_indices == True:
+                    phi_indices = utils.read_selected_indices(file, self.parameters['phi'])
+                    phi = phi[:, phi_indices]
 
-                # Read and broadcast theta
-                if self.parameters['theta']['selected_labels']:
+                if use_indices == True and len(self.parameters['theta']['selected_labels']) > 0:
                     theta_indices = utils.read_selected_indices(file, self.parameters['theta'])
-                    theta_data = f[self.parameters['theta']['key']]
-                    if len(theta_data.shape) == 1:
-                        theta = np.tile(theta_data[theta_indices], (phi.shape[0], 1))
-                    else:
-                        theta = theta_data[:, theta_indices]
+                    theta = np.array(f[self.parameters['theta']['key']])
+                    theta = np.array(f[self.parameters['theta']['key']])[theta_indices]
+                else:
+                    theta = np.array(f[self.parameters['theta']['key']])
+
+                if len(theta.shape) == 1:
+                        theta = np.tile(theta, (phi.shape[0], 1))
+                else:
+                        theta = theta[:, theta_indices]
+
+                if theta.shape[1] > 0: 
                     features = np.hstack([theta, phi])
                 else:
                     features = phi
 
-                # Accumulate sum and sum of squares
-                if sum_features is None:
-                    sum_features = np.sum(features, axis=0)
-                    sum_squared = np.sum(features ** 2, axis=0)
-                else:
-                    sum_features += np.sum(features, axis=0)
-                    sum_squared += np.sum(features ** 2, axis=0)
+                if normalization == 'zscore':
+                    if sum_features is None:
+                        sum_features = np.sum(features, axis=0)
+                        sum_squared = np.sum(features ** 2, axis=0)
+                    else:
+                        sum_features += np.sum(features, axis=0)
+                        sum_squared += np.sum(features ** 2, axis=0)
+
+                elif normalization == 'minmax':
+                    if global_min is None:
+                        global_min = np.min(features, axis=0)
+                        global_max = np.max(features, axis=0)
+                    else:
+                        global_min = np.minimum(global_min, np.min(features, axis=0))
+                        global_max = np.maximum(global_max, np.max(features, axis=0))
 
                 total_count += features.shape[0]
 
         if total_count == 0:
             raise ValueError(f"No samples found using key '{phi_key}'")
 
-        mean = sum_features / total_count
-        std = np.sqrt((sum_squared / total_count) - (mean ** 2) + 1e-8)
+        if normalization == 'zscore':
+            mean = sum_features / total_count
+            std = np.sqrt((sum_squared / total_count) - (mean ** 2) + 1e-8)
 
-        self.feature_mean = torch.tensor(mean, dtype=torch.float32).unsqueeze(0)
-        self.feature_std = torch.tensor(std, dtype=torch.float32).unsqueeze(0)
+            self.feature_mean = torch.tensor(mean, dtype=torch.float32).unsqueeze(0)
+            self.feature_std = torch.tensor(std, dtype=torch.float32).unsqueeze(0)
 
-        print("Feature mean/std computation completed.")
+            print("Z-score feature mean/std computation completed.")
+
+        elif normalization == 'minmax':
+            # Store min as "mean"
+            self.feature_mean = torch.tensor(global_min, dtype=torch.float32).unsqueeze(0)
+            # Store (max - min) as "std"
+            self.feature_std = torch.tensor(global_max - global_min, dtype=torch.float32).unsqueeze(0)
+
+            print("Min-Max feature min/max computation completed.")
+
+        else:
+            raise ValueError(f"Unsupported normalization method: {normalization}")
     
     def format_batch_for_cnp(self,batch, context_is_subset=True):
         """
@@ -457,8 +562,8 @@ class DataGeneration(object):
         # Split batch into input (X) and target (Y) features
         batch_x = batch[:,:self.feature_size]  # All features except last column (input features)
         # Z-score normalization for input features
-        if self.feature_mean is None or self.feature_std is None:
-            batch_x = (batch_x - self.feature_mean) / self.feature_std
+        if self.use_normalization != False:
+            batch_x = (batch_x - self.feature_mean) / (self.feature_std + 1e-8)  # Avoid division by zero
 
         batch_y = batch[:,self.feature_size:self.feature_size+self.target_size]   # Last column is the target (output values)
 
@@ -493,20 +598,6 @@ class DataGeneration(object):
         
         # Return the properly formatted object
         return CNPRegressionDescription(query=query, target_y=batch_target_y)
-
-    def get_batch(self,batch_idx):
-        """
-        Retrieves a specific batch from an iterable DataLoader.
-
-        Parameters:
-        - dataloader (torch.utils.data.DataLoader): The DataLoader object.
-        - batch_idx (int): The index of the batch to retrieve.
-
-        Returns:
-        - The requested batch.
-        """
-        batch = next(itertools.islice(self.dataloader, batch_idx, None))
-        return self.format_batch_for_cnp(batch)
 
     def get_dataloader(self):
         return self.dataloader

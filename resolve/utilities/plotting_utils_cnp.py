@@ -6,6 +6,7 @@ import os
 from . import plotting_utils as plotting
 import pandas as pd
 import matplotlib.lines as mlines
+import matplotlib.pyplot as plt
 
 def plot(prediction_y_training, target_y_training, loss_training, prediction_y_testing, target_y_testing,  loss_testing, target_range=[0,1], it=None):
 
