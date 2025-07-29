@@ -8,6 +8,7 @@ import pandas as pd
 import h5py
 import random
 import torch
+import operator
 
 def set_random_seed(seed=42):
     random.seed(seed)           # Python's built-in random module
@@ -71,6 +72,67 @@ def get_dataframes_concat(path, nrows=None):
         df_new = pd.concat([df_new, df], ignore_index=True)
     return df_new, len(file_list)
 
+def get_max_number_of_rows(files, key):
+        max_rows = 0
+
+        for file in files:
+            try:
+                with h5py.File(file, "r") as hdf:
+                    if key in hdf:
+                        num_rows = hdf[key].shape[0]
+                        max_rows = max(max_rows, num_rows)
+                    else:
+                        num_rows = 0
+            except (OSError, IOError) as e:
+                print(f"Skipping corrupted or unreadable file: {file}\nReason: {e}")
+                continue
+
+            if num_rows == 0:
+                print(f"WARNING! {file} has 0 rows — possibly no data or mismatched target key.")
+
+        if max_rows == 0:
+            raise ValueError("ERROR! All files are empty or the target key is invalid.")
+
+        return [0, max_rows]
+
+def parse_condition(condition_str, columns):
+        
+        """
+        Parses condition strings like 'BBH Events==1' or 'some name>=value'
+        and returns (column index, condition lambda).
+        """
+        ops = {
+            '==': operator.eq,
+            '!=': operator.ne,
+            '>=': operator.ge,
+            '<=': operator.le,
+            '>': operator.gt,
+            '<': operator.lt
+        }
+
+        for op in ops:
+            if op in condition_str:
+                parts = condition_str.split(op)
+                if len(parts) != 2:
+                    raise ValueError(f"Invalid condition format: {condition_str}")
+                column_name = parts[0].strip()
+                value_str = parts[1].strip()
+                break
+        else:
+            raise ValueError(f"No valid operator found in: {condition_str}")
+
+        if column_name not in columns:
+            raise ValueError(f"Column '{column_name}' not found in target!")
+
+        column_idx = columns.index(column_name)
+
+        try:
+            value = float(value_str) if '.' in value_str else int(value_str)
+        except ValueError:
+            value = value_str  # Use raw string directly
+
+        return column_idx, lambda x: ops[op](x, value)
+    
 def convert_single_csv_to_hdf5(csv_file, hdf5_file, theta_headers, target_label, weights_labels):
         """
         """
