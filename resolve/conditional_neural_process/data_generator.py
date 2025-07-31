@@ -15,109 +15,111 @@ import h5py
 from torch.utils.data import DataLoader, IterableDataset
 from ..utilities import utilities as utils
 import random
-
+from torch.utils.data import get_worker_info
 utils.set_random_seed(42)
 
 class HDF5Dataset(IterableDataset):
-    def __init__(self, hdf5_dir, 
-                batch_size=3000, 
-                files_per_batch=20,
-                parameters = {'phi': {'key': "phi",'label_key': "phi_labels",'selected_labels': None},
-                              'theta': {'key': "theta",'label_key': "theta_headers",'selected_labels': None},
-                              'target': {'key': "target",'label_key': "target_headers",'selected_labels': None}}
-        ):
-        """
-        - hdf5_dir: Directory containing HDF5 files.
-        - batch_size: Number of samples per batch (3,400).
-        - files_per_batch: Number of files used in each batch (34).
-        """
+    def __init__(self, hdf5_dir, batch_size=3000, files_per_batch=20, parameters=None):
         super().__init__()
         self.hdf5_dir = hdf5_dir
         self.batch_size = batch_size
         self.files_per_batch = files_per_batch
         self.rows_per_file = batch_size // files_per_batch
         self.parameters = parameters
-        self.phi_selected_indices= None
-        self.theta_selected_indices= None
-        self.target_selected_indices= None
 
-        # List and sort all HDF5 files
-        self.files = sorted([os.path.join(hdf5_dir, f) for f in os.listdir(hdf5_dir) if f.endswith(".h5")])
+        self.files = sorted([
+            os.path.join(hdf5_dir, f)
+            for f in os.listdir(hdf5_dir) if f.endswith(".h5")
+        ])
         self.num_files = len(self.files)
-        # Total row cycles per file to complete an epoch
 
-        max_rows_per_file, self.nrows = utils.get_max_number_of_rows(self.files, self.parameters['target']['key'])
-        self.total_batches = max_rows_per_file // self.rows_per_file  # maxrows / k rows per batch = c cycles per full dataset pass
+        max_rows_per_file, self.nrows = utils.get_max_number_of_rows(
+            self.files, self.parameters['target']['key']
+        )
+        self.total_cycles = max_rows_per_file // self.rows_per_file
 
-    def shuffle_files(self):
-        """Shuffle the file order at the start of each full dataset pass (epoch)."""
-        random.shuffle(self.files)
-    
+        sample_file = self.files[0]
+        self.phi_selected_indices = utils.read_selected_indices(sample_file, self.parameters['phi'])
+
+        if self.parameters['theta']['selected_labels']:
+            self.theta_selected_indices = utils.read_selected_indices(sample_file, self.parameters['theta'])
+        else:
+            self.theta_selected_indices = None
+
+        labels = self.parameters['target']['selected_labels']
+        if labels:
+            if "columns[" in labels:
+                start, end = utils.parse_slice_string(labels)
+                self.target_selected_indices = np.arange(start, end)
+            else:
+                self.target_selected_indices = utils.read_selected_indices(sample_file, self.parameters['target'])
+        else:
+            self.target_selected_indices = None
+
+        self._file_cache = {}
+
     def __len__(self):
-        """Returns the total number of samples in the dataset."""
         return self.nrows
 
+    def _get_file_handle(self, file_path):
+        # Lazy open per-worker file handles
+        if file_path not in self._file_cache:
+            self._file_cache[file_path] = h5py.File(file_path, "r")
+        return self._file_cache[file_path]
+
     def __iter__(self):
-        batch_idx = 0
+        rng = np.random.default_rng()
+        worker_info = get_worker_info()
 
-        while batch_idx < self.total_batches:
-            self.shuffle_files()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
 
-            for i in range(0, len(self.files), self.files_per_batch):
-                if i == 0 and batch_idx == 0:
-                    self.phi_selected_indices = utils.read_selected_indices(self.files[0], self.parameters['phi'])
+        all_cycle_indices = list(range(self.total_cycles))
+        worker_cycle_indices = all_cycle_indices[worker_id::num_workers]
 
-                    if self.parameters['theta']['selected_labels']:
-                        self.theta_selected_indices = utils.read_selected_indices(self.files[0], self.parameters['theta'])
-                    else:
-                        self.theta_selected_indices = None
+        for cycle_idx in worker_cycle_indices:
+            file_indices = list(range(self.num_files))
+            rng.shuffle(file_indices)
 
-                    labels = self.parameters['target']['selected_labels']
-                    if labels:
-                        if "columns[" in labels:
-                            start, end = utils.parse_slice_string(labels)
-                            self.target_selected_indices = [np.arange(start, end)]
-                        else:
-                            self.target_selected_indices = utils.read_selected_indices(self.files[0], self.parameters['target'])
-                    else:
-                        self.target_selected_indices = None
+            for i in range(0, self.num_files, self.files_per_batch):
+                selected_files = [self.files[j] for j in file_indices[i:i + self.files_per_batch]]
 
-                batch = []
-                selected_files = self.files[i:i + self.files_per_batch]
-                start_idx = batch_idx * self.rows_per_file
+                start_idx = cycle_idx * self.rows_per_file
                 end_idx = start_idx + self.rows_per_file
 
-                for file in selected_files:
-                    with h5py.File(file, "r") as hdf:
-                        phi = hdf[self.parameters['phi']['key']][start_idx:end_idx, self.phi_selected_indices]
+                batch = []
+                for file_path in selected_files:
+                    hdf = self._get_file_handle(file_path)
 
-                        if self.theta_selected_indices is not None:
-                            theta_data = hdf[self.parameters['theta']['key']]
-                            if theta_data.ndim == 1:
-                                theta = theta_data[self.theta_selected_indices]
-                                theta = np.tile(theta, (phi.shape[0], 1))
-                            else:
-                                theta = theta_data[start_idx:end_idx, self.theta_selected_indices]
-                            features = np.hstack([theta, phi])
+                    phi = hdf[self.parameters['phi']['key']][start_idx:end_idx, self.phi_selected_indices]
+
+                    if self.theta_selected_indices is not None:
+                        theta_data = hdf[self.parameters['theta']['key']]
+                        if theta_data.ndim == 1:
+                            theta = theta_data[self.theta_selected_indices]
+                            theta = np.tile(theta, (phi.shape[0], 1))
                         else:
-                            features = phi
+                            theta = theta_data[start_idx:end_idx, self.theta_selected_indices]
+                        features = np.hstack([theta, phi])
+                    else:
+                        features = phi
 
-                        target_data = hdf[self.parameters['target']['key']]
-                        if target_data.ndim > 1 and self.target_selected_indices is not None:
-                            target = target_data[start_idx:end_idx, self.target_selected_indices]
-                        else:
-                            target = target_data[start_idx:end_idx]
-                            target = target.reshape(-1, 1)
+                    target_data = hdf[self.parameters['target']['key']]
+                    if target_data.ndim > 1 and self.target_selected_indices is not None:
+                        target = target_data[start_idx:end_idx, self.target_selected_indices]
+                    else:
+                        target = target_data[start_idx:end_idx].reshape(-1, 1)
 
-                        file_data = np.hstack([features, target])
-                        batch.append(file_data)
+                    file_data = np.hstack([features, target])
+                    batch.append(file_data)
 
                 batch = np.vstack(batch)
-                np.random.shuffle(batch)
+                rng.shuffle(batch)
                 yield torch.tensor(batch, dtype=torch.float32)
-
-            batch_idx += 1
-
 
 CNPRegressionDescription = collections.namedtuple(
     "CNPRegressionDescription", ("query", "target_y")
@@ -196,11 +198,22 @@ class DataGeneration:
             self.compute_feature_stats()
             self.config_file["feature_settings"]["x_mean"] = self.feature_mean.numpy().tolist()
             self.config_file["feature_settings"]["x_std"] = self.feature_std.numpy().tolist()
-            
-        dataset = HDF5Dataset(self.path_to_files, self._batch_size, files_per_batch=self.files_per_batch, parameters=self.parameters)
-        self.dataloader = DataLoader(dataset, batch_size=None, num_workers=self.config_file["cnp_settings"]["number_of_walkers"], prefetch_factor=2) 
-        # write the feature mean and std from the training set to the config file
 
+        dataset = HDF5Dataset(
+            self.path_to_files,
+            batch_size=self._batch_size,
+            files_per_batch=self.files_per_batch,
+            parameters=self.parameters
+        )
+
+        self.dataloader = DataLoader(
+            dataset,
+            batch_size=None,  # required for IterableDataset
+            num_workers=4,
+            prefetch_factor=2,
+            pin_memory=True,
+            persistent_workers=True
+        )
     def split_and_mixup_augment(self, filename, split_ratio, use_beta, condition_strings, mixup_ratio=0.):
 
         combined = [

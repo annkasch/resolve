@@ -13,7 +13,7 @@ cnp_settings:
   context_ratio: 0.33
   context_is_subset: false
   batch_size_train: 2000
-  files_per_batch_train: 50
+  files_per_batch_train: 10
   batch_size_predict:
   - 5000
   - 1000
@@ -26,7 +26,7 @@ cnp_settings:
   training:
     use_staged_training: false
     phase1:
-      training_epochs: 50
+      training_epochs: 20
       mixup_ratio: 0.3
       mixup_margin: 0.0
       use_beta:
