@@ -225,15 +225,21 @@ class DataGeneration:
             has_weights = "weights" in f  # Check if "weights" dataset exists
             weights = np.array(f["weights"]) if has_weights else None
 
-            max_retries = 10000
+            max_retries = 1000
             retry_count = 0
-            phi_train_phase1 = None
-            while phi_train_phase1 is None and retry_count < max_retries:
+            nsignals = [0]
+            while np.all(nsignals) == 0 is 0 and retry_count < max_retries:
                 retry_count += 1
                 (phi_train, phi_val, phi_test,
                 target_train, target_val, target_test,
                 weights_train, weights_val, weights_test) = self.split_data(phi, target, weights, split_ratio)
-                
+                nsignals = np.sum(target_train == 1, axis=0)
+
+            phi_train_phase1 = None
+            retry_count = 0
+            while phi_train_phase1 is None and retry_count < max_retries:
+                retry_count += 1
+
                 if mixup_ratio > 0.:
                     all_indices = np.arange(target_train.shape[0])
                     all_indices_phase1 = np.random.choice(all_indices, size=int(len(all_indices) * mixup_ratio), replace=False)
