@@ -74,13 +74,14 @@ def get_dataframes_concat(path, nrows=None):
 
 def get_max_number_of_rows(files, key):
         max_rows = 0
-
+        total_rows = 0
         for file in files:
             try:
                 with h5py.File(file, "r") as hdf:
                     if key in hdf:
                         num_rows = hdf[key].shape[0]
                         max_rows = max(max_rows, num_rows)
+                        total_rows += num_rows
                     else:
                         num_rows = 0
             except (OSError, IOError) as e:
@@ -93,7 +94,7 @@ def get_max_number_of_rows(files, key):
         if max_rows == 0:
             raise ValueError("ERROR! All files are empty or the target key is invalid.")
 
-        return [0, max_rows]
+        return max_rows, total_rows
 
 def parse_condition(condition_str, columns):
         

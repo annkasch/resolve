@@ -24,8 +24,7 @@ class HDF5Dataset(IterableDataset):
                 files_per_batch=20,
                 parameters = {'phi': {'key': "phi",'label_key': "phi_labels",'selected_labels': None},
                               'theta': {'key': "theta",'label_key': "theta_headers",'selected_labels': None},
-                              'target': {'key': "target",'label_key': "target_headers",'selected_labels': None}},
-                rows=None
+                              'target': {'key': "target",'label_key': "target_headers",'selected_labels': None}}
         ):
         """
         - hdf5_dir: Directory containing HDF5 files.
@@ -46,8 +45,9 @@ class HDF5Dataset(IterableDataset):
         self.files = sorted([os.path.join(hdf5_dir, f) for f in os.listdir(hdf5_dir) if f.endswith(".h5")])
         self.num_files = len(self.files)
         # Total row cycles per file to complete an epoch
-        self.rows = rows or utils.get_max_number_of_rows(self.files, self.parameters['target']['key'])
-        self.total_batches = (self.rows[1]-self.rows[0]) // self.rows_per_file  # nrows / k rows per batch = c cycles per full dataset pass
+
+        max_rows_per_file, self.nrows = utils.get_max_number_of_rows(self.files, self.parameters['target']['key'])
+        self.total_batches = max_rows_per_file // self.rows_per_file  # maxrows / k rows per batch = c cycles per full dataset pass
 
     def shuffle_files(self):
         """Shuffle the file order at the start of each full dataset pass (epoch)."""
@@ -55,7 +55,7 @@ class HDF5Dataset(IterableDataset):
     
     def __len__(self):
         """Returns the total number of samples in the dataset."""
-        return self.rows[1] * len(self.files)
+        return self.nrows
 
     def __iter__(self):
         batch_idx = 0
@@ -84,8 +84,8 @@ class HDF5Dataset(IterableDataset):
 
                 batch = []
                 selected_files = self.files[i:i + self.files_per_batch]
-                start_idx = batch_idx * self.rows_per_file + self.rows[0]
-                end_idx = min(start_idx + self.rows_per_file, self.rows[1])
+                start_idx = batch_idx * self.rows_per_file
+                end_idx = start_idx + self.rows_per_file
 
                 for file in selected_files:
                     with h5py.File(file, "r") as hdf:
@@ -144,7 +144,7 @@ class DataGeneration:
         self._names_target = config_file["simulation_settings"]["target_headers"]
 
         self.feature_size, self.target_size = utils.get_feature_and_label_size(config_file)
-        self.rows = None
+
 
         if not any(f.endswith(".h5") for f in os.listdir(path_to_files)):
             utils.convert_all_csv_to_hdf5(config_file)
@@ -163,16 +163,16 @@ class DataGeneration:
                     self.split_and_mixup_augment(
                         file,
                         config_file["cnp_settings"]["split_ratio"],
-                        config_file["cnp_settings"]["use_beta"],
+                        config_file["cnp_settings"]["training"]["phase1"]["use_beta"],
                         signal_condition,
-                        config_file["cnp_settings"]["mixup_ratio"]
+                        config_file["cnp_settings"]["training"]["phase1"]["mixup_ratio"]
                     )
+
+                self.parameters["phi"]["key"] = "phi_train" # eventually altered training set according to mixup/ mixup_ratio
+                self.parameters["target"]["key"] = "target_train" # eventually altered training set according to mixup/ mixup_ratio
             else:
-                self.rows = utils.get_max_number_of_rows(files[:1],"target_train")
-                self.rows[0] = int(self.rows[1] * config_file['cnp_settings']['mixup_ratio'])
-            
-            self.parameters["phi"]["key"] = "phi_train"
-            self.parameters["target"]["key"] = "target_train"
+                self.parameters["phi"]["key"] = "phi_train_raw" # unaltered training set
+                self.parameters["target"]["key"] = "target_train_raw" # unaltered training set
 
         elif mode == "validation":
             self.parameters["phi"]["key"] = "phi_val"
@@ -197,7 +197,7 @@ class DataGeneration:
             self.config_file["feature_settings"]["x_mean"] = self.feature_mean.numpy().tolist()
             self.config_file["feature_settings"]["x_std"] = self.feature_std.numpy().tolist()
             
-        dataset = HDF5Dataset(self.path_to_files, self._batch_size, files_per_batch=self.files_per_batch, parameters=self.parameters,rows=self.rows)
+        dataset = HDF5Dataset(self.path_to_files, self._batch_size, files_per_batch=self.files_per_batch, parameters=self.parameters)
         self.dataloader = DataLoader(dataset, batch_size=None, num_workers=self.config_file["cnp_settings"]["number_of_walkers"], prefetch_factor=2) 
         # write the feature mean and std from the training set to the config file
 
@@ -207,8 +207,7 @@ class DataGeneration:
             f"split_ratio='{split_ratio}'",
             f"condition='{condition_strings}'",
             f"use_beta={use_beta}",
-            f"mixup_ratio={mixup_ratio}",
-            f"disable_shuffle={self.config_file['cnp_settings']['disable_phase_shuffle']}"
+            f"mixup_ratio={mixup_ratio}"
         ]
 
         with h5py.File(filename, "a") as f:  # Open in append mode
@@ -218,6 +217,7 @@ class DataGeneration:
                 existing_metadata = [s.decode("utf-8") for s in f["training_metadata"][:]]
                 if existing_metadata == combined:
                     #print("Skipping split and mixup augmentation — already exists with matching metadata.")
+                    #test = 1
                     return
             
             phi = np.array(f[self.parameters["phi"]["key"]])  # Feature data
@@ -225,15 +225,16 @@ class DataGeneration:
             has_weights = "weights" in f  # Check if "weights" dataset exists
             weights = np.array(f["weights"]) if has_weights else None
 
-            (phi_train, phi_val, phi_test,
-            target_train, target_val, target_test,
-            weights_train, weights_val, weights_test) = self.split_data(phi, target, weights, split_ratio)
-            
-            self.rows = [0, phi_train.shape[0]]
-            
-            if mixup_ratio > 0.:
-                phi_train_phase1 = None
-                while phi_train_phase1 is None:
+            max_retries = 10000
+            retry_count = 0
+            phi_train_phase1 = None
+            while phi_train_phase1 is None and retry_count < max_retries:
+                retry_count += 1
+                (phi_train, phi_val, phi_test,
+                target_train, target_val, target_test,
+                weights_train, weights_val, weights_test) = self.split_data(phi, target, weights, split_ratio)
+                
+                if mixup_ratio > 0.:
                     all_indices = np.arange(target_train.shape[0])
                     all_indices_phase1 = np.random.choice(all_indices, size=int(len(all_indices) * mixup_ratio), replace=False)
                     all_indices_phase2 = np.setdiff1d(all_indices, all_indices_phase1)
@@ -245,39 +246,47 @@ class DataGeneration:
                         weights_train[all_indices_phase1] if has_weights else None,
                         all_target_names,
                         condition_strings,
-                        use_beta)
+                        use_beta) #apply mixup returns None, None, None if no signal samples found
 
-                # Concatenate original data
-                phi_train = np.concatenate((phi_train[all_indices_phase2],phi_train_phase1), axis=0)
-                target_train = np.concatenate((target_train[all_indices_phase2],target_train_phase1), axis=0)
-                if has_weights:
-                    weights_train = np.concatenate((weights_train[all_indices_phase2], weights_train_phase1), axis=0)
-                
-                # Update rows to reflect new training set size
-                if not self.config_file["cnp_settings"]["disable_phase_shuffle"]:
-                    # Shuffle everything using the same permutation
-                    permutation = np.random.permutation(phi_train.shape[0])
-                    phi_train = phi_train[permutation]
-                    target_train = target_train[permutation]
-                    if has_weights:
-                        weights_train = weights_train[permutation]
-                    self.rows = [0, phi_train.shape[0]]
+                    if phi_train_phase1 is not None:
+                        # Concatenate original data
+                        if len(all_indices_phase2) > 0:
+                            phi_train_phase1 = np.concatenate((phi_train[all_indices_phase2],phi_train_phase1), axis=0)
+                            target_train_phase1 = np.concatenate((target_train[all_indices_phase2],target_train_phase1), axis=0)
+                            if has_weights:
+                                weights_train_phase1 = np.concatenate((weights_train[all_indices_phase2], weights_train_phase1), axis=0)
+                        
+                        # Shuffle everything using the same permutation
+                        permutation = np.random.permutation(phi_train_phase1.shape[0])
+                        phi_train_phase1 = phi_train_phase1[permutation]
+                        target_train_phase1 = target_train_phase1[permutation]
+                        if has_weights:
+                            weights_train_phase1 = weights_train_phase1[permutation]
+                else:
+                    break  # Exit loop if split was successful
                     
-            
+            if phi_train_phase1 is None:
+                target = np.array(f[self.parameters["target"]["key"]])  # Labels
+                count_ones_per_column = np.sum(target == 1, axis=0)
+                print("Number of label==1 per column:", count_ones_per_column)
+                raise RuntimeError(f"Could not create training data with signal for mixup after {max_retries} retries in {filename}. Check your data and conditions.")
             # Store new datasets in the same file
             # Define data splits and corresponding variable names
             datasets = {
-                "phi_train": phi_train,
+                "phi_train_raw": phi_train,
+                "phi_train": phi_train_phase1 if mixup_ratio > 0. else phi_train,
                 "phi_val": phi_val,
                 "phi_test": phi_test,
-                "target_train": target_train,
+                "target_train_raw": target_train,
+                "target_train": target_train_phase1 if mixup_ratio > 0. else target_train,
                 "target_val": target_val,
                 "target_test": target_test,
             }
 
             if has_weights:
                 datasets.update({
-                    "weights_train": weights_train,
+                    "weights_train_raw": weights_train,
+                    "weights_train": weights_train_phase1 if mixup_ratio > 0. else weights_train,
                     "weights_val": weights_val,
                     "weights_test": weights_test,
                 })
@@ -336,13 +345,13 @@ class DataGeneration:
         # Identify background (0) and signal (1) indices
         signal_indices = np.where(conditions)[0]
         if len(signal_indices) == 0:
-            print(f"Error: No signal samples found for conditions: {condition_strings}")
+            #print(f"Error: No signal samples found for conditions: {condition_strings}")
             return None, None, None
         
         # Background indices are those NOT in signal_indices
         background_indices = np.setdiff1d(all_indices, signal_indices)
         if len(background_indices) == 0 or len(signal_indices) == 0:
-            print("Dataset must contain both signal (1) and background (0) samples.")
+            #print("Dataset must contain both signal (1) and background (0) samples.")
             return None, None, None
 
         # Randomly pair each background sample with a signal sample
@@ -350,7 +359,7 @@ class DataGeneration:
         sampled_signal_indices = np.random.choice(signal_indices, size=len(sampled_background_indices), replace=True)
 
         # Generate mixup ratios
-        mixup_margin = self.config_file["cnp_settings"]["mixup_margin"]
+        mixup_margin = self.config_file["cnp_settings"]["training"]["phase1"]["mixup_margin"]
         if use_beta and isinstance(use_beta, (list, tuple)) and len(use_beta) == 2:
             if mixup_margin > 0.:
                 # Use uniform distribution if margin > 0
