@@ -6,7 +6,7 @@ from numpy.polynomial.legendre import Legendre
 import random
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-from resum.utilities import ModelVisualizer
+from resolve.utilities import ModelVisualizer
 from scipy.integrate import nquad
 from math import comb
 import pymc as pm

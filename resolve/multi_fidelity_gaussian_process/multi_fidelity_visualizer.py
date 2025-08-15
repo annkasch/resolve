@@ -1,7 +1,7 @@
 import numpy as np
 np.random.seed(42)
 from emukit.multi_fidelity.convert_lists_to_array import convert_x_list_to_array
-from resum.utilities import ModelVisualizer
+from resolve.utilities import ModelVisualizer
 
 class GPMultiFidelityVisualizer(ModelVisualizer):
     def __init__(self, mf_model, fidelities, parameters):
