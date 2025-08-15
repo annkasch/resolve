@@ -1,3 +1,1 @@
-from .multi_fidelity_surrogate_model import MFGPModel
-from .multi_fidelity_surrogate_model import MFGPInequalityConstraints
-from .multi_fidelity_visualizer import GPMultiFidelityVisualizer
+from .model_visualizer import ModelVisualizer
