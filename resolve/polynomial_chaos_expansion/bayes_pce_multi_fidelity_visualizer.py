@@ -285,8 +285,6 @@ class PCEMultiFidelityModelVisualizer:
             mesh = np.meshgrid(*x_grid_norm_list, indexing='ij')
             x_grid = np.column_stack([x.flatten() for x in mesh])  # shape: (m, 4)
 
-            
-
             y = self.generate_y_pred_samples(x_grid) # is a list of shape (n_posterior_draws, n_data_samples)
             y = [yi * si for yi, si in zip(y, self.y_scaling)]
             self.y_marginalized = []
@@ -300,7 +298,7 @@ class PCEMultiFidelityModelVisualizer:
                     marg_axes = tuple(ax for ax in all_axes if ax != (ix + 1))
                     self.y_marginalized[-1].append(np.mean(y_grid, axis=marg_axes))
 
-    def plot_marginalized(self,x_data=None, y_data=None, grid_steps=20):
+    def plot_marginalized(self,grid_steps=20):
         if self.y_marginalized is None:
             self.get_marginalized(grid_steps=grid_steps)
         nrows = self.nfidelities
@@ -332,10 +330,7 @@ class PCEMultiFidelityModelVisualizer:
                     color="green", alpha=0.2, label=r'$\pm 1\sigma$'
                 )
                 ax.plot(self.x_grid[keep_axis], y_mean, color="black", label="Model")
-                if x_data is not None and y_data is not None:
-                    x, y, _, _ = self.get_marginalized_single_draw(x_data[f], self.y_scaling[f] * y_data[f], keep_axis=keep_axis, scaling=self.y_scaling[f], grid_steps=grid_steps)
-                    ax.scatter(x, y, marker='.', color="black", label="Data")
-                    w_data=False
+
 
                 #y_ax=np.nan_to_num(y, nan=0.0)
 
@@ -354,21 +349,14 @@ class PCEMultiFidelityModelVisualizer:
                 ax.set_ylabel("")
 
         # Create custom legend handles
-        if x_data is None:
-            legend_elements = [
-                Line2D([0], [0], color='black', lw=2, label='Model prediction'),
-                mpatches.Patch(color='green', alpha=0.2, label=r'$\pm 1\sigma$'),
-                mpatches.Patch(color='yellow', alpha=0.2, label=r'$\pm 2\sigma$'),
-                mpatches.Patch(color='coral', alpha=0.2, label=r'$\pm 3\sigma$')
-            ]
-        else:
-            legend_elements = [
-                Line2D([0], [0], marker='.', color='black', linestyle='None', label='Data'),
-                Line2D([0], [0], color='black', lw=2, label='Model prediction'),
-                mpatches.Patch(color='green', alpha=0.2, label=r'$\pm 1\sigma$'),
-                mpatches.Patch(color='yellow', alpha=0.2, label=r'$\pm 2\sigma$'),
-                mpatches.Patch(color='coral', alpha=0.2, label=r'$\pm 3\sigma$')
-            ]
+
+        legend_elements = [
+            Line2D([0], [0], marker='.', color='black', linestyle='None', label='Data'),
+            Line2D([0], [0], color='black', lw=2, label='Model prediction'),
+            mpatches.Patch(color='green', alpha=0.2, label=r'$\pm 1\sigma$'),
+            mpatches.Patch(color='yellow', alpha=0.2, label=r'$\pm 2\sigma$'),
+            mpatches.Patch(color='coral', alpha=0.2, label=r'$\pm 3\sigma$')
+        ]
 
 
         fig.legend(handles=legend_elements, loc='upper center', ncol=len(legend_elements), fontsize=16, frameon=False, bbox_to_anchor=(0.5, 1.05))
@@ -433,8 +421,12 @@ class PCEMultiFidelityModelVisualizer:
 
         # 5. For each bin, compute the median and 1σ percentiles (16th and 84th) from the samples in the bin.
         medians = np.empty(grid_steps)
-        lower_vals = np.empty(grid_steps)
-        upper_vals = np.empty(grid_steps)
+        one_sigma_lower_vals = np.empty(grid_steps)
+        one_sigma_upper_vals = np.empty(grid_steps)
+        two_sigma_lower_vals = np.empty(grid_steps)
+        two_sigma_upper_vals = np.empty(grid_steps)
+        three_sigma_lower_vals = np.empty(grid_steps)
+        three_sigma_upper_vals = np.empty(grid_steps)
         for i in range(grid_steps):
             # Use a half-open interval except for the last bin.
             if i < grid_steps - 1:
@@ -444,18 +436,31 @@ class PCEMultiFidelityModelVisualizer:
             if np.sum(mask) > 0:
                 bin_values = y_data[mask]
                 medians[i] = np.median(bin_values)
-                lower_vals[i] = np.percentile(bin_values, 16)
-                upper_vals[i] = np.percentile(bin_values, 84)
+                one_sigma_lower_vals[i] = np.percentile(bin_values, 16)
+                one_sigma_upper_vals[i] = np.percentile(bin_values, 84)
+                two_sigma_lower_vals[i] = np.percentile(bin_values, 2.5)
+                two_sigma_upper_vals[i] = np.percentile(bin_values, 97.5)
+                three_sigma_lower_vals[i] = np.percentile(bin_values, 0.5)
+                three_sigma_upper_vals[i] = np.percentile(bin_values, 99.5)
             else:
                 medians[i] = np.nan
-                lower_vals[i] = np.nan
-                upper_vals[i] = np.nan
+                one_sigma_lower_vals[i] = np.nan
+                one_sigma_upper_vals[i] = np.nan
+                two_sigma_lower_vals[i] = np.nan
+                two_sigma_upper_vals[i] = np.nan
+                three_sigma_lower_vals[i] = np.nan
+                three_sigma_upper_vals[i] = np.nan
+
 
         # Compute errors for plotting (errorbars represent the distance from the median to the percentiles)
-        lower_error = medians - lower_vals
-        upper_error = upper_vals - medians
+        one_sigma_lower_error = medians - one_sigma_lower_vals
+        one_sigma_upper_error = one_sigma_upper_vals - medians
+        two_sigma_lower_error = medians - two_sigma_lower_vals
+        two_sigma_upper_error = two_sigma_upper_vals - medians
+        three_sigma_lower_error = medians - three_sigma_lower_vals
+        three_sigma_upper_error = three_sigma_upper_vals - medians
         
-        return bin_centers, medians, lower_error, upper_error
+        return bin_centers, medians, [one_sigma_lower_error, one_sigma_upper_error], [two_sigma_lower_error, two_sigma_upper_error] ,[three_sigma_lower_error, three_sigma_upper_error]
     
     def set_y_scaling(self, scaling):
         self.y_scaling[self.nfidelities-1] =  scaling

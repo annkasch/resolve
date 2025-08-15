@@ -15,6 +15,7 @@ from sklearn.metrics import (
 from sklearn.metrics import roc_auc_score, average_precision_score
 import matplotlib.pyplot as plt
 import math
+from torch.utils.data import get_worker_info
 
 
 class Trainer():
@@ -109,6 +110,7 @@ class Trainer():
                 ax[k].hist(prediction_signal_training[:, k], range=target_range, bins=bins, color='coral', alpha=0.8, label='network (signal)')
 
             ax[k].set_yscale('log')
+            ax[k].set_ylim(1e-1,1e6)
             ax[k].set_ylabel("Count")
             ax[k].set_xlabel(r'$y_{CNP}$')
             ax[k].set_title(f'Loss {loss_training:.4f}', fontsize=10)
@@ -338,7 +340,7 @@ class Trainer():
         else:
             return loss
 
-    def predict(self, dataset_predict):
+    def predict(self, dataset_predict, writer=None):
             """
             Run the model in prediction mode over the given dataset.
             Returns:
@@ -348,20 +350,25 @@ class Trainer():
                 - features_all: np.ndarray of unnormalized input features
             """
             self.model.eval()
+            theta_size = len(dataset_predict.config_file["simulation_settings"]["theta_headers"])
+            num_workers = dataset_predict.config_file["cnp_settings"]["number_of_workers"]
 
-            mu_all = []
-            sigma_all = []
-            target_y_all = []
-            features_all = []
+            mu_mean=[]
+            sigma_mean=[]
+            y_mean=[]
+            x=[]
+            mu_mean_tmp = [[] for _ in range(num_workers)]
+            sigma_mean_tmp = [[] for _ in range(num_workers)]
+            y_mean_tmp = [[] for _ in range(num_workers)]
+            counts = []
 
             dataloader = dataset_predict.dataloader
 
+            # Progress bar for files
+            pbar = tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file")
+
             with torch.no_grad():
-                for b, batch in tqdm(
-                    enumerate(dataloader),
-                    total=math.ceil(len(dataloader) / dataset_predict._batch_size),
-                    desc="Predicting"
-                ):
+                for batch, worker_id, file_completed in dataloader:
                     batch_formatted = dataset_predict.format_batch_for_cnp(
                         batch, True
                     )
@@ -378,47 +385,34 @@ class Trainer():
                     x_std = dataset_predict.feature_std.cpu()
                     x_unnorm = x_norm * (x_std+1.e-6) + x_mean  # element-wise
 
-                    mu_all.append(mu[0].cpu().numpy().reshape(-1, mu[0].shape[-1]))
-                    sigma_all.append(sigma[0].cpu().numpy().reshape(-1, sigma[0].shape[-1]))
-                    target_y_all.append(batch_formatted.target_y[0].cpu().numpy().reshape(-1, batch_formatted.target_y[0].shape[-1]))
-                    features_all.append(x_unnorm.reshape(-1, x_unnorm.shape[-1])) 
+                    mu_mean_tmp[worker_id].extend(mu[0].cpu().numpy())
+                    sigma_mean_tmp[worker_id].extend(sigma[0].cpu().numpy())
+                    y_mean_tmp[worker_id].extend(batch_formatted.target_y[0].cpu().numpy())
 
-            mu_all = np.concatenate(mu_all, axis=0)  
-            sigma_all = np.concatenate(sigma_all, axis=0)
-            target_y_all = np.concatenate(target_y_all, axis=0)
-            features_all = np.concatenate(features_all, axis=0)
-
-            return mu_all, sigma_all, target_y_all, features_all
-
-
-    def aggretate_predictions(self, dataset_predict):
-        mu, sigma, y, x = self.predict(dataset_predict)
-
-        theta_size = len(self.dataset.config_file["simulation_settings"]["theta_headers"])
-        theta = x[:, 0:theta_size]
-        sort_idx = np.lexsort([theta[:, i] for i in reversed(range(theta_size))])
-
-        theta_sorted = theta[sort_idx]
-        mu_sorted = mu[sort_idx]
-        sigma_sorted = sigma[sort_idx]
-        y_sorted = y[sort_idx]
-
-        theta_unique, inverse_indices = np.unique(theta_sorted, axis=0, return_inverse=True)
-        counts = np.bincount(inverse_indices)
-
-        mu_avg_per_theta = np.zeros((len(theta_unique), mu_sorted.shape[1]))
-        np.add.at(mu_avg_per_theta, inverse_indices, mu_sorted)
-        mu_avg_per_theta /= counts[:, None]
-
-        sigma_avg_per_theta = np.zeros((len(theta_unique), sigma_sorted.shape[1]))
-        np.add.at(sigma_avg_per_theta, inverse_indices, sigma_sorted)
-        sigma_avg_per_theta /= counts[:, None]
-
-        y_avg_per_theta = np.zeros((len(theta_unique), y_sorted.shape[1]))
-        np.add.at(y_avg_per_theta, inverse_indices, y_sorted)
-        y_avg_per_theta /= counts[:, None]
-
-        return theta_unique, counts, mu_avg_per_theta, sigma_avg_per_theta, y_avg_per_theta
+                    if file_completed:
+                        # Inverse variance weights
+                        weights = 1 / np.array(sigma_mean_tmp[worker_id])**2
+                        # Weighted average of mu
+                        mu_avg = np.sum(weights * np.array(mu_mean_tmp[worker_id])) / np.sum(weights)
+                        # Uncertainty on the weighted average
+                        sigma_avg = np.sqrt(1 / np.sum(weights))
+                        
+                        mu_mean.append(mu_avg)
+                        sigma_mean.append(sigma_avg)
+                        y_mean.append(np.mean(y_mean_tmp[worker_id]))
+                        x.append(x_unnorm[0].cpu().numpy()[0][:theta_size])
+                        counts.append(len(mu_mean_tmp[worker_id]))
+                        
+                        #fig = self.plot(np.array(mu_mean_tmp), np.array(y_mean_tmp), -1, self.target_range, len(mu_mean_tmp[worker_id]))
+                        #writer.add_figure(f'Plot/Predition', fig, global_step=len(mu_mean_tmp[worker_id]))
+                        
+                        mu_mean_tmp[worker_id]=[]
+                        y_mean_tmp[worker_id]=[]
+                        sigma_mean_tmp[worker_id]=[]
+                        
+                        pbar.update(1)  # move progress bar by one file
+                        
+            return np.array(x), np.array(counts).reshape(-1,1), np.array(mu_mean).reshape(-1,1), np.array(sigma_mean).reshape(-1,1), np.array(y_mean).reshape(-1,1)
 
     def get_final_metrics(self):
         # Extract or define final metrics manually if not tracked

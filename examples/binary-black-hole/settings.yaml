@@ -14,11 +14,8 @@ cnp_settings:
   context_is_subset: false
   batch_size_train: 2000
   files_per_batch_train: 10
-  batch_size_predict:
-  - 5000
-  - 1000
   files_per_batch_predict: 1
-  number_of_walkers: 1
+  number_of_workers: 1
   split_ratio:
   - 0.6
   - 0.2
@@ -26,8 +23,8 @@ cnp_settings:
   training:
     use_staged_training: false
     phase1:
-      training_epochs: 20
-      mixup_ratio: 0.3
+      training_epochs: 100
+      mixup_ratio: 1.0
       mixup_margin: 0.0
       use_beta:
       - 0.1
@@ -39,7 +36,7 @@ cnp_settings:
       training_epochs: 0
       learning_rate: 0.0001
       weight_false_positives: 0.0
-      weight_true_positives: 0.0
+      weight_true_positives: 1.0
 feature_settings:
   use_normalization: zscore
   feature_size: 30
@@ -52,11 +49,11 @@ feature_settings:
     - 0.0
     - 0.0
     - 0.0
-    - 0.026433205232024193
-    - 13.867612838745117
-    - 75.2010726928711
-    - 40.50010681152344
-    - 0.1646568924188614
+    - 0.015657739713788033
+    - 13.92072868347168
+    - 75.92536926269531
+    - 45.540924072265625
+    - 0.09802230447530746
     - 0.0
     - 0.014990150928497314
     - 0.014990150928497314
@@ -69,12 +66,12 @@ feature_settings:
     - 30.0
     - 30.0
     - 1.0
-    - 0.5062448382377625
-    - 92.44620513916016
-    - 12.073898315429688
-    - 11.448996543884277
+    - 0.5100019574165344
+    - 55.58350372314453
+    - 12.85440731048584
+    - 12.482093811035156
     - 1.0
-    - 0.9921497702598572
+    - 0.9953560829162598
   x_std:
   - - 0.008603613823652267
     - 2.884115695953369
@@ -83,11 +80,11 @@ feature_settings:
     - 9.999999747378752e-05
     - 9.999999747378752e-05
     - 9.999999747378752e-05
-    - 0.15921646356582642
-    - 3.4051225185394287
-    - 39.195858001708984
-    - 30.891685485839844
-    - 0.3675243854522705
+    - 0.11887042969465256
+    - 2.5336992740631104
+    - 32.065040588378906
+    - 26.093732833862305
+    - 0.28345680236816406
     - 9.999999747378752e-05
     - 0.008603550493717194
     - 0.008603550493717194
@@ -100,12 +97,12 @@ feature_settings:
     - 9.999999747378752e-05
     - 9.999999747378752e-05
     - 9.999999747378752e-05
-    - 0.28500092029571533
-    - 192.713623046875
-    - 4.354128360748291
-    - 4.741987705230713
+    - 0.27499741315841675
+    - 149.31130981445312
+    - 3.3537020683288574
+    - 3.711118698120117
     - 9.999999747378752e-05
-    - 0.08758259564638138
+    - 0.06508219987154007
 simulation_settings:
   theta_headers:
   - metallicity
@@ -184,18 +181,14 @@ pce_settings:
       sigma_coeffs_delta: 0.1
       sigma_y: 0.006
 path_settings:
-  version: v1.3.2
+  version: v1.3.4
   path_to_files_train: ../in/data/lf/v1.3/training_cnp
   path_to_files_predict:
-  - ../in/data/lf/v1.3/validation
-  - ../in/data/lf/v1.3/training_regression
+  - /Users/aschuetz/Data/BBH/lf/v1.3/tmp
   iteration:
   - -1
-  - 0
   fidelity:
   - 0
-  - 0
-  path_to_files_validation: ../out/cnp/cnp_v1.3_output_validation.csv
   path_out_cnp: ../out/cnp
   path_out_mfgp: ../out/mfgp
   path_out_pce: ../out/pce

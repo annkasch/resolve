@@ -14,18 +14,19 @@ import itertools
 import h5py
 from torch.utils.data import DataLoader, IterableDataset
 from ..utilities import utilities as utils
-import random
+import math
 from torch.utils.data import get_worker_info
 utils.set_random_seed(42)
 
 class HDF5Dataset(IterableDataset):
-    def __init__(self, hdf5_dir, batch_size=3000, files_per_batch=20, parameters=None):
+    def __init__(self, hdf5_dir, batch_size=3000, files_per_batch=20, parameters=None, mode='train'):
         super().__init__()
         self.hdf5_dir = hdf5_dir
         self.batch_size = batch_size
-        self.files_per_batch = files_per_batch
-        self.rows_per_file = batch_size // files_per_batch
+        self.files_per_batch = 1 if mode == "prediction" else files_per_batch
+        
         self.parameters = parameters
+        self.mode = mode
 
         self.files = sorted([
             os.path.join(hdf5_dir, f)
@@ -36,7 +37,10 @@ class HDF5Dataset(IterableDataset):
         max_rows_per_file, self.nrows = utils.get_max_number_of_rows(
             self.files, self.parameters['target']['key']
         )
-        self.total_cycles = max_rows_per_file // self.rows_per_file
+        if max_rows_per_file < self.batch_size:
+            self.batch_size = max_rows_per_file
+        self.rows_per_file = self.batch_size // files_per_batch
+        self.total_cycles = math.ceil(max_rows_per_file / self.rows_per_file)
 
         sample_file = self.files[0]
         self.phi_selected_indices = utils.read_selected_indices(sample_file, self.parameters['phi'])
@@ -66,8 +70,29 @@ class HDF5Dataset(IterableDataset):
         if file_path not in self._file_cache:
             self._file_cache[file_path] = h5py.File(file_path, "r")
         return self._file_cache[file_path]
+    
+    def _read_file(self, hdf, start_idx, end_idx):
+        phi = hdf[self.parameters['phi']['key']][start_idx:end_idx, self.phi_selected_indices]
+        
+        if self.theta_selected_indices is not None:
+            theta_data = hdf[self.parameters['theta']['key']]
+            if theta_data.ndim == 1:
+                theta = theta_data[self.theta_selected_indices]
+                theta = np.tile(theta, (phi.shape[0], 1))
+            else:
+                theta = theta_data[start_idx:end_idx, self.theta_selected_indices]
+            features = np.hstack([theta, phi])
+        else:
+            features = phi
+        target_data = hdf[self.parameters['target']['key']]
+        if target_data.ndim > 1 and self.target_selected_indices is not None:
+            target = target_data[start_idx:end_idx, self.target_selected_indices]
+        else:
+            target = target_data[start_idx:end_idx].reshape(-1, 1)
 
-    def __iter__(self):
+        return np.hstack([features, target])
+
+    def _train_iter(self):
         rng = np.random.default_rng()
         worker_info = get_worker_info()
 
@@ -90,36 +115,51 @@ class HDF5Dataset(IterableDataset):
 
                 start_idx = cycle_idx * self.rows_per_file
                 end_idx = start_idx + self.rows_per_file
-
+                
                 batch = []
                 for file_path in selected_files:
                     hdf = self._get_file_handle(file_path)
-
-                    phi = hdf[self.parameters['phi']['key']][start_idx:end_idx, self.phi_selected_indices]
-
-                    if self.theta_selected_indices is not None:
-                        theta_data = hdf[self.parameters['theta']['key']]
-                        if theta_data.ndim == 1:
-                            theta = theta_data[self.theta_selected_indices]
-                            theta = np.tile(theta, (phi.shape[0], 1))
-                        else:
-                            theta = theta_data[start_idx:end_idx, self.theta_selected_indices]
-                        features = np.hstack([theta, phi])
-                    else:
-                        features = phi
-
-                    target_data = hdf[self.parameters['target']['key']]
-                    if target_data.ndim > 1 and self.target_selected_indices is not None:
-                        target = target_data[start_idx:end_idx, self.target_selected_indices]
-                    else:
-                        target = target_data[start_idx:end_idx].reshape(-1, 1)
-
-                    file_data = np.hstack([features, target])
-                    batch.append(file_data)
+                    batch.append(self._read_file(hdf, start_idx, end_idx))
 
                 batch = np.vstack(batch)
                 rng.shuffle(batch)
                 yield torch.tensor(batch, dtype=torch.float32)
+
+    def _predict_iter(self):
+
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        self.subcycles_per_file = self.total_cycles  # total_cycles = rows_per_file per file
+
+        # Split files among workers
+        files_for_worker = self.files[worker_id::num_workers]
+
+        for file_path in files_for_worker:
+            hdf = self._get_file_handle(file_path)
+            file_idx = self.files.index(file_path)
+
+            for subcycle_idx in range(self.subcycles_per_file):
+                start_idx = subcycle_idx * self.rows_per_file
+                end_idx = start_idx + self.rows_per_file
+                batch = self._read_file(hdf, start_idx, end_idx)
+                file_completed = (subcycle_idx == self.subcycles_per_file - 1)
+
+                yield torch.tensor(batch, dtype=torch.float32), worker_id, file_completed
+                if file_completed:
+                    # Close the file handle after processing the last subcycle
+                    hdf.close()
+                    del self._file_cache[file_path]
+                    gc.collect()
+                
+
+    def __iter__(self):
+        if self.mode !='prediction':
+            return self._train_iter()
+        else:
+            return self._predict_iter()
+
 
 CNPRegressionDescription = collections.namedtuple(
     "CNPRegressionDescription", ("query", "target_y")
@@ -136,7 +176,8 @@ class DataGeneration:
         self.feature_mean = None
         self.feature_std = None
         self.use_normalization = config_file["feature_settings"]["use_normalization"]
-
+        self.mode=mode
+        
         _phi_key = "phi"
         _theta_key = "theta"
         _target_key = "target"
@@ -157,7 +198,7 @@ class DataGeneration:
             'target': {'key': _target_key, 'label_key': "target_headers", 'selected_labels': self._names_target}
         }
 
-        if mode.startswith("training"):
+        if self.mode.startswith("training"):
             files = self._get_hdf5_files()
             if "phase2" not in mode:
                 signal_condition = config_file["simulation_settings"]["signal_condition"]
@@ -176,13 +217,13 @@ class DataGeneration:
                 self.parameters["phi"]["key"] = "phi_train_raw" # unaltered training set
                 self.parameters["target"]["key"] = "target_train_raw" # unaltered training set
 
-        elif mode == "validation":
+        elif self.mode == "validation":
             self.parameters["phi"]["key"] = "phi_val"
             self.parameters["target"]["key"] = "target_val"
-        elif mode == "testing":
+        elif self.mode == "testing":
             self.parameters["phi"]["key"] = "phi_test"
             self.parameters["target"]["key"] = "target_test"
-        elif mode == "prediction":
+        elif self.mode == "prediction":
             self.parameters["phi"]["key"] = "phi"
             self.parameters["target"]["key"] = "target"
 
@@ -203,17 +244,19 @@ class DataGeneration:
             self.path_to_files,
             batch_size=self._batch_size,
             files_per_batch=self.files_per_batch,
-            parameters=self.parameters
+            parameters=self.parameters,
+            mode=self.mode
         )
 
         self.dataloader = DataLoader(
             dataset,
             batch_size=None,  # required for IterableDataset
-            num_workers=4,
+            num_workers=self.config_file["cnp_settings"]["number_of_workers"],
             prefetch_factor=2,
             pin_memory=True,
             persistent_workers=True
         )
+    
     def split_and_mixup_augment(self, filename, split_ratio, use_beta, condition_strings, mixup_ratio=0.):
 
         combined = [
