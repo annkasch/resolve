@@ -6,7 +6,7 @@ from numpy.polynomial.legendre import Legendre
 import random
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
-from resolve.utilities import plotting_utils as plotting
+from resum.utilities import ModelVisualizer
 from scipy.integrate import nquad
 from math import comb
 import pymc as pm
@@ -14,7 +14,7 @@ import pymc as pm
 np.random.seed(42)         # NumPy seed
 random.seed(42)            # Python random seed
 
-class PCEMultiFidelityModelVisualizer:
+class PCEMultiFidelityModelVisualizer(ModelVisualizer):
     def __init__(self, fidelities, parameters, degree, trace=None):
         """
         Initialize the multi-fidelity model visualizer.
@@ -26,13 +26,8 @@ class PCEMultiFidelityModelVisualizer:
         - priors (dict): Dictionary of prior configurations for each fidelity level.
           Example: {"lf": {"sigma": 0.5}, "mf": {"sigma": 0.1}, "hf": {"sigma": 0.01}}
         """
-        self.fidelities = fidelities
-        self.nfidelities = len(fidelities)
-        self.feature_labels = list(map(str, parameters.keys()))
+        super().__init__(fidelities, parameters)
         self.degree = degree
-        self.x_min = np.array([parameters[k][0] for k in self.feature_labels])
-        self.x_max = np.array([parameters[k][1] for k in self.feature_labels])
-
         self.trace = trace
         if trace==None:
             print("Warring: No trace has been given. Please run \"read_trace(path_to_trace)\"")
@@ -86,6 +81,7 @@ class PCEMultiFidelityModelVisualizer:
         - y_pred_samples (ndarray): A lit of each predicted fidelity samples (shape: list of (n_samples_total x n_hf_samples)).
         """
         y_pred_samples=[]
+
         basis_matrix_test,_ = self._generate_basis(x_data,self.degree[0])  # Shape: (n_samples, n_terms_hf)
         coeff_samples = self.trace.posterior[f"coeffs_{self.fidelities[0]}"].values
         coeff_samples_flat = coeff_samples.reshape(-1, coeff_samples.shape[-1]) 
@@ -132,6 +128,22 @@ class PCEMultiFidelityModelVisualizer:
         y_pred_samples = self.generate_y_pred_samples(x_data)[fidelity]
         return y_pred_samples
     
+    def get_model_prediction(self, x_data):
+        
+        y_mean=[]
+        sigma1=[]
+        sigma2=[]
+        sigma3=[]
+        for f in range(self.nfidelities):
+            x_data_tmp = self.normalize_to_minus1_plus1(x_data[f])
+            y_pred_samples = self.generate_y_pred_samples(x_data_tmp)[f]
+            y_mean.append(np.percentile(y_pred_samples, 50., axis=0))
+            sigma1.append([np.percentile(y_pred_samples, 16., axis=0),np.percentile(y_pred_samples, 84., axis=0)])
+            sigma2.append([np.percentile(y_pred_samples, 2.5, axis=0),np.percentile(y_pred_samples, 97.5, axis=0)])
+            sigma3.append([np.percentile(y_pred_samples, 0.5, axis=0),np.percentile(y_pred_samples, 99.5, axis=0)])
+
+        return y_mean, sigma1, sigma2, sigma3
+
     def unnormalized_pdf(self, x, fidelity=1):
         pred = self.predict(x, fidelity)
         return np.maximum(pred, 0)
@@ -147,128 +159,6 @@ class PCEMultiFidelityModelVisualizer:
     def log_likelihood(self, x):
         return np.log(self.likelihood(x))
 
-    def validate_mse(self, x_data, y_true, include_noise=False):
-        """
-        Validate the mean squared error (MSE) of the model.
-
-        Parameters:
-        - x_data (ndarray): Input data for prediction.
-        - y_true (ndarray): True target values.
-        - include_noise (bool): Whether to include noise in predictions.
-
-        Returns:
-        - list: Mean Squared Error
-        """
-        mse = []
-
-        for f in range(self.nfidelities):
-            x_data_tmp = self.normalize_to_minus1_plus1(x_data[f])
-            y_pred_samples = self.y_scaling[f] * self.generate_y_pred_samples(x_data_tmp, include_noise=include_noise)[f]  # use highest fidelity
-            y_pred_mean = y_pred_samples.mean(axis=0)
-            y_true_tmp = self.y_scaling[f] * y_true[f]
-            mse.append(np.mean((y_true_tmp - y_pred_mean) ** 2))
-
-        return mse
-
-    def plot_validation(self, x_data, y_true):
-        """
-        Plot the validation data with the uncertainty prediction bands.
-
-        Parameters:
-        - x_data (ndarray): Input data (e.g., validation or test set).
-        - y_true (ndarray): True high-fidelity target values for validation.
-        - trace: Trace object containing posterior samples from PyMC.
-        """
-        if len(x_data) != self.nfidelities:
-            print(f"ERROR: Expected data for {self.nfidelities} fidelities, but got {len(x_data)}.")
-            return
-
-        mse = self.validate_mse(x_data,y_true)
-        coverage = self.validate_coverage(x_data,y_true)
-
-        nrows = self.nfidelities
-        ncols = 1
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(12 * ncols, 3 * nrows), squeeze=False)
-
-        for f in range(self.nfidelities):
-            ax = axes[f][0]
-            x_data_tmp = self.normalize_to_minus1_plus1(x_data[f])
-            y_pred_samples = self.y_scaling[f] * self.generate_y_pred_samples(x_data_tmp)[f]
-            sample_numbers = np.arange(len(y_true[f]))
-
-            ax.fill_between(
-                sample_numbers,
-                np.percentile(y_pred_samples, 0.5, axis=0),
-                np.percentile(y_pred_samples, 99.5, axis=0),
-                color="coral", alpha=0.2, label=r'$\pm 3\sigma$'
-            )
-            ax.fill_between(
-                sample_numbers,
-                np.percentile(y_pred_samples, 2.5, axis=0),
-                np.percentile(y_pred_samples, 97.5, axis=0),
-                color="yellow", alpha=0.2, label=r'$\pm 2\sigma$'
-            )
-            ax.fill_between(
-                sample_numbers,
-                np.percentile(y_pred_samples, 16, axis=0),
-                np.percentile(y_pred_samples, 84, axis=0),
-                color="green", alpha=0.2, label=r'$\pm 1\sigma$'
-            )
-            ax.scatter(sample_numbers, self.y_scaling[f] * y_true[f], marker='.',s=5, color="black", label=f"{self.fidelities[f]} Validation Data")
-
-            ax.set_xlabel(f"Simulation Trial Number")
-            ax.set_ylabel(r"Predicted $\epsilon^{("+f"{self.fidelities[f]}"+")}$")
-            text = f"MSE: {mse[f]:.6f} $\pm1\sigma$: {coverage[self.fidelities[f]][1]:.1f}%  $\pm3\sigma$: {coverage[self.fidelities[f]][2]:.1f}%  $\pm3\sigma$: {coverage[self.fidelities[f]][3]:.1f}%"
-            plotting.place_text_corner(ax, text, fontsize=8, bbox=dict(edgecolor='gray', facecolor='none', linewidth=0.5))
-            
-
-        legend_elements = [
-            Line2D([0], [0], marker='.', color='black', linestyle='None', label='Data'),
-            Line2D([0], [0], marker='.', color='white', linestyle='None', label='Model prediction'),
-            mpatches.Patch(color='green', alpha=0.2, label=r'$\pm 1\sigma$'),
-            mpatches.Patch(color='yellow', alpha=0.2, label=r'$\pm 2\sigma$'),
-            mpatches.Patch(color='coral', alpha=0.2, label=r'$\pm 3\sigma$')
-        ]
-        fig.legend(handles=legend_elements, loc='upper center', ncol=len(legend_elements), fontsize='medium', frameon=False, bbox_to_anchor=(0.5, 1.05))
-        plt.tight_layout()
-        return fig
-
-    def validate_coverage(self, x_data, y_true):
-        """
-        Validate the coverage of the model for 1, 2, and 3 sigma intervals.
-
-        Parameters:
-        - y_true (ndarray): True high-fidelity target values for validation.
-        - y_hf_pred_samples (ndarray): Posterior predictive samples for high-fidelity predictions.
-
-        Returns:
-        - dict: Percentages of validation data within 1, 2, and 3 sigma intervals.
-        """
-        coverage={}
-        for ix in range(len(x_data)):
-            x_data_tmp = self.normalize_to_minus1_plus1(x_data[ix])
-            y_pred_samples = self.y_scaling[ix] * self.generate_y_pred_samples(x_data_tmp)[ix]
-            y_true_tmp = self.y_scaling[ix] * y_true[ix]
-            counters = {1: 0, 2: 0, 3: 0}
-
-            # Calculate percentile intervals for the posterior samples
-            percentiles = {
-                1: (np.percentile(y_pred_samples, 16, axis=0), np.percentile(y_pred_samples, 84, axis=0)),
-                2: (np.percentile(y_pred_samples, 2.5, axis=0), np.percentile(y_pred_samples, 97.5, axis=0)),
-                3: (np.percentile(y_pred_samples, 0.5, axis=0), np.percentile(y_pred_samples, 99.5, axis=0)),
-            }
-
-            # Count the number of y_true points within each interval
-            for i, y in enumerate(y_true_tmp):
-                for sigma in [1, 2, 3]:
-                    low, high = percentiles[sigma]
-                    if low[i] <= y <= high[i]:
-                        counters[sigma] += 1
-
-            # Calculate percentages
-            coverage[self.fidelities[ix]]={sigma: (counters[sigma] / len(y_true_tmp)) * 100 for sigma in [1, 2, 3]}
-        return coverage
-    
     def get_marginalized(self, grid_steps=20):
             def reverse_norm(x_norm, x_min, x_max):
                 return x_min + (x_norm + 1) * (x_max - x_min) / 2
@@ -284,9 +174,8 @@ class PCEMultiFidelityModelVisualizer:
 
             mesh = np.meshgrid(*x_grid_norm_list, indexing='ij')
             x_grid = np.column_stack([x.flatten() for x in mesh])  # shape: (m, 4)
-
             y = self.generate_y_pred_samples(x_grid) # is a list of shape (n_posterior_draws, n_data_samples)
-            y = [yi * si for yi, si in zip(y, self.y_scaling)]
+
             self.y_marginalized = []
             for f in range(self.nfidelities):
                 self.y_marginalized.append([])
@@ -298,12 +187,12 @@ class PCEMultiFidelityModelVisualizer:
                     marg_axes = tuple(ax for ax in all_axes if ax != (ix + 1))
                     self.y_marginalized[-1].append(np.mean(y_grid, axis=marg_axes))
 
-    def plot_marginalized(self,grid_steps=20):
-        if self.y_marginalized is None:
-            self.get_marginalized(grid_steps=grid_steps)
+    def plot_marginalized(self,grid_steps=50):
+        
+        self.get_marginalized(grid_steps=grid_steps)
         nrows = self.nfidelities
         ncols = len(self.x_max)
-        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(10 * ncols, 4 * nrows), sharex='col', sharey='row',squeeze=False)
+        fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(5 * ncols, 4 * nrows),squeeze=False)
 
         for f in range(self.nfidelities):
             for keep_axis in range(len(self.x_max)):
@@ -329,8 +218,6 @@ class PCEMultiFidelityModelVisualizer:
                     self.x_grid[keep_axis], y_1sigma_low, y_1sigma_high,
                     color="green", alpha=0.2, label=r'$\pm 1\sigma$'
                 )
-                ax.plot(self.x_grid[keep_axis], y_mean, color="black", label="Model")
-
 
                 #y_ax=np.nan_to_num(y, nan=0.0)
 
@@ -344,20 +231,18 @@ class PCEMultiFidelityModelVisualizer:
             for ax in axes[i, :]:
                 ax.set_xlabel("")
         
-        for i in range(n_rows):
-            for ax in axes[i, 1:]:
-                ax.set_ylabel("")
+        #for i in range(n_rows):
+        #    for ax in axes[i, 1:]:
+        #        ax.set_ylabel("")
 
         # Create custom legend handles
 
         legend_elements = [
-            Line2D([0], [0], marker='.', color='black', linestyle='None', label='Data'),
             Line2D([0], [0], color='black', lw=2, label='Model prediction'),
             mpatches.Patch(color='green', alpha=0.2, label=r'$\pm 1\sigma$'),
             mpatches.Patch(color='yellow', alpha=0.2, label=r'$\pm 2\sigma$'),
             mpatches.Patch(color='coral', alpha=0.2, label=r'$\pm 3\sigma$')
         ]
-
 
         fig.legend(handles=legend_elements, loc='upper center', ncol=len(legend_elements), fontsize=16, frameon=False, bbox_to_anchor=(0.5, 1.05))
         plt.tight_layout(rect=[0, 0.05, 1, 1])  # Leave space at bottom for legend
@@ -407,62 +292,3 @@ class PCEMultiFidelityModelVisualizer:
         y_hf_1sigma_high= np.nanpercentile(binned_means, 84, axis=0)
 
         return y_hf_mean, y_hf_1sigma_low, y_hf_1sigma_high
-    
-    def get_marginalized_single_draw(self, x_data, y_data, keep_axis, scaling=1., grid_steps=25):
-        """
-        Marginalizes predictions over all but one feature using random sampling when only one 
-        prediction is available per sample (y_hf has shape (n_samples, 1)).
-        """
-        x_keep = x_data[:, keep_axis]
-
-        # 4. Define bins along the kept axis in the original scale.
-        bin_edges = np.linspace(self.x_min[keep_axis], self.x_max[keep_axis], grid_steps + 1)
-        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-
-        # 5. For each bin, compute the median and 1σ percentiles (16th and 84th) from the samples in the bin.
-        medians = np.empty(grid_steps)
-        one_sigma_lower_vals = np.empty(grid_steps)
-        one_sigma_upper_vals = np.empty(grid_steps)
-        two_sigma_lower_vals = np.empty(grid_steps)
-        two_sigma_upper_vals = np.empty(grid_steps)
-        three_sigma_lower_vals = np.empty(grid_steps)
-        three_sigma_upper_vals = np.empty(grid_steps)
-        for i in range(grid_steps):
-            # Use a half-open interval except for the last bin.
-            if i < grid_steps - 1:
-                mask = (x_keep >= bin_edges[i]) & (x_keep < bin_edges[i+1])
-            else:
-                mask = (x_keep >= bin_edges[i]) & (x_keep <= bin_edges[i+1])
-            if np.sum(mask) > 0:
-                bin_values = y_data[mask]
-                medians[i] = np.median(bin_values)
-                one_sigma_lower_vals[i] = np.percentile(bin_values, 16)
-                one_sigma_upper_vals[i] = np.percentile(bin_values, 84)
-                two_sigma_lower_vals[i] = np.percentile(bin_values, 2.5)
-                two_sigma_upper_vals[i] = np.percentile(bin_values, 97.5)
-                three_sigma_lower_vals[i] = np.percentile(bin_values, 0.5)
-                three_sigma_upper_vals[i] = np.percentile(bin_values, 99.5)
-            else:
-                medians[i] = np.nan
-                one_sigma_lower_vals[i] = np.nan
-                one_sigma_upper_vals[i] = np.nan
-                two_sigma_lower_vals[i] = np.nan
-                two_sigma_upper_vals[i] = np.nan
-                three_sigma_lower_vals[i] = np.nan
-                three_sigma_upper_vals[i] = np.nan
-
-
-        # Compute errors for plotting (errorbars represent the distance from the median to the percentiles)
-        one_sigma_lower_error = medians - one_sigma_lower_vals
-        one_sigma_upper_error = one_sigma_upper_vals - medians
-        two_sigma_lower_error = medians - two_sigma_lower_vals
-        two_sigma_upper_error = two_sigma_upper_vals - medians
-        three_sigma_lower_error = medians - three_sigma_lower_vals
-        three_sigma_upper_error = three_sigma_upper_vals - medians
-        
-        return bin_centers, medians, [one_sigma_lower_error, one_sigma_upper_error], [two_sigma_lower_error, two_sigma_upper_error] ,[three_sigma_lower_error, three_sigma_upper_error]
-    
-    def set_y_scaling(self, scaling):
-        self.y_scaling[self.nfidelities-1] =  scaling
-
-        

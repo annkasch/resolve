@@ -1,2 +1,0 @@
-lf_sigma_coeffs_prior_type,lf_sigma_coeffs,lf_sigma_y,hf_mu_rho,hf_sigma_rho,hf_sigma_coeffs_prior_type,hf_sigma_coeffs_delta,hf_sigma_y,polynomial_order_lf,polynomial_order_delta_hf,dataset_lf,n_samples,ess_bulk < 100 [%],r_hat > 1.05 [%],p_loo,p_waic,pareto_k > 0.5 [%],BMFI,MSE,coverage
-default,0.1,0.0217551099999999,0.032,0.03028,default,0.1,0.006,4,1,2,8000,0.0,0.0,72.2,70.7,1.1,0.98/0.92/0.91,1.3025897889777425e-05,74%/97%/100%
