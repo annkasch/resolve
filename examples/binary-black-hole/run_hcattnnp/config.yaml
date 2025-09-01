@@ -1,0 +1,173 @@
+cnp_settings:
+  batch_size_predict:
+  - 1000
+  batch_size_train: 500
+  config_wise: false
+  context_is_subset: true
+  context_ratio: 0.333
+  files_per_batch_predict: 1
+  files_per_batch_train: 20
+  number_of_walkers: 1
+  plot_after: 200
+  ratio_testing_vs_training: 1/40
+  signal_to_background_ratio: ''
+  training_epochs: 1
+  use_beta:
+  - 0.1
+  - 0.1
+  use_data_augmentation: mixup
+feature_settings:
+  feature_size: 30
+  target_size: 1
+  x_mean:
+  - - 0.015088998712599277
+    - 4.856727123260498
+    - 461.5833435058594
+    - 458.9075927734375
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.022542858496308327
+    - 13.57253360748291
+    - 75.17450714111328
+    - 44.44785690307617
+    - 0.09907225519418716
+    - 0.0
+    - 0.015088998712599277
+    - 0.015088998712599277
+    - 0.0
+    - 0.0
+    - 4.856727123260498
+    - 1.5
+    - 461.5833435058594
+    - 458.9075927734375
+    - 30.0
+    - 30.0
+    - 1.0
+    - 0.4289821982383728
+    - 53.45836639404297
+    - 12.86812686920166
+    - 12.383307456970215
+    - 1.0
+    - 0.9950169324874878
+  x_std:
+  - - 0.009108012542128563
+    - 2.8084638118743896
+    - 292.5469055175781
+    - 284.3138427734375
+    - 9.99999993922529e-09
+    - 9.99999993922529e-09
+    - 9.99999993922529e-09
+    - 0.14337971806526184
+    - 2.916640043258667
+    - 32.40966033935547
+    - 25.768478393554688
+    - 0.2847732901573181
+    - 9.99999993922529e-09
+    - 0.009108012542128563
+    - 0.009108012542128563
+    - 9.99999993922529e-09
+    - 9.99999993922529e-09
+    - 2.8084638118743896
+    - 9.99999993922529e-09
+    - 292.5469055175781
+    - 284.3138427734375
+    - 9.99999993922529e-09
+    - 9.99999993922529e-09
+    - 9.99999993922529e-09
+    - 0.2616709768772125
+    - 150.52688598632812
+    - 3.3012192249298096
+    - 3.76576566696167
+    - 9.99999993922529e-09
+    - 0.06425653398036957
+mfgp_settings:
+  noise:
+    hf: 0.0
+    lf: 0.021
+path_settings:
+  fidelity:
+  - 0
+  iteration:
+  - 0
+  path_out_cnp: ../out/cnp
+  path_out_mfgp: ../out/mfgp
+  path_out_pce: ../out/pce
+  path_to_files_predict:
+  - ../in/data/lf/v1.2/iteration_0
+  path_to_files_train: ../in/data/lf/v1.2/iteration_0
+  path_to_files_validation: ../out/cnp/cnp_v1.2_output_validation.csv
+  version: v1.2
+pce_settings:
+  polynomial_order: 4
+  priors:
+    hf:
+      mu_rho: 0.49466
+      sigma_coeffs_delta: 0.1
+      sigma_coeffs_prior_type: default
+      sigma_rho: 0.15313
+      sigma_y: 0.006
+    lf:
+      sigma_coeffs: 0.1
+      sigma_coeffs_prior_type: default
+      sigma_y: 0.021
+simulation_settings:
+  hf_cost: 1000
+  lf_cost: 1
+  observed_rate: 17
+  phi_labels:
+  - CH_on_MS(1)
+  - CH_on_MS(2)
+  - Eccentricity@ZAMS
+  - Equilibrated_At_Birth
+  - Evolution_Status
+  - Mass@ZAMS(1)
+  - Mass@ZAMS(2)
+  - Merger
+  - Merger_At_Birth
+  - Metallicity@ZAMS(1)
+  - Metallicity@ZAMS(2)
+  - Omega@ZAMS(1)
+  - Omega@ZAMS(2)
+  - PO_CE_Alpha
+  - PO_LBV_Factor
+  - PO_Sigma_Kick_CCSN_BH
+  - PO_Sigma_Kick_CCSN_NS
+  - PO_Sigma_Kick_ECSN
+  - PO_Sigma_Kick_USSN
+  - PO_WR_Factor
+  - SN_Kick_Magnitude_Random_N
+  - SemiMajorAxis@ZAMS
+  - Stellar_Type(1)
+  - Stellar_Type(2)
+  - Stellar_Type@ZAMS(1)
+  - Stellar_Type@ZAMS(2)
+  signal_condition:
+  - BBH Events==1
+  target_headers:
+  - BBH Events
+  target_headers_plot: $\hat{\epsilon}$
+  target_range:
+  - 0
+  - 1
+  theta_headers:
+  - metallicity
+  - envelope_eff_alpha
+  - sigma_bh
+  - sigma_ns
+  theta_headers_plot:
+  - metallicity
+  - $\alpha_{CE}$
+  - $\sigma_{BH}$
+  - $\sigma_{NS}$
+  theta_max:
+  - 0.031
+  - 10
+  - 1000
+  - 1000
+  theta_min:
+  - 0.0001
+  - 0
+  - 0
+  - 0
+  y_scaling: 3142.6685399999997
