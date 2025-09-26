@@ -3,5 +3,7 @@
 *.pth
 *.pyc
 *.json
-__pycache__/
+*.png
+*.csv
+ examples/binary-black-hole/in/
 *tensorboard_logs/
