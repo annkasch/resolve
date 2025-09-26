@@ -26,7 +26,7 @@ cnp_settings:
   training:
     use_staged_training: false
     phase1:
-      training_epochs: 25
+      training_epochs: 2
       mixup_ratio: 0.0
       mixup_margin: 0.0
       use_beta:
@@ -71,8 +71,6 @@ feature_settings:
     - 0.0
     - 4.994467735290527
     - 1.5
-    - 500.17999267578125
-    - 498.3039855957031
     - 30.0
     - 30.0
     - 1.0
@@ -102,8 +100,6 @@ feature_settings:
     - 9.999999747378752e-05
     - 2.8838846683502197
     - 9.999999747378752e-05
-    - 288.7698974609375
-    - 288.7687072753906
     - 9.999999747378752e-05
     - 9.999999747378752e-05
     - 9.999999747378752e-05
@@ -140,8 +136,6 @@ simulation_settings:
   - Omega@ZAMS(2)
   - PO_CE_Alpha
   - PO_LBV_Factor
-  - PO_Sigma_Kick_CCSN_BH
-  - PO_Sigma_Kick_CCSN_NS
   - PO_Sigma_Kick_ECSN
   - PO_Sigma_Kick_USSN
   - PO_WR_Factor

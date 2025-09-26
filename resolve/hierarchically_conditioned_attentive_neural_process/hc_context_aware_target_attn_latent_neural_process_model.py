@@ -249,7 +249,7 @@ class GlobalContextAttentionDual(nn.Module):
             scores = scores.masked_fill(~mask[:, None, None, :], float('-inf'))
         attn = torch.softmax(scores, dim=-1)  # (B,H,Nt,Nc)
         w_token = attn[..., -1].mean().item()   # average over batch, heads, targets
-        print("avg attn to latent token:", w_token)
+        #print("avg attn to latent token:", w_token)
         # two value matmuls: all and weighted
         V_all = V
         V_pos = V * wS[:, None, :, None]      # broadcast (B,1,Nc,1)
@@ -378,7 +378,7 @@ class HCTargetAttnLNP(nn.Module):
             logvar_p = torch.zeros_like(logvar_q)
 
         kl = kl_gauss(mu_q, logvar_q, mu_p, logvar_p)  # (B,)
-        print(mu_q.norm().mean(), logvar_q.mean(),kl.mean())
+        #print(mu_q.norm().mean(), logvar_q.mean(),kl.mean())
 
         # 2) Build per-target query
         R_t = self.tquery(theta_t, phi_t)              # (B,Nt,D)
@@ -387,7 +387,7 @@ class HCTargetAttnLNP(nn.Module):
         token, s_base = self.latent_proj(z)            # (B,D), (B,1)
         token = token.unsqueeze(1)                     # (B,1,D)
         s_base = s_base.squeeze(-1)                    # (B,)
-        print(s_base.mean())
+        #print(s_base.mean())
         # 4) Extend context with latent token
         R_ctx_ext = torch.cat([R_ctx, token], dim=1)   # (B,Nc+1,D)
         mask_ext  = torch.cat([mask_c, torch.ones(B,1, dtype=torch.bool, device=mask_c.device)], dim=1)

@@ -10,6 +10,7 @@ from sklearn.metrics import (
     recall_score,
     f1_score
 )
+from typing import Tuple
 from sklearn.metrics import roc_auc_score, average_precision_score
 import matplotlib.pyplot as plt
 import numpy as np
@@ -19,6 +20,9 @@ import torch
 from .losses import AsymmetricFocalWithFPPenalty
 from sklearn.metrics import precision_recall_curve, auc
 import os
+import zarr, gc
+from numcodecs import Blosc
+
 
 class Trainer():
     def __init__(self, model, dataset):
@@ -184,7 +188,6 @@ class Trainer():
         with torch.no_grad():
 
             for b, batch in tqdm(enumerate(dataloader), total=math.ceil(len(dataloader) / dataset_eval._batch_size), desc=f"Evaluation"):
-                
                 batch_formatted = dataset_eval.format_batch_for_cnp(
                     batch, self.dataset.config_file["cnp_settings"]["context_is_subset"]
                 )
@@ -215,15 +218,299 @@ class Trainer():
 
         return y_pred, y_true, epoch_loss
 
+    def predict(self, dataset_predict, writer=None, out_store="pred_store.zarr",
+                dtype=np.float32, mu_chunks=262_144) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Run the model in prediction mode over the given dataset.
+
+        Persists ALL per-query data to a Zarr store:
+        worker_{k}/mu       : (N_k,) or float32
+        worker_{k}/q_theta  : (N_k, q_theta_dim) float32  (RAW/unnormalized)
+        worker_{k}/q_phi    : (N_k, q_phi_dim)   float32  (RAW/unnormalized)
+        worker_{k}/y_true   : (N_k,) or (N_k, y_dim) float32 (RAW/unnormalized)
+        worker_{k}/file_start : (n_files_k,) int64
+        worker_{k}/file_count : (n_files_k,) int64
+
+        Meta (global across files):
+        meta/theta           : (n_files_total, theta_size) float32   (context θ, unnormalized)
+        meta/worker_of_file  : (n_files_total,) int32
+
+        Returns (small arrays kept in RAM):
+        theta         : (n_files, theta_size)
+        counts        : (n_files, 1)            number of queries in each file
+        mu_mean       : (n_files, 1)
+        sigma_mean    : (n_files, 1)            std over μ within file
+        y_mean        : (n_files, 1)            mean target if scalar; 0.0 otherwise
+        """
+        self.model.eval()
+
+        theta_size = len(dataset_predict.config_file["simulation_settings"]["theta_headers"])
+        # We'll create workers lazily; don't rely on num_workers ordering.
+        # num_workers = dataset_predict.config_file["cnp_settings"]["dataloader_number_of_workers"]
+
+        # tiny outputs we return
+        mu_mean, sigma_mean, y_mean, theta_rows, counts = [], [], [], [], []
+
+        # streaming state per worker (created on first use)
+        state = {}  # worker_id -> dict(n, mu_sum, mu_sumsq, y_sum, cur_start)
+
+        # We infer query dims from the first batch we process
+        q_theta_dim = None
+        q_phi_dim = None
+        y_dim = None
+
+        # Zarr store setup (append if exists; start new with mode="w" if you prefer)
+        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
+        z = zarr.open(out_store, mode="a")
+        meta = z.require_group("meta")
+        # meta datasets (resizable)
+        if "theta" in meta:
+            theta_ds = meta["theta"]
+        else:
+            theta_ds = meta.zeros("theta", shape=(0, theta_size),
+                                chunks=(1024, theta_size), dtype=dtype, compressor=compressor)
+        if "worker_of_file" in meta:
+            who_ds = meta["worker_of_file"]
+        else:
+            who_ds = meta.zeros("worker_of_file", shape=(0,),
+                                chunks=(4096,), dtype=np.int32, compressor=compressor)
+
+        # open dataloader
+        dataset_predict.set_loader()
+        dataloader = dataset_predict.dataloader
+
+        pbar = tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file")
+
+        def _ensure_worker(wk: int):
+            """Create Zarr arrays for a worker if absent."""
+            if f"worker_{wk}" in z:
+                g = z[f"worker_{wk}"]
+            else:
+                g = z.create_group(f"worker_{wk}")
+            # require datasets (so reruns append cleanly)
+            if "mu" in g:
+                mu_arr = g["mu"]
+            else:
+                mu_arr = g.zeros("mu", shape=(0,), chunks=(mu_chunks,),
+                                dtype=dtype, compressor=compressor)
+            if "q_theta" in g:
+                qtheta_arr = g["q_theta"]
+            else:
+                assert q_theta_dim is not None, "q_theta_dim must be known before creating q_theta dataset."
+                qtheta_arr = g.zeros("q_theta", shape=(0, q_theta_dim),
+                                    chunks=(max(1, mu_chunks // max(1, q_theta_dim)), q_theta_dim),
+                                    dtype=dtype, compressor=compressor)
+            if "q_phi" in g:
+                qphi_arr = g["q_phi"]
+            else:
+                assert q_phi_dim is not None, "q_phi_dim must be known before creating q_phi dataset."
+                qphi_arr = g.zeros("q_phi", shape=(0, q_phi_dim),
+                                chunks=(max(1, mu_chunks // max(1, q_phi_dim)), q_phi_dim),
+                                dtype=dtype, compressor=compressor)
+            if "y_true" in g:
+                y_arr = g["y_true"]
+            else:
+                assert y_dim is not None, "y_dim must be known before creating y_true dataset."
+                if y_dim == 1:
+                    y_arr = g.zeros("y_true", shape=(0,), chunks=(mu_chunks,),
+                                    dtype=dtype, compressor=compressor)
+                else:
+                    y_arr = g.zeros("y_true", shape=(0, y_dim),
+                                    chunks=(max(1, mu_chunks // max(1, y_dim)), y_dim),
+                                    dtype=dtype, compressor=compressor)
+            if "file_start" in g:
+                fs_arr = g["file_start"]
+            else:
+                fs_arr = g.zeros("file_start", shape=(0,), chunks=(4096,),
+                                dtype=np.int64, compressor=compressor)
+            if "file_count" in g:
+                fc_arr = g["file_count"]
+            else:
+                fc_arr = g.zeros("file_count", shape=(0,), chunks=(4096,),
+                                dtype=np.int64, compressor=compressor)
+            return {
+                "group": g,
+                "mu": mu_arr,
+                "q_theta": qtheta_arr,
+                "q_phi": qphi_arr,
+                "y_true": y_arr,
+                "file_start": fs_arr,
+                "file_count": fc_arr,
+            }
+
+        with torch.no_grad():
+            for batch, worker_id, file_completed in dataloader:
+                # ===== 1) Grab RAW (unnormalized) query matrix from `batch` BEFORE normalization =====
+                # Adapt this to your batch structure. Assumes:
+                #  - batch is either a dict containing key "query" (Tensor/ndarray),
+                #    or directly the query matrix Tensor/ndarray.
+                if isinstance(batch, dict) and "query" in batch:
+                    raw_q = batch["query"]
+                else:
+                    raw_q = batch
+
+                # Convert to Tensor on CPU
+                if isinstance(raw_q, np.ndarray):
+                    raw_q_t = torch.from_numpy(raw_q)
+                else:
+                    raw_q_t = raw_q
+                # Drop batch dim if present: (B, N, D) -> (N, D)
+                if raw_q_t.ndim == 3:
+                    raw_q_t = raw_q_t[0]
+
+                # ===== 2) Build normalized batch for the model =====
+                bf = dataset_predict.format_batch_for_cnp(
+                    batch, self.dataset.config_file["cnp_settings"]["context_is_subset"]
+                )
+
+                # Forward pass to get logits -> mu
+                logit, _ = self.model(
+                    bf.context.theta, bf.context.phi, bf.context.y,
+                    bf.query.theta, bf.query.phi
+                )
+                mu0_t = torch.sigmoid(logit)[0].detach().cpu().float()  # shape (N,)
+
+                # Target from bf (normalized), just to infer y_dim; we will store RAW y from `raw_q_t`
+                y0_t_norm = bf.target_y[0].detach().cpu().float()  # (N,) or (N, y_dim)
+
+                # Infer dims on first iteration
+                if q_theta_dim is None:
+                    q_theta_dim = bf.query.theta[0].shape[-1]
+                    q_phi_dim = bf.query.phi[0].shape[-1]
+                if y_dim is None:
+                    y_dim = 1 if y0_t_norm.ndim == 1 else y0_t_norm.shape[-1]
+
+                # ===== 3) Slice RAW theta/phi/y from raw_q_t laid out as [theta | phi | y] =====
+                D_total = raw_q_t.shape[-1]
+                expected = q_theta_dim + q_phi_dim + y_dim
+                if D_total != expected:
+                    raise ValueError(
+                        f"Raw query width {D_total} != theta({q_theta_dim}) + phi({q_phi_dim}) + y({y_dim}). "
+                        "Check your dataloader column ordering."
+                    )
+                q_theta_raw_t = raw_q_t[:, 0:q_theta_dim]
+                q_phi_raw_t = raw_q_t[:, q_theta_dim:q_theta_dim + q_phi_dim]
+                y_raw_t = raw_q_t[:, q_theta_dim + q_phi_dim:q_theta_dim + q_phi_dim + y_dim]
+
+                # ===== 4) Convert to numpy and normalize shapes for storage =====
+                mu0 = mu0_t.numpy().astype(dtype, copy=False).ravel()
+                qt = q_theta_raw_t.detach().cpu().numpy().astype(dtype, copy=False)   # (N, q_theta_dim)
+                qp = q_phi_raw_t.detach().cpu().numpy().astype(dtype, copy=False)     # (N, q_phi_dim)
+                y0_raw = y_raw_t.detach().cpu().numpy().astype(dtype, copy=False)     # (N, y_dim) or (N,)
+
+                if y_dim == 1:
+                    y0_store = y0_raw.ravel()     # (N,)
+                else:
+                    if y0_raw.ndim == 1:
+                        y0_store = y0_raw.reshape(-1, y_dim)
+                    else:
+                        y0_store = y0_raw         # (N, y_dim)
+
+                n_add = mu0.shape[0]
+
+                # ===== 5) Ensure Zarr arrays exist for THIS worker; init per-worker state =====
+                if worker_id not in state:
+                    state[worker_id] = {"n": 0, "mu_sum": 0.0, "mu_sumsq": 0.0, "y_sum": 0.0, "cur_start": None}
+                W = _ensure_worker(worker_id)
+
+                # ===== 6) Append to Zarr (always pass full-shape tuples to resize) =====
+                old = W["mu"].shape[0]
+
+                W["mu"].resize((old + n_add,))
+                W["mu"][old:old + n_add] = mu0
+
+                W["q_theta"].resize((old + n_add, q_theta_dim))
+                W["q_theta"][old:old + n_add, :] = qt
+
+                W["q_phi"].resize((old + n_add, q_phi_dim))
+                W["q_phi"][old:old + n_add, :] = qp
+
+                if y_dim == 1:
+                    W["y_true"].resize((old + n_add,))
+                    W["y_true"][old:old + n_add] = y0_store
+                else:
+                    W["y_true"].resize((old + n_add, y_dim))
+                    W["y_true"][old:old + n_add, :] = y0_store
+
+                # First batch of the current file for this worker -> remember start index
+                if state[worker_id]["cur_start"] is None:
+                    state[worker_id]["cur_start"] = old
+
+                # ===== 7) Accumulate streaming stats for aggregates =====
+                st = state[worker_id]
+                st["n"] += n_add
+                st["mu_sum"] += float(mu0.sum())
+                st["mu_sumsq"] += float((mu0 * mu0).sum())
+                if y_dim == 1:
+                    st["y_sum"] += float(y0_store.sum())
+
+                # ===== 8) Per-file context θ (unnormalized) for returns/meta =====
+                theta_norm = bf.context.theta.cpu()
+                theta_mean_t = dataset_predict.feature_mean.cpu()[:, :theta_size]
+                theta_std_t = dataset_predict.feature_std.cpu()[:, :theta_size]
+                theta_unnorm = theta_norm * (theta_std_t + 1e-6) + theta_mean_t  # [B, ?, theta_size]
+                theta_row = theta_unnorm[0].numpy()[0][:theta_size].astype(dtype, copy=False)
+
+                # ===== 9) If file completed, finalize per-file records =====
+                if file_completed:
+                    n = max(st["n"], 1)
+                    mu_avg = st["mu_sum"] / n
+                    mu_var = max(st["mu_sumsq"] / n - mu_avg * mu_avg, 0.0)
+                    sigma_avg = mu_var ** 0.5
+
+                    mu_mean.append(mu_avg)
+                    sigma_mean.append(sigma_avg)
+                    y_mean.append(st["y_sum"] / n if y_dim == 1 else 0.0)
+                    theta_rows.append(theta_row)
+                    counts.append(n)
+
+                    # write file boundaries for the worker
+                    fs_old = W["file_start"].shape[0]
+                    W["file_start"].resize((fs_old + 1,))
+                    W["file_count"].resize((fs_old + 1,))
+                    W["file_start"][fs_old] = st["cur_start"]
+                    W["file_count"][fs_old] = n
+
+                    # update meta tables
+                    tf_old = theta_ds.shape[0]
+                    theta_ds.resize((tf_old + 1, theta_size))
+                    theta_ds[tf_old, :] = theta_row
+
+                    who_ds.resize((tf_old + 1,))
+                    who_ds[tf_old] = int(worker_id)
+
+                    # reset worker state for next file
+                    state[worker_id] = {"n": 0, "mu_sum": 0.0, "mu_sumsq": 0.0, "y_sum": 0.0, "cur_start": None}
+
+                    pbar.update(1)
+
+                # housekeeping
+                del mu0_t, y0_t_norm, q_theta_raw_t, q_phi_raw_t, y_raw_t
+                if W["mu"].shape[0] and (W["mu"].shape[0] % (mu_chunks * 8) == 0):
+                    gc.collect()
+
+        # close loader
+        dataset_predict.close_loader()
+
+        # stack/reshape returns
+        theta_arr = np.array(theta_rows, dtype=dtype)
+        counts_arr = np.array(counts, dtype=np.int64).reshape(-1, 1)
+        mu_mean_arr = np.array(mu_mean, dtype=dtype).reshape(-1, 1)
+        sigma_mean_arr = np.array(sigma_mean, dtype=dtype).reshape(-1, 1)
+        y_mean_arr = np.array(y_mean, dtype=dtype).reshape(-1, 1)
+
+        return theta_arr, counts_arr, mu_mean_arr, sigma_mean_arr, y_mean_arr
+
+    """
     def predict(self, dataset_predict, writer=None):
-            """
-            Run the model in prediction mode over the given dataset.
-            Returns:
-                - mu_all: np.ndarray of predicted means
-                - sigma_all: np.ndarray of predicted standard deviations
-                - target_y_all: np.ndarray of ground truth targets
-                - features_all: np.ndarray of unnormalized input features
-            """
+
+            #Run the model in prediction mode over the given dataset.
+            #Returns:
+            #    - mu_all: np.ndarray of predicted means
+            #    - sigma_all: np.ndarray of predicted standard deviations
+            #    - target_y_all: np.ndarray of ground truth targets
+            #    - features_all: np.ndarray of unnormalized input features
+
             self.model.eval()
             theta_size = len(dataset_predict.config_file["simulation_settings"]["theta_headers"])
             num_workers = dataset_predict.config_file["cnp_settings"]["dataloader_number_of_workers"]
@@ -288,7 +575,7 @@ class Trainer():
                         pbar.update(1)  # move progress bar by one file
             dataset_predict.close_loader()
             return np.array(theta), np.array(counts).reshape(-1,1), np.array(mu_mean).reshape(-1,1), np.array(sigma_mean).reshape(-1,1), np.array(y_mean).reshape(-1,1)
-
+    """
     def log_metrics(self, writer, y_true, y_pred, loss, it_step, is_binary, leg="Train"):
         metrics = {
                 "Loss": loss,
