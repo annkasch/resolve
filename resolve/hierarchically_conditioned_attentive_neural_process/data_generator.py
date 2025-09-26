@@ -257,17 +257,18 @@ class DataGeneration:
         _target_key = "target"
 
         self._names_theta = config_file["simulation_settings"]["theta_headers"]
-        _names_phi = config_file["simulation_settings"]["phi_labels"]
+        self._names_phi = config_file["simulation_settings"]["phi_labels"]
         self._names_target = config_file["simulation_settings"]["target_headers"]
 
-        self.feature_size, self.target_size = utils.get_feature_and_label_size(config_file)
-
+        #self.feature_size, self.target_size = utils.get_feature_and_label_size(config_file)
+        self.feature_size = len(self._names_theta) + len(self._names_phi)
+        self.target_size = len(self._names_target)
 
         if not any(f.endswith(".h5") for f in os.listdir(path_to_files)):
             utils.convert_all_csv_to_hdf5(config_file)
 
         self.parameters = {
-            'phi': {'key': _phi_key, 'label_key': "phi_labels", 'selected_labels': _names_phi},
+            'phi': {'key': _phi_key, 'label_key': "phi_labels", 'selected_labels': self._names_phi},
             'theta': {'key': _theta_key, 'label_key': "theta_headers", 'selected_labels': self._names_theta},
             'target': {'key': _target_key, 'label_key': "target_headers", 'selected_labels': self._names_target}
         }

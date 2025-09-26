@@ -11,11 +11,14 @@ cnp_settings:
   - 64
   - 48
   context_ratio: 0.33
-  context_is_subset: false
-  batch_size_train: 2000
+  context_is_subset: true
+  batch_size_train: 1000
   files_per_batch_train: 10
   files_per_batch_predict: 1
-  number_of_workers: 1
+  dataloader_number_of_workers: 1
+  dataloader_prefetch_factor: 2
+  dataloader_pin_memory: false
+  dataloader_persistent_workers: true
   split_ratio:
   - 0.6
   - 0.2
@@ -23,24 +26,89 @@ cnp_settings:
   training:
     use_staged_training: false
     phase1:
-      training_epochs: 100
-      mixup_ratio: 1.0
+      training_epochs: 2
+      mixup_ratio: 0.0
       mixup_margin: 0.0
       use_beta:
       - 0.1
       - 0.1
       learning_rate: 0.001
-      weight_false_positives: 1.0
-      weight_true_positives: 0.0
+      loss:
+        prior_pos: true
+        alpha_pos: 0.2
+        alpha_neg: null
+        gamma_pos: 2.0
+        gamma_neg: 2.0
+        lambda_fp: 0.0
+        tau_fp: 0.0
+        reduction: mean
     phase2:
       training_epochs: 0
-      learning_rate: 0.0001
+      learning_rate: 0.001
       weight_false_positives: 0.0
-      weight_true_positives: 1.0
+      weight_true_positives: 0.0
 feature_settings:
   use_normalization: zscore
   feature_size: 30
   target_size: 1
+  x_mean:
+  - - 0.0149928517639637
+    - 4.9864606857299805
+    - 499.6375427246094
+    - 499.5863342285156
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.031054550781846046
+    - 13.845510482788086
+    - 74.93899536132812
+    - 38.36873245239258
+    - 0.1938641220331192
+    - 0.0
+    - 0.014990150928497314
+    - 0.014990150928497314
+    - 0.0
+    - 0.0
+    - 4.98534631729126
+    - 1.5
+    - 30.0
+    - 30.0
+    - 1.0
+    - 0.5032479166984558
+    - 108.55863952636719
+    - 11.732481002807617
+    - 10.99680233001709
+    - 1.0
+    - 0.9907329082489014
+  x_std:
+  - - 0.008603613823652267
+    - 2.884115695953369
+    - 288.5081481933594
+    - 288.1513671875
+    - 9.999999747378752e-05
+    - 9.999999747378752e-05
+    - 9.999999747378752e-05
+    - 0.17346520721912384
+    - 3.71966552734375
+    - 41.919273376464844
+    - 32.59436798095703
+    - 0.3953237235546112
+    - 9.999999747378752e-05
+    - 0.008603550493717194
+    - 0.008603550493717194
+    - 9.999999747378752e-05
+    - 9.999999747378752e-05
+    - 2.883615255355835
+    - 9.999999747378752e-05
+    - 9.999999747378752e-05
+    - 9.999999747378752e-05
+    - 9.999999747378752e-05
+    - 0.28903013467788696
+    - 206.99359130859375
+    - 4.685214519500732
+    - 5.063401222229004
+    - 9.999999747378752e-05
+    - 0.09581857919692993
 simulation_settings:
   theta_headers:
   - metallicity
@@ -68,8 +136,6 @@ simulation_settings:
   - Omega@ZAMS(2)
   - PO_CE_Alpha
   - PO_LBV_Factor
-  - PO_Sigma_Kick_CCSN_BH
-  - PO_Sigma_Kick_CCSN_NS
   - PO_Sigma_Kick_ECSN
   - PO_Sigma_Kick_USSN
   - PO_WR_Factor
@@ -122,12 +188,12 @@ path_settings:
   version: v1.3.4
   path_to_files_train: ../in/data/lf/v1.3/training_cnp
   path_to_files_predict:
-  - /Users/aschuetz/Data/BBH/lf/v1.3/tmp
+  - /Users/aschuetz/Data/BBH/lf/v1.3/validation
   iteration:
   - -1
   fidelity:
   - 0
   path_out_cnp: ../out/cnp
+  path_out_hcanp: ../out/hcacnp
   path_out_mfgp: ../out/mfgp
-  path_out_resum: ../out/resum
   path_out_pce: ../out/pce
