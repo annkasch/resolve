@@ -70,7 +70,7 @@ class PCEMultiFidelityModelVisualizer(ModelVisualizer):
             basis_matrix[:, i] = poly
         return basis_matrix, degree_new
     
-    def generate_y_pred_samples(self, x_data, include_noise=True):
+    def generate_y_pred_samples(self, x_data, include_noise=False):
         """
         Generate high-fidelity prediction samples based on posterior trace.
         Parameters:
@@ -86,6 +86,7 @@ class PCEMultiFidelityModelVisualizer(ModelVisualizer):
         coeff_samples = self.trace.posterior[f"coeffs_{self.fidelities[0]}"].values
         coeff_samples_flat = coeff_samples.reshape(-1, coeff_samples.shape[-1]) 
         y_pred = np.dot(coeff_samples_flat, basis_matrix_test.T)
+        y_pred = np.exp(y_pred)
 
 
         if include_noise:
@@ -104,6 +105,7 @@ class PCEMultiFidelityModelVisualizer(ModelVisualizer):
             rho_samples = self.trace.posterior[f"rho_{f}"].values  # Shape: (n_chains, n_draws)
             rho_samples_flat = rho_samples.flatten()  # Shape: (n_samples_total,)
             y_pred = rho_samples_flat[:, None] * y_pred_samples[-1] + delta_pred_samples
+            y_pred = np.exp(y_pred)
 
             if include_noise:
                 sigma = self.trace.posterior[f"sigma_{f}"].values.flatten()
