@@ -29,7 +29,7 @@ class ThetaEncoder(nn.Module):
         z = self.mlp(flat)
         return z.view(*leading, -1)
 
-# ---------- context encoder: R^{(c,phi|θ)} ----------
+# context encoder: R^{(c,phi|θ)}
 class ContextConditionalEncoder(nn.Module):
     """
     Encodes (theta_c, phi_c, y_c) -> R^(c)

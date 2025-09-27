@@ -17,7 +17,7 @@ from ..utilities import utilities as utils
 import math
 from torch.utils.data import get_worker_info
 utils.set_random_seed(42)
-
+from sklearn.preprocessing import StandardScaler
 from collections import OrderedDict
 
 class _LRUBytesBoundCache:
@@ -229,8 +229,8 @@ class HDF5Dataset(IterableDataset):
 ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
 QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi"))
 
-CNPBatch = collections.namedtuple(
-    "CNPBatch",
+BatchCollection = collections.namedtuple(
+    "BatchCollection",
     ("context", "query", "target_y")
 )
 
@@ -247,9 +247,7 @@ class DataGeneration:
         self.dataloader = None
         self.config_file = config_file
         self.files_per_batch = files_per_batch
-        self.feature_mean = None
-        self.feature_std = None
-        self.use_normalization = config_file["feature_settings"]["use_normalization"]
+        
         self.mode=mode
         
         _phi_key = "phi"
@@ -315,12 +313,6 @@ class DataGeneration:
             for f in os.listdir(self.path_to_files)
             if f.endswith(".h5")
         )
-
-    def set_feature_stats(self):
-        if (self.feature_mean is None or self.feature_std is None) and self.use_normalization != False:
-            self.compute_feature_stats()
-            self.config_file["feature_settings"]["x_mean"] = self.feature_mean.numpy().tolist()
-            self.config_file["feature_settings"]["x_std"] = self.feature_std.numpy().tolist()
     
     def set_loader(self):
         dataset = HDF5Dataset(
@@ -535,176 +527,206 @@ class DataGeneration:
 
         return phi_mixup, target_mixup, weights_mixup
 
-
-    def compute_feature_stats(self, use_indices=True):
+    def get_dataloader(self):
+        return self.dataloader
+    
+class Normalizer:
+    def __init__(self, method: str = "zscore", eps: float = 1e-8):
+        self.method = method
+        self.eps = eps
+        self.scaler = StandardScaler(copy=False, with_mean=False, with_std=False)
+    
+    def fit_from_files(self, path_to_files, parameters, chunk_size=131072):
         """
-        Computes global statistics (mean/std or min/max) for normalization of features (theta + phi),
-        using the feature key currently set in self.parameters['phi']['key'].
-
-        Supports both z-score and min-max normalization, depending on:
-            self.parameters['normalization'] = 'zscore' or 'minmax'
-
-        Stores:
-            For z-score:
-                self.feature_mean: torch.Tensor of shape (1, D)
-                self.feature_std:  torch.Tensor of shape (1, D)
-            For min-max:
-                self.feature_min: torch.Tensor of shape (1, D)
-                self.feature_max: torch.Tensor of shape (1, D)
+        Stream over HDF5 files and compute normalization stats for [theta | phi].
+        Supports:
+        - self.method == 'zscore'  -> StandardScaler.partial_fit (streaming)
+        - self.method == 'minmax'  -> stream gmin/gmax, then instantiate MinMaxScaler
+        Side effects:
+        - self.mean  : [1, D] torch.float32
+        - self.scale : [1, D] torch.float32  (std for zscore, (max-min) for minmax)
+        - self.sklearn_scaler : fitted sklearn scaler object (StandardScaler or MinMaxScaler)
         """
-        phi_key = self.parameters["phi"]["key"]
-        normalization = self.use_normalization
+        if self.method == None:
+            return
+            
+        self.scaler = StandardScaler(copy=False, with_mean=True, with_std=True)
+        
+        assert self.method in ("zscore", "minmax"), f"Unsupported method: {self.method}"
+
+        phi_key   = parameters["phi"]["key"]
+        theta_key = parameters["theta"]["key"]
+        theta_sel = parameters["theta"]["selected_labels"]
+        phi_sel   = parameters["phi"]["selected_labels"]
+
+        gmin = None
+        gmax = None
+        D = None
+        total_rows = 0
 
         file_list = sorted([
-            os.path.join(self.path_to_files, f)
-            for f in os.listdir(self.path_to_files)
+            os.path.join(path_to_files, f)
+            for f in os.listdir(path_to_files)
             if f.endswith(".h5")
         ])
 
-        sum_features = None
-        sum_squared = None
-        total_count = 0
+        with tqdm(total=len(file_list), desc="Computing global feature stats") as pbar:
+            for path in file_list:
+                if not path.endswith(".h5"):
+                    pbar.update(1); continue
+                try:
+                    with h5py.File(path, "r") as f:
+                        if phi_key not in f or theta_key not in f:
+                            print(f"Warning: keys '{phi_key}' or '{theta_key}' not found in {path}. Skipping.")
+                            pbar.update(1); continue
 
-        global_min = None
-        global_max = None
+                        d_phi   = f[phi_key]
+                        d_theta = f[theta_key]
 
-        for file in tqdm(file_list, desc="Computing global feature stats"):
-            with h5py.File(file, "r") as f:
-                if phi_key not in f:
-                    print(f"Warning: '{phi_key}' not found in {file}. Skipping.")
-                    continue
+                        # column selections
+                        phi_idx   = utils.read_selected_indices(path, parameters["phi"])   if phi_sel   else None
+                        theta_idx = utils.read_selected_indices(path, parameters["theta"]) if theta_sel else None
 
-                phi = np.array(f[phi_key])
- 
-                if use_indices == True:
-                    phi_indices = utils.read_selected_indices(file, self.parameters['phi'])
-                    phi = phi[:, phi_indices]
+                        # dims without loading all
+                        phi_dim = d_phi.shape[1] if d_phi.ndim == 2 else 1
+                        sel_phi_dim = (len(phi_idx) if phi_idx is not None and len(phi_idx) > 0 else phi_dim)
 
-                if use_indices == True and len(self.parameters['theta']['selected_labels']) > 0:
-                    theta_indices = utils.read_selected_indices(file, self.parameters['theta'])
-                    theta = np.array(f[self.parameters['theta']['key']])
-                    theta = np.array(f[self.parameters['theta']['key']])[theta_indices]
-                else:
-                    theta = np.array(f[self.parameters['theta']['key']])
+                        if d_theta.ndim == 1:
+                            theta_raw = np.array(d_theta, dtype=np.float64, copy=False)
+                            if theta_idx: theta_raw = theta_raw[theta_idx]
+                            theta_cols = theta_raw.shape[0]
+                            per_file_theta = theta_raw  # broadcast later
+                            per_row_theta = None
+                        else:
+                            theta_cols = (len(theta_idx) if theta_idx else d_theta.shape[1])
+                            per_file_theta = None
+                            per_row_theta = d_theta
 
-                if len(theta.shape) == 1:
-                        theta = np.tile(theta, (phi.shape[0], 1))
-                else:
-                        theta = theta[:, theta_indices]
+                        cur_D = sel_phi_dim + theta_cols
+                        if D is None:
+                            D = cur_D
+                        elif cur_D != D:
+                            raise ValueError(f"Feature dimension changed ({cur_D} vs {D}) in {path}")
 
-                if theta.shape[1] > 0: 
-                    features = np.hstack([theta, phi])
-                else:
-                    features = phi
+                        # chunk loop
+                        N = d_phi.shape[0]
+                        for start in range(0, N, chunk_size):
+                            stop = min(start + chunk_size, N)
 
-                if normalization == 'zscore':
-                    if sum_features is None:
-                        sum_features = np.sum(features, axis=0)
-                        sum_squared = np.sum(features ** 2, axis=0)
-                    else:
-                        sum_features += np.sum(features, axis=0)
-                        sum_squared += np.sum(features ** 2, axis=0)
+                            # phi slice
+                            if d_phi.ndim == 2:
+                                phi_chunk = np.array(d_phi[start:stop, :], dtype=np.float64, copy=False)
+                                if phi_idx is not None and len(phi_idx) > 0:
+                                    phi_chunk = phi_chunk[:, phi_idx]
+                            else:
+                                phi_chunk = np.array(d_phi[start:stop], dtype=np.float64, copy=False).reshape(-1, 1)
 
-                elif normalization == 'minmax':
-                    if global_min is None:
-                        global_min = np.min(features, axis=0)
-                        global_max = np.max(features, axis=0)
-                    else:
-                        global_min = np.minimum(global_min, np.min(features, axis=0))
-                        global_max = np.maximum(global_max, np.max(features, axis=0))
+                            # theta slice/broadcast
+                            if per_file_theta is not None:
+                                theta_chunk = np.tile(per_file_theta, (phi_chunk.shape[0], 1))
+                            else:
+                                theta_chunk = np.array(per_row_theta[start:stop, :], dtype=np.float64, copy=False)
+                                if theta_idx: theta_chunk = theta_chunk[:, theta_idx]
 
-                total_count += features.shape[0]
+                            feats = np.hstack((theta_chunk, phi_chunk)) if theta_cols > 0 else phi_chunk
 
-        if total_count == 0:
+                            # filter non-finite
+                            mask = np.isfinite(feats).all(axis=1)
+                            if not mask.all():
+                                feats = feats[mask]
+                            if feats.size == 0:
+                                continue
+
+                            if self.method == "zscore":
+                                self.scaler.partial_fit(feats)  # streaming update
+
+                            mn = feats.min(axis=0)
+                            mx = feats.max(axis=0)
+                            gmin = mn if gmin is None else np.minimum(gmin, mn)
+                            gmax = mx if gmax is None else np.maximum(gmax, mx)
+
+                            total_rows += feats.shape[0]
+
+                    pbar.update(1)
+                except OSError as e:
+                    print(f"Warning: failed to open {path}: {e}")
+                    pbar.update(1); continue
+
+        if total_rows == 0:
             raise ValueError(f"No samples found using key '{phi_key}'")
+            
+        self.data_min_ = gmin.astype(np.float64, copy=False)
+        self.data_max_ = gmax.astype(np.float64, copy=False)
+        self.data_range_ = (self.data_max_ - self.data_min_)
+        
+        # finalize MinMaxScaler from streamed min/max
+        if self.method == "minmax":
+            # avoid zero range to prevent div-by-zero; matches sklearn behavior
+            zero = self.data_range_ == 0.0
+            if np.any(zero):
+                self.data_range_[zero] = 1.0
 
-        if normalization == 'zscore':
-            mean = sum_features / total_count
-            std = np.sqrt((sum_squared / total_count) - (mean ** 2) + 1e-8)
+            self.scaler.n_features_in_ = self.data_min_.shape[0]
+            self.scaler.mean_ = self.data_min_
+            self.scaler.scale_ = self.data_range_
+            self.scaler.n_samples_seen_= total_rows
 
-            self.feature_mean = torch.tensor(mean, dtype=torch.float32).unsqueeze(0)
-            self.feature_std = torch.tensor(std, dtype=torch.float32).unsqueeze(0)
-
-            print("Z-score feature mean/std computation completed.")
-
-        elif normalization == 'minmax':
-            # Store min as "mean"
-            self.feature_mean = torch.tensor(global_min, dtype=torch.float32).unsqueeze(0)
-            # Store (max - min) as "std"
-            self.feature_std = torch.tensor(global_max - global_min, dtype=torch.float32).unsqueeze(0)
-
-            print("Min-Max feature min/max computation completed.")
-
-        else:
-            raise ValueError(f"Unsupported normalization method: {normalization}")
+    def transform(self, x: torch.Tensor) -> torch.Tensor:
+        return self.scaler.transform(x)
     
-    def format_batch_for_cnp(self,batch, context_is_subset=True):
-        """
-        Formats a batch into the query format required for CNP training with dynamic batch splitting.
-        Parameters:
-        - batch (torch.Tensor): Input batch of shape (batch_size, feature_dim).
-        - total_batch_size (int): Expected full batch size (default: 3000).
-        - context_ratio (float): Ratio of context points (default: 1/3).
-        - target_ratio (float): Ratio of target points (default: 2/3).
+    def inverse_transform(self, x: torch.Tensor) -> torch.Tensor:
+        if self.scaler == None:
+                raise RuntimeError("Normalizer not set")
+        return self.scaler.inverse_transform(x)
 
-        Returns:
-        - CNPRegressionDescription(query=((batch_context_x, batch_context_y), batch_target_x), target_y=batch_target_y)
-        """
+    def to(self, device):
+        if self.mean is not None: self.mean = self.mean.to(device)
+        if self.scale is not None: self.scale = self.scale.to(device)
+        return self
 
-        batch_size = batch.shape[0]  # Actual batch size (may be < 3000)
-        
-        # Dynamically compute num_context and num_target
-        num_context = int(batch_size * self._context_ratio)
-        num_target = batch_size - num_context  # Ensure it sums to batch_size
-        
-        # Shuffle the batch to ensure randomness
-        batch = batch[torch.randperm(batch.shape[0])]
-        
-        # Split batch into input (X) and target (Y) features
-        batch_x = batch[:,:self.feature_size]  # All features except last column (input features)
-        # Z-score normalization for input features
-        if self.use_normalization != False:
-            batch_x = (batch_x - self.feature_mean) / (self.feature_std + 1e-8)  # Avoid division by zero
+    def dump_to_config(self, cfg):
+        cfg["feature_settings"]["x_mean"] = self.mean.cpu().numpy().tolist()
+        cfg["feature_settings"]["x_std"]  = self.scale.cpu().numpy().tolist()
+        return cfg
 
-        batch_y = batch[:,self.feature_size:self.feature_size+self.target_size]   # Last column is the target (output values)
+    def load_from_config(self, cfg):
+        self.mean  = torch.tensor(cfg["feature_settings"]["x_mean"], dtype=torch.float32)
+        self.scale = torch.tensor(cfg["feature_settings"]["x_std"],  dtype=torch.float32)
+        return self
 
+class BatchFormatter:
+    def __init__(self, feature_size: int, target_size: int, context_ratio: float, normalizer: Normalizer | None):
+        self.F = feature_size
+        self.T = target_size
+        self.context_ratio = context_ratio
+        self.norm = normalizer
+
+    def __call__(self, batch: torch.Tensor, context_is_subset=True):
+        # split X/Y
+        x = batch[:, :self.F]
+        y = batch[:, self.F:self.F+self.T]
+
+        if self.norm is not None:
+            x = self.norm.transform(x)
+
+        # shuffle & split into context/target
+        B = x.shape[0]
+        idx = torch.randperm(B, device=x.device)
+        x, y = x[idx], y[idx]
+        n_ctx = int(B * self.context_ratio)
         if context_is_subset:
-            # **Context is taken as the first num_context points from target**
-            batch_target_x = batch_x  # Target is the entire batch
-            batch_target_y = batch_y  # Target outputs are the entire batch
-
-            batch_context_x = batch_target_x[:num_context]  # Context is a subset of target
-            batch_context_y = batch_target_y[:num_context]  # Context outputs
+            x_ctx, y_ctx = x[:n_ctx], y[:n_ctx]
+            x_tgt, y_tgt = x, y
         else:
-            batch_context_x = batch_x[:num_context]  # Context inputs
-            batch_context_y = batch_y[:num_context]  # Context outputs
-            batch_target_x = batch_x[num_context:num_context + num_target]  # Target inputs
-            batch_target_y = batch_y[num_context:num_context + num_target]  # Target outputs
+            x_ctx, y_ctx = x[:n_ctx], y[:n_ctx]
+            x_tgt, y_tgt = x[n_ctx:], y[n_ctx:]
 
-        # Ensure y tensors have correct dimensions (convert from 1D to 2D if needed)
-        batch_context_y = batch_context_y.view(-1, 1) if batch_context_y.ndim == 1 else batch_context_y
-        batch_target_y = batch_target_y.view(-1, 1) if batch_target_y.ndim == 1 else batch_target_y
-        
-        if batch_context_x.dim() == 2:  # Convert from [N, D] → [1, N, D]
-            batch_context_x = batch_context_x.unsqueeze(0)
-        if batch_context_y.dim() == 2:  # Convert from [N, 1] → [1, N, 1]
-            batch_context_y = batch_context_y.unsqueeze(0)
+        # shape them and slice theta/phi
+        def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
+        x_ctx, y_ctx, x_tgt, y_tgt = map(ensure_3d, (x_ctx, y_ctx, x_tgt, y_tgt))
 
-        if batch_target_x.dim() == 2:  # Convert from [N, D] → [1, N, D]
-            batch_target_x = batch_target_x.unsqueeze(0)
-        if batch_target_y.dim() == 2:  # Convert from [N, 1] → [1, N, 1]
-            batch_target_y = batch_target_y.unsqueeze(0)
-        # Construct the query tuple
-
-        theta_size = len(self.config_file["simulation_settings"]["theta_headers"])
-        # Return the properly formatted object
-
-        return CNPBatch(
-            context=ContextSet(theta=batch_context_x[:,:,:theta_size], phi=batch_context_x[:,:,theta_size:], y=batch_context_y),
-            query=QuerySet(theta=batch_target_x[:,:,:theta_size], phi=batch_target_x[:,:,theta_size:]),
-            target_y=batch_target_y,
+        return BatchCollection(
+            context=ContextSet(theta=x_ctx[:, :, :theta_size], phi=x_ctx[:, :, theta_size:], y=y_ctx),
+            query=QuerySet(theta=x_tgt[:, :, :theta_size], phi=x_tgt[:, :, theta_size:]),
+            target_y=y_tgt,
         )
-
-
-    def get_dataloader(self):
-        return self.dataloader

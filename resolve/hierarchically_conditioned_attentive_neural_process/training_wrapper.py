@@ -22,6 +22,8 @@ from sklearn.metrics import precision_recall_curve, auc
 import os
 import zarr, gc
 from numcodecs import Blosc
+from typing import Optional, Tuple
+from .zarr_helper import ZarrPredWriter
 
 
 class Trainer():
@@ -218,247 +220,102 @@ class Trainer():
 
         return y_pred, y_true, epoch_loss
 
-    def predict(self, dataset_predict, writer=None, out_store="pred_store.zarr",
-                dtype=np.float32, mu_chunks=262_144) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def predict(
+        self,
+        dataset_predict,
+        writer: Optional[ZarrPredWriter] = None,
+        out_store: str = "pred_store.zarr",
+        dtype=np.float32,
+        mu_chunks: int = 262_144,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Run the model in prediction mode over the given dataset.
-
-        Persists ALL per-query data to a Zarr store:
-        worker_{k}/mu       : (N_k,) or float32
-        worker_{k}/q_theta  : (N_k, q_theta_dim) float32  (RAW/unnormalized)
-        worker_{k}/q_phi    : (N_k, q_phi_dim)   float32  (RAW/unnormalized)
-        worker_{k}/y_true   : (N_k,) or (N_k, y_dim) float32 (RAW/unnormalized)
-        worker_{k}/file_start : (n_files_k,) int64
-        worker_{k}/file_count : (n_files_k,) int64
-
-        Meta (global across files):
-        meta/theta           : (n_files_total, theta_size) float32   (context θ, unnormalized)
-        meta/worker_of_file  : (n_files_total,) int32
-
-        Returns (small arrays kept in RAM):
+        Returns small aggregates in RAM:
         theta         : (n_files, theta_size)
-        counts        : (n_files, 1)            number of queries in each file
+        counts        : (n_files, 1)
         mu_mean       : (n_files, 1)
-        sigma_mean    : (n_files, 1)            std over μ within file
-        y_mean        : (n_files, 1)            mean target if scalar; 0.0 otherwise
+        sigma_mean    : (n_files, 1)
+        y_mean        : (n_files, 1) if scalar y, else 0
+        Persists per-query data to Zarr via ZarrPredWriter.
         """
         self.model.eval()
 
+        # basic dims
         theta_size = len(dataset_predict._names_theta)
+        q_theta_dim = len(dataset_predict._names_theta)
+        q_phi_dim = len(dataset_predict._names_phi)
+        y_dim = len(dataset_predict._names_target)  # 1 for scalar targets
+
+        # writer
+        _writer = writer or ZarrPredWriter(out_store, theta_size=theta_size, dtype=dtype, mu_chunks=mu_chunks)
+
+        # aggregates to return
         mu_mean, sigma_mean, y_mean, theta_rows, counts = [], [], [], [], []
-
-        # streaming state per worker (created on first use)
-        state = {}  # worker_id -> dict(n, mu_sum, mu_sumsq, y_sum, cur_start)
-
-        # We infer query dims from the first batch we process
-        q_theta_dim = None
-        q_phi_dim = None
-        y_dim = None
-
-        # Zarr store setup (append if exists)
-        compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
-        z = zarr.open(out_store, mode="a")
-        meta = z.require_group("meta")
-        # meta datasets (resizable)
-        if "theta" in meta:
-            theta_ds = meta["theta"]
-        else:
-            theta_ds = meta.zeros("theta", shape=(0, theta_size),
-                                chunks=(1024, theta_size), dtype=dtype, compressor=compressor)
-        if "worker_of_file" in meta:
-            who_ds = meta["worker_of_file"]
-        else:
-            who_ds = meta.zeros("worker_of_file", shape=(0,),
-                                chunks=(4096,), dtype=np.int32, compressor=compressor)
 
         # open dataloader
         dataset_predict.set_loader()
         dataloader = dataset_predict.dataloader
-
         pbar = tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file")
-
-        def _ensure_worker(wk: int):
-            """Create Zarr arrays for a worker if absent."""
-            if f"worker_{wk}" in z:
-                g = z[f"worker_{wk}"]
-            else:
-                g = z.create_group(f"worker_{wk}")
-            # require datasets (so reruns append cleanly)
-            if "mu" in g:
-                mu_arr = g["mu"]
-            else:
-                mu_arr = g.zeros("mu", shape=(0,), chunks=(mu_chunks,),
-                                dtype=dtype, compressor=compressor)
-            if "q_theta" in g:
-                qtheta_arr = g["q_theta"]
-            else:
-                assert q_theta_dim is not None, "q_theta_dim must be known before creating q_theta dataset."
-                qtheta_arr = g.zeros("q_theta", shape=(0, q_theta_dim),
-                                    chunks=(max(1, mu_chunks // max(1, q_theta_dim)), q_theta_dim),
-                                    dtype=dtype, compressor=compressor)
-            if "q_phi" in g:
-                qphi_arr = g["q_phi"]
-            else:
-                assert q_phi_dim is not None, "q_phi_dim must be known before creating q_phi dataset."
-                qphi_arr = g.zeros("q_phi", shape=(0, q_phi_dim),
-                                chunks=(max(1, mu_chunks // max(1, q_phi_dim)), q_phi_dim),
-                                dtype=dtype, compressor=compressor)
-            if "y_true" in g:
-                y_arr = g["y_true"]
-            else:
-                assert y_dim is not None, "y_dim must be known before creating y_true dataset."
-                if y_dim == 1:
-                    y_arr = g.zeros("y_true", shape=(0,), chunks=(mu_chunks,),
-                                    dtype=dtype, compressor=compressor)
-                else:
-                    y_arr = g.zeros("y_true", shape=(0, y_dim),
-                                    chunks=(max(1, mu_chunks // max(1, y_dim)), y_dim),
-                                    dtype=dtype, compressor=compressor)
-            if "file_start" in g:
-                fs_arr = g["file_start"]
-            else:
-                fs_arr = g.zeros("file_start", shape=(0,), chunks=(4096,),
-                                dtype=np.int64, compressor=compressor)
-            if "file_count" in g:
-                fc_arr = g["file_count"]
-            else:
-                fc_arr = g.zeros("file_count", shape=(0,), chunks=(4096,),
-                                dtype=np.int64, compressor=compressor)
-            return {
-                "group": g,
-                "mu": mu_arr,
-                "q_theta": qtheta_arr,
-                "q_phi": qphi_arr,
-                "y_true": y_arr,
-                "file_start": fs_arr,
-                "file_count": fc_arr,
-            }
-        q_theta_dim = len(dataset_predict._names_theta)
-        q_phi_dim = len(dataset_predict._names_phi)
-        q_target_y_dim = len(dataset_predict._names_target)
 
         with torch.no_grad():
             for batch, worker_id, file_completed in dataloader:
-
+                # format batch and run model
                 bf = dataset_predict.format_batch_for_cnp(
-                    batch, self.dataset.config_file["cnp_settings"]["context_is_subset"]
+                    batch,
+                    self.dataset.config_file["cnp_settings"]["context_is_subset"]
                 )
+                # model forward
                 logit, _ = self.model(
                     bf.context.theta, bf.context.phi, bf.context.y,
                     bf.query.theta, bf.query.phi
                 )
-                mu0_t = torch.sigmoid(logit)[0].detach().cpu().float()  # shape (N,)
-                y0_t = bf.target_y[0].detach().cpu().float()  # (N,) or (N, y_dim)
+                mu0_t = torch.sigmoid(logit)[0].detach().cpu().float()            # (N,)
+                y0_t  = bf.target_y[0].detach().cpu().float()                     # (N,) or (N, y_dim)
 
+                # unnormalize query features to RAW for storage
                 theta_mean_t = dataset_predict.feature_mean.cpu()[:, :theta_size]
-                theta_std_t = dataset_predict.feature_std.cpu()[:, :theta_size]
-                phi_mean_t = dataset_predict.feature_mean.cpu()[:, theta_size:]
-                phi_std_t = dataset_predict.feature_std.cpu()[:, theta_size:]
-                q_theta_raw_t = bf.query.tehta * (theta_std_t + 1e-6) + theta_mean_t
-                q_phi_raw_t = bf.query.phi * (phi_std_t + 1e-6) + phi_mean_t
+                theta_std_t  = dataset_predict.feature_std.cpu()[:, :theta_size]
+                phi_mean_t   = dataset_predict.feature_mean.cpu()[:, theta_size:]
+                phi_std_t    = dataset_predict.feature_std.cpu()[:, theta_size:]
 
-                # Convert to numpy and normalize shapes for storage
+                q_theta_raw_t = bf.query.theta * (theta_std_t + 1e-6) + theta_mean_t
+                q_phi_raw_t   = bf.query.phi * (phi_std_t + 1e-6) + phi_mean_t
+
                 mu0 = mu0_t.numpy().astype(dtype, copy=False).ravel()
-                n_add = mu0.shape[0]
-                qt = tuple(n_add, q_theta_dim)   # (N, q_theta_dim)
-                qp = tuple(n_add, q_phi_dim)     # (N, q_phi_dim)
-                y0_raw = tuple(n_add, q_target_y_dim)     # (N, y_dim) or (N,)
+                q_theta_raw = q_theta_raw_t[0].detach().cpu().numpy().astype(dtype, copy=False)  # (N, q_theta_dim)
+                q_phi_raw   = q_phi_raw_t[0].detach().cpu().numpy().astype(dtype, copy=False)    # (N, q_phi_dim)
+                y0_raw      = y0_t.numpy()
 
-                if y_dim == 1:
-                    y0_store = y0_raw.ravel()     # (N,)
-                else:
-                    if y0_raw.ndim == 1:
-                        y0_store = y0_raw.reshape(-1, y_dim)
-                    else:
-                        y0_store = y0_raw         # (N, y_dim)
+                # ensure arrays exist for this worker
+                W = _writer.ensure_worker(int(worker_id), q_theta_dim=q_theta_dim, q_phi_dim=q_phi_dim, y_dim=y_dim)
 
-                # ===== 5) Ensure Zarr arrays exist for THIS worker; init per-worker state =====
-                if worker_id not in state:
-                    state[worker_id] = {"n": 0, "mu_sum": 0.0, "mu_sumsq": 0.0, "y_sum": 0.0, "cur_start": None}
-                W = _ensure_worker(worker_id)
+                # append batch to store + update streaming stats
+                _writer.append_batch(int(worker_id), mu=mu0, q_theta=q_theta_raw, q_phi=q_phi_raw, y_true=y0_raw, y_dim=y_dim)
 
-                # ===== 6) Append to Zarr (always pass full-shape tuples to resize) =====
-                old = W["mu"].shape[0]
+                # one per-file theta row (context) for meta and return arrays
+                # take the first query's theta (already unnormalized)
+                theta_row = q_theta_raw[0].astype(dtype, copy=False)
 
-                W["mu"].resize((old + n_add,))
-                W["mu"][old:old + n_add] = mu0
-
-                W["q_theta"].resize((old + n_add, q_theta_dim))
-                W["q_theta"][old:old + n_add, :] = qt
-
-                W["q_phi"].resize((old + n_add, q_phi_dim))
-                W["q_phi"][old:old + n_add, :] = qp
-
-                if y_dim == 1:
-                    W["y_true"].resize((old + n_add,))
-                    W["y_true"][old:old + n_add] = y0_store
-                else:
-                    W["y_true"].resize((old + n_add, y_dim))
-                    W["y_true"][old:old + n_add, :] = y0_store
-
-                # First batch of the current file for this worker -> remember start index
-                if state[worker_id]["cur_start"] is None:
-                    state[worker_id]["cur_start"] = old
-
-                # Accumulate streaming stats for aggregates =====
-                st = state[worker_id]
-                st["n"] += n_add
-                st["mu_sum"] += float(mu0.sum())
-                st["mu_sumsq"] += float((mu0 * mu0).sum())
-                if y_dim == 1:
-                    st["y_sum"] += float(y0_store.sum())
-
-                # Per-file context θ (unnormalized) for returns/meta =====
-                theta_row = q_theta_raw_t[0].numpy()[0].astype(dtype, copy=False)
-
-                # If file completed, finalize per-file records =====
                 if file_completed:
-                    n = max(st["n"], 1)
-                    mu_avg = st["mu_sum"] / n
-                    mu_var = max(st["mu_sumsq"] / n - mu_avg * mu_avg, 0.0)
-                    sigma_avg = mu_var ** 0.5
-
+                    mu_avg, sigma_avg, y_avg, n = _writer.finalize_file(int(worker_id), theta_row=theta_row)
                     mu_mean.append(mu_avg)
                     sigma_mean.append(sigma_avg)
-                    y_mean.append(st["y_sum"] / n if y_dim == 1 else 0.0)
+                    y_mean.append(y_avg if y_dim == 1 else 0.0)
                     theta_rows.append(theta_row)
                     counts.append(n)
-
-                    # write file boundaries for the worker
-                    fs_old = W["file_start"].shape[0]
-                    W["file_start"].resize((fs_old + 1,))
-                    W["file_count"].resize((fs_old + 1,))
-                    W["file_start"][fs_old] = st["cur_start"]
-                    W["file_count"][fs_old] = n
-
-                    # update meta tables
-                    tf_old = theta_ds.shape[0]
-                    theta_ds.resize((tf_old + 1, theta_size))
-                    theta_ds[tf_old, :] = theta_row
-
-                    who_ds.resize((tf_old + 1,))
-                    who_ds[tf_old] = int(worker_id)
-
-                    # reset worker state for next file
-                    state[worker_id] = {"n": 0, "mu_sum": 0.0, "mu_sumsq": 0.0, "y_sum": 0.0, "cur_start": None}
-
                     pbar.update(1)
 
-                # housekeeping
-                del mu0_t, y0_t_norm, q_theta_raw_t, q_phi_raw_t, y_raw_t
+                # housekeeping for very large runs
                 if W["mu"].shape[0] and (W["mu"].shape[0] % (mu_chunks * 8) == 0):
                     gc.collect()
 
-        # close loader
         dataset_predict.close_loader()
 
-        # stack/reshape returns
-        theta_arr = np.array(theta_rows, dtype=dtype)
-        counts_arr = np.array(counts, dtype=np.int64).reshape(-1, 1)
-        mu_mean_arr = np.array(mu_mean, dtype=dtype).reshape(-1, 1)
-        sigma_mean_arr = np.array(sigma_mean, dtype=dtype).reshape(-1, 1)
-        y_mean_arr = np.array(y_mean, dtype=dtype).reshape(-1, 1)
-
+        # return small aggregates
+        theta_arr = np.asarray(theta_rows, dtype=dtype)
+        counts_arr = np.asarray(counts, dtype=np.int64).reshape(-1, 1)
+        mu_mean_arr = np.asarray(mu_mean, dtype=dtype).reshape(-1, 1)
+        sigma_mean_arr = np.asarray(sigma_mean, dtype=dtype).reshape(-1, 1)
+        y_mean_arr = np.asarray(y_mean, dtype=dtype).reshape(-1, 1)
         return theta_arr, counts_arr, mu_mean_arr, sigma_mean_arr, y_mean_arr
 
     """

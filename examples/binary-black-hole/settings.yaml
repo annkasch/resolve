@@ -26,7 +26,7 @@ cnp_settings:
   training:
     use_staged_training: false
     phase1:
-      training_epochs: 2
+      training_epochs: 1
       mixup_ratio: 0.0
       mixup_margin: 0.0
       use_beta:
@@ -188,7 +188,7 @@ path_settings:
   version: v1.3.4
   path_to_files_train: ../in/data/lf/v1.3/training_cnp
   path_to_files_predict:
-  - /Users/aschuetz/Data/BBH/lf/v1.3/validation
+  - ../in/data/lf/v1.3/training_regression
   iteration:
   - -1
   fidelity:
