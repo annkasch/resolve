@@ -5,6 +5,10 @@
 *.json
 *.png
 *.csv
+*.DS_Store
  examples/binary-black-hole/in/
 *tensorboard_logs/
 examples/binary-black-hole/out
+*pred_store.zarr/
+*/pred_store.zarr
+*/*.zarray

@@ -6,11 +6,11 @@ import os
 from collections import Counter
 from tqdm import tqdm
 import gc
-from IPython.display import display, Image
-import re
-import sys
-import yaml
-import itertools
+
+from pathlib import Path
+
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"
+import h5py
 import h5py
 from torch.utils.data import DataLoader, IterableDataset
 from ..utilities import utilities as utils
@@ -53,21 +53,18 @@ class _LRUBytesBoundCache:
         self.bytes += nb
 
 class HDF5Dataset(IterableDataset):
-    def __init__(self, hdf5_dir, batch_size=3000, files_per_batch=20, parameters=None, mode='train',enable_slice_cache=False, slice_cache_max_bytes=512*1024**2):
+    def __init__(self, files, batch_size=3000, files_per_batch=20, parameters=None, mode='train',enable_slice_cache=False, slice_cache_max_bytes=512*1024**2):
         super().__init__()
-        self.hdf5_dir = hdf5_dir
+        self.files = files
         self.batch_size = batch_size
-        self.files_per_batch = 1 if mode == "prediction" else files_per_batch
+        self.files_per_batch = 1 if (mode == "predict" or mode == "test") else files_per_batch
         self._file_cache = {}
         self.enable_slice_cache = enable_slice_cache
         self._slice_cache = _LRUBytesBoundCache(slice_cache_max_bytes) if enable_slice_cache else None
         self.parameters = parameters
         self.mode = mode
 
-        self.files = sorted([
-            os.path.join(hdf5_dir, f)
-            for f in os.listdir(hdf5_dir) if f.endswith(".h5")
-        ])
+
         self.num_files = len(self.files)
 
         max_rows_per_file, self.nrows = utils.get_max_number_of_rows(
@@ -78,11 +75,10 @@ class HDF5Dataset(IterableDataset):
         self.rows_per_file = self.batch_size // files_per_batch
         self.total_cycles = math.ceil(max_rows_per_file / self.rows_per_file)
 
-        sample_file = self.files[0]
-        self.phi_selected_indices = utils.read_selected_indices(sample_file, self.parameters['phi'])
+        self.phi_selected_indices = self.parameters['phi']['selected_indices']
 
         if self.parameters['theta']['selected_labels']:
-            self.theta_selected_indices = utils.read_selected_indices(sample_file, self.parameters['theta'])
+            self.theta_selected_indices = self.parameters['theta']['selected_indices']
         else:
             self.theta_selected_indices = None
 
@@ -92,7 +88,7 @@ class HDF5Dataset(IterableDataset):
                 start, end = utils.parse_slice_string(labels)
                 self.target_selected_indices = np.arange(start, end)
             else:
-                self.target_selected_indices = utils.read_selected_indices(sample_file, self.parameters['target'])
+                self.target_selected_indices = self.parameters['target']['selected_indices']
         else:
             self.target_selected_indices = None
 
@@ -174,36 +170,38 @@ class HDF5Dataset(IterableDataset):
                 yield torch.tensor(batch, dtype=torch.float32)
 
     def _predict_iter(self):
+        try:
+            worker_info = get_worker_info()
+            worker_id = worker_info.id if worker_info else 0
+            num_workers = worker_info.num_workers if worker_info else 1
 
-        worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
+            self.subcycles_per_file = self.total_cycles  # total_cycles = rows_per_file per file
 
-        self.subcycles_per_file = self.total_cycles  # total_cycles = rows_per_file per file
+            # Split files among workers
+            files_for_worker = self.files[worker_id::num_workers]
 
-        # Split files among workers
-        files_for_worker = self.files[worker_id::num_workers]
+            for file_path in files_for_worker:
+                hdf = self._get_file_handle(file_path)
+                file_idx = self.files.index(file_path)
 
-        for file_path in files_for_worker:
-            hdf = self._get_file_handle(file_path)
-            file_idx = self.files.index(file_path)
+                for subcycle_idx in range(self.subcycles_per_file):
+                    start_idx = subcycle_idx * self.rows_per_file
+                    end_idx = start_idx + self.rows_per_file
+                    batch = self._read_file(hdf, start_idx, end_idx, file_path=file_path)
+                    file_completed = (subcycle_idx == self.subcycles_per_file - 1)
 
-            for subcycle_idx in range(self.subcycles_per_file):
-                start_idx = subcycle_idx * self.rows_per_file
-                end_idx = start_idx + self.rows_per_file
-                batch = self._read_file(hdf, start_idx, end_idx, file_path=file_path)
-                file_completed = (subcycle_idx == self.subcycles_per_file - 1)
+                    yield torch.tensor(batch, dtype=torch.float32), worker_id, file_idx, file_completed
+                    if file_completed:
+                        # Close the file handle after processing the last subcycle
+                        hdf.close()
+                        del self._file_cache[file_path]
 
-                yield torch.tensor(batch, dtype=torch.float32), worker_id, file_completed
-                if file_completed:
-                    # Close the file handle after processing the last subcycle
-                    hdf.close()
-                    del self._file_cache[file_path]
-                    gc.collect()
+        finally:
+            self.close()
                 
 
     def __iter__(self):
-        if self.mode !='prediction':
+        if self.mode !='predict' and self.mode !='test':
             return self._train_iter()
         else:
             return self._predict_iter()
@@ -219,6 +217,7 @@ class HDF5Dataset(IterableDataset):
             try: f.close()
             except: pass
         self._file_cache.clear()
+        gc.collect()
 
     def __enter__(self):
         return self
@@ -241,86 +240,93 @@ def running_average(batch_sum, batch_count, mean, I):
 
 class DataGeneration:
     def __init__(self, mode, config_file, path_to_files, batch_size, files_per_batch):
-        self._context_ratio = config_file["cnp_settings"]["context_ratio"]
-        self._batch_size = batch_size
-        self.path_to_files = path_to_files
-        self.dataloader = None
+        self.mode = mode
         self.config_file = config_file
+        self.files = self._get_hdf5_files(Path(path_to_files))
+        self._batch_size = batch_size
         self.files_per_batch = files_per_batch
-        
-        self.mode=mode
-        
-        _phi_key = "phi"
-        _theta_key = "theta"
-        _target_key = "target"
+        self.dataloader = None
+        self._context_ratio = config_file["cnp_settings"]["context_ratio"]
 
-        self._names_theta = config_file["simulation_settings"]["theta_headers"]
-        self._names_phi = config_file["simulation_settings"]["phi_labels"]
-        self._names_target = config_file["simulation_settings"]["target_headers"]
-
-        #self.feature_size, self.target_size = utils.get_feature_and_label_size(config_file)
-        self.feature_size = len(self._names_theta) + len(self._names_phi)
-        self.target_size = len(self._names_target)
-
-        if not any(f.endswith(".h5") for f in os.listdir(path_to_files)):
+        # ensure HDF5 exists (only once)
+        if not any(self.files):
             utils.convert_all_csv_to_hdf5(config_file)
 
+        # base parameter spec
+        sim = config_file["simulation_settings"]
+        
         self.parameters = {
-            'phi': {'key': _phi_key, 'label_key': "phi_labels", 'selected_labels': self._names_phi},
-            'theta': {'key': _theta_key, 'label_key': "theta_headers", 'selected_labels': self._names_theta},
-            'target': {'key': _target_key, 'label_key': "target_headers", 'selected_labels': self._names_target}
+            "phi":    {"key": "phi",    "label_key": "phi_labels",    "selected_labels": sim["phi_labels"],    "size": len(sim["phi_labels"]),      "selected_indices": None},
+            "theta":  {"key": "theta",  "label_key": "theta_headers", "selected_labels": sim["theta_headers"],  "size": len(sim["theta_headers"]),  "selected_indices": None},
+            "target": {"key": "target", "label_key": "target_headers","selected_labels": sim["target_headers"], "size": len(sim["target_headers"]), "selected_indices": None},
         }
+        self.parameters["phi"]["selected_indices"] = utils.read_selected_indices(self.files[0],self.parameters["phi"])
+        self.parameters["target"]["selected_indices"] = utils.read_selected_indices(self.files[0],self.parameters["target"])
+        self.parameters["theta"]["selected_indices"] = utils.read_selected_indices(self.files[0],self.parameters["theta"])
 
-        if self.mode.startswith("training"):
-            files = self._get_hdf5_files()
-            
-            if "phase2" not in mode:
-                signal_condition = config_file["simulation_settings"]["signal_condition"]
-                self.signal_rate = 0.
-                I = 0
-                for file in tqdm(files, total=len(files), desc="Data Processing in Progress"):
-                    self.split_and_mixup_augment(
-                        file,
-                        config_file["cnp_settings"]["split_ratio"],
-                        config_file["cnp_settings"]["training"]["phase1"]["use_beta"],
-                        signal_condition,
-                        config_file["cnp_settings"]["training"]["phase1"]["mixup_ratio"]
-                    )
-                    self.signal_rate = running_average(np.sum(np.array(h5py.File(file, "r")["target_train"]) == 1, axis=0), np.array(h5py.File(file, "r")["target_train"]).shape[0], self.signal_rate, I)[utils.read_selected_indices(file, self.parameters['target'])[0]]
+        # optional Phase-1 preprocessing + signal-rate computation
+        if mode == "train":
+            self._phase1_preprocess_and_signal_rate()
 
-                
-                print("Overall signal rate in training data:", self.signal_rate)
-                
-                self.parameters["phi"]["key"] = "phi_train" # eventually altered training set according to mixup/ mixup_ratio
-                self.parameters["target"]["key"] = "target_train" # eventually altered training set according to mixup/ mixup_ratio
-            else:
-                self.parameters["phi"]["key"] = "phi_train_raw" # unaltered training set
-                self.parameters["target"]["key"] = "target_train_raw" # unaltered training set
+    # ------------- helpers -------------
+    def _get_hdf5_files(self, path_to_files):
+        return sorted(str(p) for p in path_to_files.glob("*.h5"))
 
-        elif self.mode == "validation":
-            self.parameters["phi"]["key"] = "phi_val"
-            self.parameters["target"]["key"] = "target_val"
-        elif self.mode == "testing":
-            self.parameters["phi"]["key"] = "phi_test"
-            self.parameters["target"]["key"] = "target_test"
-        elif self.mode == "prediction":
-            self.parameters["phi"]["key"] = "phi"
-            self.parameters["target"]["key"] = "target"
+    def _configure_parameter_keys(self, mode="train"):
+        """Map parameter keys depending on mode."""
+        if mode != "predict":
+            self.parameters["phi"]["key"] = f"{mode}/phi"
+            self.parameters["target"]["key"] = f"{mode}/target"
 
-    def _get_hdf5_files(self):
-        return sorted(
-            os.path.join(self.path_to_files, f)
-            for f in os.listdir(self.path_to_files)
-            if f.endswith(".h5")
-        )
+    def _phase1_preprocess_and_signal_rate(self):
+        """Split, (optionally) mixup-augment, then compute overall signal rate on selected targets."""
+
+        cnp = self.config_file["cnp_settings"]
+        split_ratio  = cnp["split_ratio"]
+        use_beta     = cnp["training"]["phase1"]["use_beta"]
+        mixup_ratio  = cnp["training"]["phase1"]["mixup_ratio"]
+        signal_cond  = self.config_file["simulation_settings"]["signal_condition"]
+
+        # run preprocessing once per file
+        for f in tqdm(self.files, total=len(self.files), desc="Data Processing in Progress"):
+            self.split_and_mixup_augment(f, split_ratio, use_beta, signal_cond, mixup_ratio)
+
+        # after augmentation, training keys point to the altered sets
+        self._configure_parameter_keys(mode="train")
+
+        # compute signal rate with a stable accumulator (fewer openings, cached indices)
+        total_pos = None
+        total_cnt = 0
+        selected_idx = None
+
+        for f in self.files:
+            with h5py.File(f, "r") as h5:
+                tgt = h5[self.parameters["target"]["key"]][...]  # shape (N, K)
+                tgt = tgt[:, self.parameters["target"]["selected_indices"]]                       # select columns once
+
+                # count positives per selected target column
+                pos = np.sum(tgt == 1, axis=0)                  # shape (K_sel,)
+                n = tgt.shape[0]
+
+                if total_pos is None:
+                    total_pos = pos.astype(np.float64)
+                else:
+                    total_pos += pos
+                total_cnt += n
+            h5.close()
+
+        # avoid division by zero
+        self.signal_rate = (total_pos / max(total_cnt, 1.0)) if total_pos is not None else 0.0
+        print("Overall signal rate in training data:", self.signal_rate)
     
-    def set_loader(self):
+    def set_loader(self, mode="train"):
+        self._configure_parameter_keys(mode)
         dataset = HDF5Dataset(
-            self.path_to_files,
+            self.files,
             batch_size=self._batch_size,
             files_per_batch=self.files_per_batch,
             parameters=self.parameters,
-            mode=self.mode
+            mode=mode
         )
 
         self.dataloader = DataLoader(
@@ -331,28 +337,35 @@ class DataGeneration:
             pin_memory=self.config_file["cnp_settings"]["dataloader_pin_memory"],
             persistent_workers=self.config_file["cnp_settings"]["dataloader_persistent_workers"]
         )
+        return self.dataloader
     
     def close_loader(self):
         self.dataloader.dataset.close()
     
     def split_and_mixup_augment(self, filename, split_ratio, use_beta, condition_strings, mixup_ratio=0.):
 
-        combined = [
-            f"split_ratio='{split_ratio}'",
-            f"condition='{condition_strings}'",
-            f"use_beta={use_beta}",
-            f"mixup_ratio={mixup_ratio}"
-        ]
+        training_metadata = {
+            "split_ratio": split_ratio,
+            "condition": condition_strings,
+            "use_beta": use_beta,
+            "mixup_ratio": mixup_ratio
+        }
 
         with h5py.File(filename, "a") as f:  # Open in append mode
             
             # Check if split + mixup was already done with identical metadata
-            if all(key in f for key in ("phi_train", "target_train", "training_metadata")):
-                existing_metadata = [s.decode("utf-8") for s in f["training_metadata"][:]]
-                if existing_metadata == combined:
-                    #print("Skipping split and mixup augmentation — already exists with matching metadata.")
-                    #test = 1
-                    return
+            if all(key in f for key in ("train", "validate", "test", "train_meta")):
+                grp = f["train_meta"]  # or whichever group you used
+                attrs = dict(grp.attrs)       # convert to dict for easy comparison
+
+                # check all expected keys exist and match
+                for k, v in training_metadata.items():
+                    if k in attrs:
+                        break
+                    elif not (attrs[k] == v).all() if hasattr(attrs[k], "all") else attrs[k] == v:
+                        break
+
+                return  # skip further processing
             
             phi = np.array(f[self.parameters["phi"]["key"]])  # Feature data
             target = np.array(f[self.parameters["target"]["key"]])  # Labels
@@ -416,33 +429,55 @@ class DataGeneration:
             # Store new datasets in the same file
             # Define data splits and corresponding variable names
             datasets = {
-                "phi_train_raw": phi_train,
-                "phi_train": phi_train_phase1 if mixup_ratio > 0. else phi_train,
-                "phi_val": phi_val,
-                "phi_test": phi_test,
-                "target_train_raw": target_train,
-                "target_train": target_train_phase1 if mixup_ratio > 0. else target_train,
-                "target_val": target_val,
-                "target_test": target_test,
+                "train":{
+                    "phi": phi_train,
+                    "target": target_train
+                },
+                "train_mix":{
+                    "phi": phi_train_phase1 if mixup_ratio > 0. else phi_train,
+                    "target": target_train_phase1 if mixup_ratio > 0. else target_train,
+                },
+                "validate":
+                {
+                    "phi": phi_val,
+                    "target": target_val,
+                },
+                "test":{
+                    "phi": phi_test,
+                    "target": target_test
+                }
             }
 
             if has_weights:
                 datasets.update({
-                    "weights_train_raw": weights_train,
-                    "weights_train": weights_train_phase1 if mixup_ratio > 0. else weights_train,
-                    "weights_val": weights_val,
-                    "weights_test": weights_test,
-                })
+                "train":{
+                    "weights": weights_train
+                },
+                "train_mix":{                    
+                    "weights": weights_train_phase1 if mixup_ratio > 0. else weights_train,
+                },
+                "validate":{
+                    "weights": weights_val,
+                },
+                "test":{
+                    "weights": weights_test,
+                }})
 
             # Write datasets to file (delete if they already exist)
-            for name, data in datasets.items():
-                if name in f:
-                    del f[name]
-                f.create_dataset(name, data=data, compression="gzip")
+            for g, k in datasets.items():
+                if g in f:
+                    del f[g]
+                grp = f.require_group(g)
+                for n, data in k.items():
+                    grp.create_dataset(n, data=data, compression="gzip")
             
-            if "training_metadata" in f:
-                del f["training_metadata"]
-            f.create_dataset("training_metadata", data=np.array(combined, dtype="S"))
+            if "train_meta" in f:
+                del f["train_meta"]
+            grp = f.require_group("train_meta")
+            for k, v in training_metadata.items():
+                grp.attrs[k] = v
+        f.close()
+
 
     def split_data(self, phi, target, weights, split_ratio):
         # Shuffle indices
@@ -536,7 +571,7 @@ class Normalizer:
         self.eps = eps
         self.scaler = StandardScaler(copy=False, with_mean=False, with_std=False)
     
-    def fit_from_files(self, path_to_files, parameters, chunk_size=131072):
+    def fit_from_files(self, file_list, parameters, chunk_size=131072):
         """
         Stream over HDF5 files and compute normalization stats for [theta | phi].
         Supports:
@@ -564,11 +599,6 @@ class Normalizer:
         D = None
         total_rows = 0
 
-        file_list = sorted([
-            os.path.join(path_to_files, f)
-            for f in os.listdir(path_to_files)
-            if f.endswith(".h5")
-        ])
 
         with tqdm(total=len(file_list), desc="Computing global feature stats") as pbar:
             for path in file_list:
@@ -584,8 +614,8 @@ class Normalizer:
                         d_theta = f[theta_key]
 
                         # column selections
-                        phi_idx   = utils.read_selected_indices(path, parameters["phi"])   if phi_sel   else None
-                        theta_idx = utils.read_selected_indices(path, parameters["theta"]) if theta_sel else None
+                        phi_idx   = parameters["phi"]["selected_indices"]   if phi_sel   else None
+                        theta_idx = parameters["theta"]["selected_indices"] if theta_sel else None
 
                         # dims without loading all
                         phi_dim = d_phi.shape[1] if d_phi.ndim == 2 else 1
@@ -647,6 +677,7 @@ class Normalizer:
 
                             total_rows += feats.shape[0]
 
+                    f.close()
                     pbar.update(1)
                 except OSError as e:
                     print(f"Warning: failed to open {path}: {e}")
@@ -695,38 +726,39 @@ class Normalizer:
         return self
 
 class BatchFormatter:
-    def __init__(self, feature_size: int, target_size: int, context_ratio: float, normalizer: Normalizer | None):
-        self.F = feature_size
-        self.T = target_size
+    def __init__(self, parameter, context_ratio: float, normalizer: Normalizer):
+        self.theta_size = parameter["theta"]["size"]
+        self.F = self.theta_size + parameter["phi"]["size"]
+        self.T = parameter["target"]["size"]
         self.context_ratio = context_ratio
         self.norm = normalizer
+        self.x_query = None
 
-    def __call__(self, batch: torch.Tensor, context_is_subset=True):
+    def __call__(self, batch: torch.Tensor, context_is_subset: bool = True):
         # split X/Y
         x = batch[:, :self.F]
         y = batch[:, self.F:self.F+self.T]
 
-        if self.norm is not None:
-            x = self.norm.transform(x)
-
-        # shuffle & split into context/target
         B = x.shape[0]
-        idx = torch.randperm(B, device=x.device)
-        x, y = x[idx], y[idx]
         n_ctx = int(B * self.context_ratio)
+        
         if context_is_subset:
             x_ctx, y_ctx = x[:n_ctx], y[:n_ctx]
-            x_tgt, y_tgt = x, y
+            self.x_query, y_tgt = x, y
+            
         else:
             x_ctx, y_ctx = x[:n_ctx], y[:n_ctx]
-            x_tgt, y_tgt = x[n_ctx:], y[n_ctx:]
+            self.x_query, y_tgt = x[n_ctx:], y[n_ctx:]
+        
+        x_ctx = torch.tensor(self.norm.transform(x_ctx), dtype=torch.float32)
+        x_tgt = torch.tensor(self.norm.transform(self.x_query), dtype=torch.float32)
 
         # shape them and slice theta/phi
         def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
         x_ctx, y_ctx, x_tgt, y_tgt = map(ensure_3d, (x_ctx, y_ctx, x_tgt, y_tgt))
 
         return BatchCollection(
-            context=ContextSet(theta=x_ctx[:, :, :theta_size], phi=x_ctx[:, :, theta_size:], y=y_ctx),
-            query=QuerySet(theta=x_tgt[:, :, :theta_size], phi=x_tgt[:, :, theta_size:]),
+            context=ContextSet(theta=x_ctx[:, :, :self.theta_size], phi=x_ctx[:, :, self.theta_size:], y=y_ctx),
+            query=QuerySet(theta=x_tgt[:, :, :self.theta_size], phi=x_tgt[:, :, self.theta_size:]),
             target_y=y_tgt,
         )

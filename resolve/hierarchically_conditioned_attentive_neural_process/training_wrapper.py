@@ -15,19 +15,18 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 import matplotlib.pyplot as plt
 import numpy as np
 import math
-from torch.utils.data import get_worker_info
 import torch
 from .losses import AsymmetricFocalWithFPPenalty
 from sklearn.metrics import precision_recall_curve, auc
 import os
-import zarr, gc
-from numcodecs import Blosc
+import gc
 from typing import Optional, Tuple
 from .zarr_helper import ZarrPredWriter
+from .data_generator import BatchFormatter
 
 
 class Trainer():
-    def __init__(self, model, dataset):
+    def __init__(self, model, dataset, normalizer):
         self.model = model
         self.dataset = dataset
         self.target_range = self.dataset.config_file["simulation_settings"]["target_range"]
@@ -35,6 +34,7 @@ class Trainer():
         self.training_epochs = 10
         self.epoch_start = 0
         self.criterion = AsymmetricFocalWithFPPenalty()
+        self.formatter = BatchFormatter(self.dataset.parameters["theta"]["size"], self.dataset.parameters["phi"]["size"], self.dataset.parameters["target"]["size"], context_ratio=self.dataset._context_ratio, normalizer=normalizer)
         
 
     def fit(self, optimizer, writer, dataset_val, debug = "off",
@@ -53,7 +53,6 @@ class Trainer():
         epochs_no_improve = 0
 
         if debug == "profiling":
-            # --- add profiler here ---
             profiler = torch.profiler.profile(
                 activities=[torch.profiler.ProfilerActivity.CPU],
                 record_shapes=True,
@@ -61,7 +60,7 @@ class Trainer():
                 with_stack=False
             )
             profiler.__enter__()
-        # -------------------------
+
         
         max_grad_norm = None  # turn off unless you actually need it for stability
         for it_epoch in range(self.epoch_start, self.epoch_start + self.training_epochs):
@@ -76,9 +75,7 @@ class Trainer():
             # If format_batch_for_cnp is heavy Python work, consider moving it into your Dataset __getitem__
             # so each sample is already in the right shape; then your collate_fn can stack efficiently.
             for b, batch in tqdm(enumerate(dataloader), total=math.ceil(len(dataloader) / self.dataset._batch_size), desc=f"Training Epoch {it_epoch+1}/{self.training_epochs}"):
-                batch_formatted = self.dataset.format_batch_for_cnp(
-                    batch, self.dataset.config_file["cnp_settings"]["context_is_subset"]
-                )
+                batch_formatted = self.formatter(batch, context_is_subset=self.dataset.config_file["cnp_settings"]["context_is_subset"])
             
                 optimizer.zero_grad(set_to_none=True)
 
@@ -186,13 +183,11 @@ class Trainer():
 
         y_pred_list = []
         y_true_list = []
-        
+
         with torch.no_grad():
 
             for b, batch in tqdm(enumerate(dataloader), total=math.ceil(len(dataloader) / dataset_eval._batch_size), desc=f"Evaluation"):
-                batch_formatted = dataset_eval.format_batch_for_cnp(
-                    batch, self.dataset.config_file["cnp_settings"]["context_is_subset"]
-                )
+                batch_formatted = self.formatter(batch, self.dataset.config_file["cnp_settings"]["context_is_subset"])
                 # Forward pass
                 logit, kl_term = self.model(
                     batch_formatted.context.theta,
@@ -240,10 +235,9 @@ class Trainer():
         self.model.eval()
 
         # basic dims
-        theta_size = len(dataset_predict._names_theta)
-        q_theta_dim = len(dataset_predict._names_theta)
-        q_phi_dim = len(dataset_predict._names_phi)
-        y_dim = len(dataset_predict._names_target)  # 1 for scalar targets
+        theta_size = dataset_predict.parameters["theta"]["size"]
+        phi_size = dataset_predict.parameters["phi"]["size"]
+        y_size = dataset_predict.parameters["target"]["size"]
 
         # writer
         _writer = writer or ZarrPredWriter(out_store, theta_size=theta_size, dtype=dtype, mu_chunks=mu_chunks)
@@ -259,37 +253,26 @@ class Trainer():
         with torch.no_grad():
             for batch, worker_id, file_completed in dataloader:
                 # format batch and run model
-                bf = dataset_predict.format_batch_for_cnp(
-                    batch,
-                    self.dataset.config_file["cnp_settings"]["context_is_subset"]
-                )
+                bf = self.formatter(batch, dataset_predict.config_file["cnp_settings"]["context_is_subset"])
+                
                 # model forward
                 logit, _ = self.model(
                     bf.context.theta, bf.context.phi, bf.context.y,
                     bf.query.theta, bf.query.phi
                 )
                 mu0_t = torch.sigmoid(logit)[0].detach().cpu().float()            # (N,)
-                y0_t  = bf.target_y[0].detach().cpu().float()                     # (N,) or (N, y_dim)
-
-                # unnormalize query features to RAW for storage
-                theta_mean_t = dataset_predict.feature_mean.cpu()[:, :theta_size]
-                theta_std_t  = dataset_predict.feature_std.cpu()[:, :theta_size]
-                phi_mean_t   = dataset_predict.feature_mean.cpu()[:, theta_size:]
-                phi_std_t    = dataset_predict.feature_std.cpu()[:, theta_size:]
-
-                q_theta_raw_t = bf.query.theta * (theta_std_t + 1e-6) + theta_mean_t
-                q_phi_raw_t   = bf.query.phi * (phi_std_t + 1e-6) + phi_mean_t
+                y0_t  = bf.target_y[0].detach().cpu().float()                     # (N,) or (N, y_size)
 
                 mu0 = mu0_t.numpy().astype(dtype, copy=False).ravel()
-                q_theta_raw = q_theta_raw_t[0].detach().cpu().numpy().astype(dtype, copy=False)  # (N, q_theta_dim)
-                q_phi_raw   = q_phi_raw_t[0].detach().cpu().numpy().astype(dtype, copy=False)    # (N, q_phi_dim)
+                q_theta_raw = self.formatter.x_query[:,:theta_size].detach().cpu().float().numpy()  # (N, theta_size) 
+                q_phi_raw   = self.formatter.x_query[:,theta_size:].detach().cpu().float().numpy()    # (N, phi_size) 
                 y0_raw      = y0_t.numpy()
 
                 # ensure arrays exist for this worker
-                W = _writer.ensure_worker(int(worker_id), q_theta_dim=q_theta_dim, q_phi_dim=q_phi_dim, y_dim=y_dim)
+                W = _writer.ensure_worker(int(worker_id), q_theta_size=theta_size, q_phi_size=phi_size, y_size=y_size)
 
                 # append batch to store + update streaming stats
-                _writer.append_batch(int(worker_id), mu=mu0, q_theta=q_theta_raw, q_phi=q_phi_raw, y_true=y0_raw, y_dim=y_dim)
+                _writer.append_batch(int(worker_id), mu=mu0, q_theta=q_theta_raw, q_phi=q_phi_raw, y_true=y0_raw, y_size=y_size)
 
                 # one per-file theta row (context) for meta and return arrays
                 # take the first query's theta (already unnormalized)
@@ -299,7 +282,7 @@ class Trainer():
                     mu_avg, sigma_avg, y_avg, n = _writer.finalize_file(int(worker_id), theta_row=theta_row)
                     mu_mean.append(mu_avg)
                     sigma_mean.append(sigma_avg)
-                    y_mean.append(y_avg if y_dim == 1 else 0.0)
+                    y_mean.append(y_avg if y_size == 1 else 0.0)
                     theta_rows.append(theta_row)
                     counts.append(n)
                     pbar.update(1)
@@ -318,81 +301,6 @@ class Trainer():
         y_mean_arr = np.asarray(y_mean, dtype=dtype).reshape(-1, 1)
         return theta_arr, counts_arr, mu_mean_arr, sigma_mean_arr, y_mean_arr
 
-    """
-    def predict(self, dataset_predict, writer=None):
-
-            #Run the model in prediction mode over the given dataset.
-            #Returns:
-            #    - mu_all: np.ndarray of predicted means
-            #    - sigma_all: np.ndarray of predicted standard deviations
-            #    - target_y_all: np.ndarray of ground truth targets
-            #    - features_all: np.ndarray of unnormalized input features
-
-            self.model.eval()
-            theta_size = len(dataset_predict.config_file["simulation_settings"]["theta_headers"])
-            num_workers = dataset_predict.config_file["cnp_settings"]["dataloader_number_of_workers"]
-
-            mu_mean=[]
-            sigma_mean=[]
-            y_mean=[]
-            theta=[]
-            mu_mean_tmp = [[] for _ in range(num_workers)]
-            sigma_mean_tmp = [[] for _ in range(num_workers)]
-            y_mean_tmp = [[] for _ in range(num_workers)]
-            counts = []
-
-            dataset_predict.set_loader()
-            dataloader = dataset_predict.dataloader
-
-            # Progress bar for files
-            pbar = tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file")
-
-            with torch.no_grad():
-                for batch, worker_id, file_completed in dataloader:
-                    batch_formatted = dataset_predict.format_batch_for_cnp(
-                            batch, self.dataset.config_file["cnp_settings"]["context_is_subset"]
-                    )
-                    # Forward pass
-                    logit, _ = self.model(
-                        batch_formatted.context.theta,
-                        batch_formatted.context.phi,
-                        batch_formatted.context.y,
-                        batch_formatted.query.theta,
-                        batch_formatted.query.phi
-                    )
-                    mu = torch.sigmoid(logit)
-                    # Denormalize features
-                    theta_norm = batch_formatted.context.theta.cpu()
-                    theta_mean = dataset_predict.feature_mean.cpu()[:,:theta_size]
-                    theta_std = dataset_predict.feature_std.cpu()[:,:theta_size]
-                    theta_unnorm = theta_norm * (theta_std+1.e-6) + theta_mean  # element-wise
-
-                    mu_mean_tmp[worker_id].extend(mu[0].cpu().numpy())
-                    sigma_mean_tmp[worker_id].extend(mu[0].cpu().numpy())
-                    y_mean_tmp[worker_id].extend(batch_formatted.target_y[0].cpu().numpy())
-
-                    if file_completed:
-                        mu_avg = np.mean(mu_mean_tmp[worker_id])
-                        sigma_avg = 0.
-                        
-                        mu_mean.append(mu_avg)
-                        sigma_mean.append(sigma_avg)
-                        y_mean.append(np.mean(y_mean_tmp[worker_id]))
-                        theta.append(theta_unnorm[0].cpu().numpy()[0][:theta_size])
-                        counts.append(len(mu_mean_tmp[worker_id]))
-                        
-                        if writer != None:
-                            fig = self.plot(np.array(mu_mean_tmp[worker_id]), np.array(y_mean_tmp[worker_id]), r"$\bar{y}_{CNP}$="+f"{mu_mean[-1]:.3f}", self.target_range, len(mu_mean))
-                            writer.add_figure(f'Plot/Predition', fig, global_step=len(mu_mean))
-                        
-                        mu_mean_tmp[worker_id]=[]
-                        y_mean_tmp[worker_id]=[]
-                        sigma_mean_tmp[worker_id]=[]
-                        
-                        pbar.update(1)  # move progress bar by one file
-            dataset_predict.close_loader()
-            return np.array(theta), np.array(counts).reshape(-1,1), np.array(mu_mean).reshape(-1,1), np.array(sigma_mean).reshape(-1,1), np.array(y_mean).reshape(-1,1)
-    """
     def log_metrics(self, writer, y_true, y_pred, loss, it_step, is_binary, leg="Train"):
         metrics = {
                 "Loss": loss,

@@ -10,9 +10,9 @@ class ZarrPredWriter:
 
     Layout:
       worker_{k}/mu        : (N_k,)
-      worker_{k}/q_theta   : (N_k, q_theta_dim)
-      worker_{k}/q_phi     : (N_k, q_phi_dim)
-      worker_{k}/y_true    : (N_k,) or (N_k, y_dim)
+      worker_{k}/q_theta   : (N_k, q_theta_size)
+      worker_{k}/q_phi     : (N_k, q_phi_size)
+      worker_{k}/y_true    : (N_k,) or (N_k, y_size)
       worker_{k}/file_start: (n_files_k,)
       worker_{k}/file_count: (n_files_k,)
       meta/theta           : (n_files_total, theta_size)
@@ -57,7 +57,7 @@ class ZarrPredWriter:
             return self.meta[name]
         return self.meta.zeros(name, shape=shape, chunks=chunks, dtype=dtype, compressor=self.compressor)
 
-    def ensure_worker(self, wk: int, q_theta_dim: int, q_phi_dim: int, y_dim: int) -> Dict[str, zarr.Array]:
+    def ensure_worker(self, wk: int, q_theta_size: int, q_phi_size: int, y_size: int) -> Dict[str, zarr.Array]:
         """Create or fetch all arrays for a worker group."""
         if wk in self._workers:
             return self._workers[wk]
@@ -71,17 +71,17 @@ class ZarrPredWriter:
 
         mu_arr = req("mu", shape=(0,), chunks=(self.mu_chunks,), dtype=self.dtype)
 
-        qtheta_chunks = (max(1, self.mu_chunks // max(1, q_theta_dim)), q_theta_dim)
-        qtheta_arr = req("q_theta", shape=(0, q_theta_dim), chunks=qtheta_chunks, dtype=self.dtype)
+        qtheta_chunks = (max(1, self.mu_chunks // max(1, q_theta_size)), q_theta_size)
+        qtheta_arr = req("q_theta", shape=(0, q_theta_size), chunks=qtheta_chunks, dtype=self.dtype)
 
-        qphi_chunks = (max(1, self.mu_chunks // max(1, q_phi_dim)), q_phi_dim)
-        qphi_arr = req("q_phi", shape=(0, q_phi_dim), chunks=qphi_chunks, dtype=self.dtype)
+        qphi_chunks = (max(1, self.mu_chunks // max(1, q_phi_size)), q_phi_size)
+        qphi_arr = req("q_phi", shape=(0, q_phi_size), chunks=qphi_chunks, dtype=self.dtype)
 
-        if y_dim == 1:
+        if y_size == 1:
             y_arr = req("y_true", shape=(0,), chunks=(self.mu_chunks,), dtype=self.dtype)
         else:
-            y_chunks = (max(1, self.mu_chunks // max(1, y_dim)), y_dim)
-            y_arr = req("y_true", shape=(0, y_dim), chunks=y_chunks, dtype=self.dtype)
+            y_chunks = (max(1, self.mu_chunks // max(1, y_size)), y_size)
+            y_arr = req("y_true", shape=(0, y_size), chunks=y_chunks, dtype=self.dtype)
 
         fs_arr = req("file_start", shape=(0,), chunks=(4096,), dtype=np.int64)
         fc_arr = req("file_count", shape=(0,), chunks=(4096,), dtype=np.int64)
@@ -98,10 +98,10 @@ class ZarrPredWriter:
         self,
         wk: int,
         mu: np.ndarray,                 # (N,)
-        q_theta: np.ndarray,            # (N, q_theta_dim)
-        q_phi: np.ndarray,              # (N, q_phi_dim)
-        y_true: np.ndarray,             # (N,) or (N, y_dim)
-        y_dim: int,
+        q_theta: np.ndarray,            # (N, q_theta_size)
+        q_phi: np.ndarray,              # (N, q_phi_size)
+        y_true: np.ndarray,             # (N,) or (N, y_size)
+        y_size: int,
     ) -> None:
         """Append one batch for a worker and update streaming stats."""
         W = self._workers[wk]
@@ -119,14 +119,14 @@ class ZarrPredWriter:
         W["q_phi"].resize((old + n_add, q_phi.shape[1]))
         W["q_phi"][old:old + n_add, :] = q_phi.astype(self.dtype, copy=False)
 
-        if y_dim == 1:
+        if y_size == 1:
             y_store = y_true.reshape(-1).astype(self.dtype, copy=False)
             W["y_true"].resize((old + n_add,))
             W["y_true"][old:old + n_add] = y_store
         else:
             y_store = y_true.astype(self.dtype, copy=False)
             if y_store.ndim == 1:
-                y_store = y_store.reshape(-1, y_dim)
+                y_store = y_store.reshape(-1, y_size)
             W["y_true"].resize((old + n_add, y_store.shape[1]))
             W["y_true"][old:old + n_add, :] = y_store
 
@@ -139,7 +139,7 @@ class ZarrPredWriter:
         st["n"] += n_add
         st["mu_sum"] += float(mu.sum())
         st["mu_sumsq"] += float((mu * mu).sum())
-        if y_dim == 1:
+        if y_size == 1:
             st["y_sum"] += float(y_store.sum())
 
     def finalize_file(self, wk: int, theta_row: np.ndarray) -> Tuple[float, float, float, int]:

@@ -1,6 +1,6 @@
 from .hc_context_attn_neural_process_model import HCContextAttnNP
 from .hc_context_aware_target_attn_neural_process_model import HCTargetAttnNP
 from .hc_context_aware_target_attn_latent_neural_process_model import HCTargetAttnLNP
-from .training_wrapper import Trainer
-from .data_generator import DataGeneration, Normalizer
+from .training_wrapper_compact import Trainer
+from .data_generator import DataGeneration, Normalizer, BatchFormatter
 from .isolation_forrest import IsolationForestWrapper
