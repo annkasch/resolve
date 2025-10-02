@@ -53,49 +53,35 @@ feature_settings:
   target_size: 1
 
 simulation_settings:
-  theta_headers:
-  - metallicity
-  - envelope_eff_alpha
-  - sigma_bh
-  - sigma_ns
-  theta_headers_plot:
+  theta_labels:
+  - BSE_System_Parameters/Metallicity@ZAMS(1)
+  - BSE_System_Parameters/PO_CE_Alpha
+  - BSE_System_Parameters/PO_Sigma_Kick_CCSN_BH
+  - BSE_System_Parameters/PO_Sigma_Kick_CCSN_NS
+  theta_labels_plot:
   - metallicity
   - $\alpha_{CE}$
   - $\sigma_{BH}$
-  - $\sigma_{SN}$
+  - $\sigma_{NS}$
   phi_labels:
-  - CH_on_MS(1)
-  - CH_on_MS(2)
-  - Eccentricity@ZAMS
-  - Equilibrated_At_Birth
-  - Evolution_Status
-  - Mass@ZAMS(1)
-  - Mass@ZAMS(2)
-  - Merger
-  - Merger_At_Birth
-  - Metallicity@ZAMS(1)
-  - Metallicity@ZAMS(2)
-  - Omega@ZAMS(1)
-  - Omega@ZAMS(2)
-  - PO_CE_Alpha
-  - PO_LBV_Factor
-  - PO_Sigma_Kick_ECSN
-  - PO_Sigma_Kick_USSN
-  - PO_WR_Factor
-  - SN_Kick_Magnitude_Random_N
-  - SemiMajorAxis@ZAMS
-  - Stellar_Type(1)
-  - Stellar_Type(2)
-  - Stellar_Type@ZAMS(1)
-  - Stellar_Type@ZAMS(2)
-  target_headers:
-  - BBH Events
-  target_headers_plot: $\hat{\epsilon}$
+  - BSE_System_Parameters/Equilibrated_At_Birth
+  - BSE_System_Parameters/Evolution_Status
+  - BSE_System_Parameters/Mass@ZAMS(1)
+  - BSE_System_Parameters/Mass@ZAMS(2)
+  - BSE_System_Parameters/Merger
+  - BSE_System_Parameters/SN_Kick_Magnitude_Random_N
+  - BSE_System_Parameters/SemiMajorAxis@ZAMS
+  - BSE_System_Parameters/Stellar_Type(1)
+  - BSE_System_Parameters/Stellar_Type(2)
+  - BSE_System_Parameters/Stellar_Type@ZAMS(2)
+  target_labels:
+  - BSE_DCO_Masks/BBH_mask
+  target_label_plot: $\hat{\epsilon}$
   target_range:
   - 0
   - 1
   signal_condition:
-  - BBH Events==1
+  - ==1
   theta_min:
   - 0.0001
   - 0
