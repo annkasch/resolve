@@ -1,0 +1,7 @@
+README.md
+pyproject.toml
+resolve.egg-info/PKG-INFO
+resolve.egg-info/SOURCES.txt
+resolve.egg-info/dependency_links.txt
+resolve.egg-info/requires.txt
+resolve.egg-info/top_level.txt

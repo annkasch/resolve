@@ -1,0 +1,29 @@
+Metadata-Version: 2.4
+Name: resolve
+Version: 1.0.0
+Summary: A Python package for a rare event surrogate model (RESOVLE)
+Author-email: xxx <xxx@gmail.com>
+License: MIT
+Project-URL: Homepage, https://github.com/xxx/resolve
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.10
+Requires-Dist: numpy==1.26.4
+Requires-Dist: torch==2.2.2
+Requires-Dist: tensorboard
+Requires-Dist: matplotlib
+Requires-Dist: pyyaml
+Requires-Dist: ipywidgets
+Requires-Dist: pandas
+Requires-Dist: tqdm
+Requires-Dist: dask[dataframe]
+Requires-Dist: imbalanced-learn==0.8.1
+Requires-Dist: termcolor
+Requires-Dist: scipy
+Requires-Dist: GPy==1.13.2
+Requires-Dist: emukit==0.4.11
+Requires-Dist: backports.tarfile
+Requires-Dist: pymc==5.22.0
+Requires-Dist: snap
+Requires-Dist: seaborn

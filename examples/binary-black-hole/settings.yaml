@@ -1,0 +1,105 @@
+path_settings:
+  version: v1.0.0
+  path_to_files_train: ./binary-black-hole/in/data/lf/v1.0/training_cnp
+  path_to_files_predict: ./binary-black-hole/in/data/lf/v1.0/training_regression
+  path_out_model: ./binary-black-hole/out
+model_settings:
+  network:
+    model_used: ConditionalNeuralProcess # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
+    models: 
+      ConditionalNeuralProcess:
+        representation_size: 32
+        encoder_sizes: [32, 64, 64, 48]
+        decoder_sizes: [32, 64, 64, 48]
+      HCTargetAttnNP:
+        representation_size: 128
+      HCTargetAttnLNP:
+        representation_size: 128
+  dataloader:
+    dataloader_number_of_workers: 4
+    dataloader_prefetch_factor: 4
+    dataloader_pin_memory: false
+    dataloader_persistent_workers: false
+  train:
+    use_staged_training: false
+    dataset:
+      train_ratio: 0.6
+      val_ratio: 0.2
+      test_ratio: 0.2
+      mixup_ratio: 1.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
+      mixup_margin: 0.0
+      use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
+      positive_ratio_train: false
+      with_replacement: false
+      context_is_subset: true # if true, context points are a subset of target points; if false, context and target points are drawn independently
+      context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
+      use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
+    batch_size: 1000
+    training_epochs: 50
+    learning_rate: 0.001
+    report_frequency: 10
+    loss:
+      base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'mse' (Mean Squared Error)
+      prior_pos: false   # Whether to apply logit adjustment based on prior class probability (signal rate). 
+                          # Helps correct imbalance if true; set false for standard loss.
+      alpha_pos: 1.0     # Weight for the positive (signal) class. 
+                          # Lower (<1) downweights positives, higher (>1) emphasizes them. 
+                          # Common range: 0.1–0.5. Set to 1 for no reweighting.
+      alpha_neg: 1.0    # Optional explicit weight for the negative (background) class. 
+                          # If None, uses (1 - alpha_pos). Set to 1 for no reweighting.
+      gamma_pos: 0.0     # Focusing parameter (Focal Loss) for positives. 
+                          # Increases focus on hard-to-classify positives. Typical values: 1–2. 
+                          # Set to 0 to disable focusing.
+      gamma_neg: 0.0     # Focusing parameter (Focal Loss) for negatives. 
+                          # Higher values (>2) penalize hard negatives more strongly. 
+                          # Set to 0 to disable focusing.
+      lambda_fp: 0.0     # Penalty weight for false positives (backgrounds predicted as signal). 
+                          # Typical range: 0.1–1.0. Set to 0 for no FP penalty.
+      tau_fp: 0.        # Confidence threshold above which a background prediction counts as a false positive. 
+                          # Typical: 0.9–0.97. Set to 0 to disable thresholding.
+      reduction: mean    # How to aggregate batch loss: 'mean' averages, 'sum' totals, 'none' returns per-sample loss.
+      weight_fp: 0.0
+      weight_tp: 0.0
+
+simulation_settings: # Settings related to the data, assumes data is in hdf5 format
+  theta_labels: # Input parameters as they appear in the simulation data files
+  - metallicity
+  - envelope_eff_alpha
+  - sigma_bh
+  - sigma_ns
+  theta_labels_plot:
+  - metallicity
+  - $\alpha_{CE}$
+  - $\sigma_{BH}$
+  - $\sigma_{NS}$
+  phi_labels:
+  - Equilibrated_At_Birth
+  - Evolution_Status
+  - Mass@ZAMS(1)
+  - Mass@ZAMS(2)
+  - Merger
+  - SN_Kick_Magnitude_Random_N
+  - SemiMajorAxis@ZAMS
+  - Stellar_Type(1)
+  - Stellar_Type(2)
+  - Stellar_Type@ZAMS(2)
+  target_labels:
+  - BBH Events
+  target_label_plot: $\hat{\epsilon}$
+  target_range:
+  - 0
+  - 1
+  signal_condition:
+  - == 1
+  signal_rate:
+  - 0.0073
+  theta_min:
+  - 0.0001
+  - 0
+  - 0
+  - 0
+  theta_max:
+  - 0.031
+  - 10
+  - 1000
+  - 1000
