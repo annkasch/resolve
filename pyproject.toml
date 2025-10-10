@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resolve"
+version = "1.0.0"
+description = "A Python package for a rare event surrogate model (RESOVLE)"
+authors = [
+    { name = "annkaschue", email = "annkaschue@gmail.com" }
+]
+license = { text = "MIT" }
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "numpy==1.26.4",
+    "torch==2.2.2",
+    "tensorboard",
+    "matplotlib",
+    "pyyaml",
+    "ipywidgets",
+    "tqdm",
+    "imbalanced-learn==0.8.1",
+    "termcolor",
+    "scipy",
+    "GPy==1.13.2",
+    "emukit==0.4.11",
+    "backports.tarfile",
+    "pymc==5.22.0",
+    "snap",
+    "seaborn"
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent"
+]
+
+[tool.setuptools]
+packages = ["resolve"]
+
+[project.urls]
+Homepage = "https://github.com/annkasch/resolve"
