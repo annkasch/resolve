@@ -1,7 +1,4 @@
-*.nc
-*.h5
-*.pth
-*.pyc
-*.json
-*.png
-*.csv
+examples/binary-black-hole/in/data/*
+!examples/binary-black-hole/in/data/.gitkeep
+examples/binary-black-hole/out/*
+!examples/binary-black-hole/out/.gitkeep
