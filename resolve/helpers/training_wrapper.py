@@ -326,7 +326,7 @@ class Trainer:
         return score
 
     @torch.inference_mode()
-    def predict(self, dataset_name="predict", writer=None):
+    def predict(self, dataset_name="predict", monitor="pr_auc",writer=None):
             """
             Run the model in prediction mode over the given dataset.
             Processes data file by file and saves predictions back to the same files.
@@ -348,6 +348,7 @@ class Trainer:
                 "phi": np.zeros((0, sizes["phi"])),
                 "loss": 0.0
             }
+            metrics_col =  np.empty((0, 4))
             
             dataloader = self.dataset.set_loader(mode="predict")
             with tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file") as pbar:
@@ -382,17 +383,6 @@ class Trainer:
                     collectors["phi"] = np.concatenate([collectors["phi"], query_phi], axis=0)
 
                     if file_completed:
-                        m_v = _compute_metrics(collectors["y_true"], collectors["y_pred"], self.is_binary)
-                        m_v["loss"] = collectors["loss"]
-                        self.metrics[dataset_name] = m_v
-
-                        # Log
-                        if writer and file_idx % self._report == 0.:
-                            for k, v in m_v.items():
-                                writer.add_scalar(f"{dataset_name}/{k}", v, file_idx)
-                            fig = utils.plot(collectors["y_pred"], collectors["y_true"], it=file_idx)
-                            writer.add_figure(f'plot/{dataset_name}', fig, global_step=file_idx)
-                        
                         # Get indices for data validation
                         indices = {k: self.dataset.parameters[k]["selected_indices"] 
                                  for k in ["phi", "theta", "target"]}
@@ -419,9 +409,11 @@ class Trainer:
                                 model_name = self.model.__class__.__name__
                                 version = self.dataset.config_file["path_settings"]["version"]
                                 group_path = f"RESOLVE_{model_name}_{version}"
-                                
-                                if group_path in f:
-                                    del f[group_path]
+                                prefix = group_path
+                                to_delete = [name for name in f.keys() if name.startswith(prefix)]
+                                for name in to_delete:
+                                    del f[name]
+
                                 grp = f.require_group(group_path)
                                 
                                 # Save predictions and metadata
@@ -430,13 +422,6 @@ class Trainer:
                                     grp.create_dataset(f'{l}_pred', data=collectors["y_pred"][:, i], compression="gzip", chunks=True)
                                     if collectors["y_err"].shape[0] > 0:
                                         grp.create_dataset(f'{l}_pred_err', data=collectors["y_err"][:, i], compression="gzip", chunks=True)
-                                
-                                grp.create_dataset("loss", data=float(collectors["loss"]))
-
-                                # Save metrics
-                                metrics = _compute_metrics(collectors["y_true"], collectors["y_pred"], self.is_binary)
-                                for name, data in metrics.items():
-                                    grp.create_dataset(name, data=data)
                                 
                                 # Save provenance
                                 grp.attrs.update({
@@ -449,9 +434,28 @@ class Trainer:
                                     "target_label": str(self.dataset.parameters["target"]["selected_labels"])
                                 })
                             
-                            
-                            # Reset collectors for next file
-                            collectors = {
+                                # Save metrics
+                                # Save metrics
+                                m_v = _compute_metrics(collectors["y_true"], collectors["y_pred"], self.is_binary)
+                                m_v["loss"] = float(collectors["loss"])
+
+                                # Correct: update attributes directly from the dictionary
+                                grp.attrs.update(m_v)
+
+                        # Log
+                        if writer and file_idx % self._report == 0.:
+                            for k, v in m_v.items():
+                                writer.add_scalar(f"{dataset_name}/{k}", v, file_idx)
+                            fig = utils.plot(collectors["y_pred"], collectors["y_true"], it=file_idx)
+                            writer.add_figure(f'plot/{dataset_name}', fig, global_step=file_idx)
+
+                        # initialize an empty array with correct number of columns but 0 rows
+                        if metrics_col.shape[1] != len(m_v):
+                            metrics_col =  np.empty((0, len(m_v)))
+
+                        metrics_col = np.vstack([metrics_col, np.array(list(m_v.values())).reshape(1, -1)])
+                        # Reset collectors for next file
+                        collectors = {
                                 "y_pred": np.zeros((0, sizes["target"])),
                                 "y_err": np.zeros((0, sizes["target"])),
                                 "y_true": np.zeros((0, sizes["target"])),
@@ -459,6 +463,15 @@ class Trainer:
                                 "phi": np.zeros((0, sizes["phi"])),
                                 "loss": 0.0
                             }
-                            
+
                         pbar.update(1)
+
+            for i, (name, _) in enumerate(m_v.items()):
+                if dataset_name not in self.metrics:
+                    self.metrics[dataset_name] = {}
+                # Store both the average and full values
+                self.metrics[dataset_name][f'{name}_avg'] = np.nanmean(metrics_col[:, i])
+                self.metrics[dataset_name][name] = metrics_col[:, i].tolist()
+            
+            return {"monitor_avg": np.nanmean(self.metrics[dataset_name].get(monitor, float("nan")))}
                         

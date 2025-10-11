@@ -1,4 +1,4 @@
-from resolve.network_model_architectures import HCTargetAttnNP, ConditionalNeuralProcess, HCTargetAttnLNP
+from resolve.network_architectures import HCTargetAttnNP, ConditionalNeuralProcess, HCTargetAttnLNP
 
 class ModelsManager():
     def __init__(self, config):

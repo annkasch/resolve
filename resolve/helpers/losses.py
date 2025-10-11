@@ -14,23 +14,6 @@ def log_prob(z, y, **kward):
     log_prob = -1.*dist.log_prob(y)
     return log_prob.view(-1), z[0].view(-1)
 
-def penalty_loss_fp(self, y_pred, y_true, weight_fp=1.0, weight_tp=0.1):
-        """
-        Penalize background events misclassified as signal (FP),
-        and reward correct signal classifications (TP).
-        y_true: ground truth labels (0 for background, 1 for signal)
-        y_pred: predicted probabilities ∈ [0, 1] (after sigmoid)
-        """
-        # False positives: background misclassified as signal
-        mask_fp = (y_true < 0.5) & (y_pred >= 0.5)
-        penalty_fp = (y_pred - 0.5) * mask_fp.float()
-
-        # True positives: signal correctly identified
-        mask_tp = (y_true >= 0.5) & (y_pred >= 0.5)
-        reward_tp = (y_pred - 0.5) * mask_tp.float()
-
-        return weight_fp * penalty_fp.mean() - weight_tp * reward_tp.mean()
-
 class AsymmetricFocalWithFPPenalty(nn.Module):
     """
     Binary classification loss:
@@ -49,9 +32,8 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         gamma_pos: focusing parameter for positives.
         gamma_neg: focusing parameter for negatives.
         lambda_fp: weight of the false-positive quadratic penalty (negatives only).
+        lambda_tp: weight of the true-positive quadratic reward (positives only).
         tau_fp: probability threshold for penalizing negatives (p > tau_fp).
-        weight_fp:
-        weight_tp:
         reduction: 'mean' | 'sum' | 'none'
         eps: small constant for numeric stability.
     """
@@ -62,10 +44,9 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         alpha_neg: float | None = None,
         gamma_pos: float = 2.0,
         gamma_neg: float = 4.0,
-        weight_fp: float = 0.0,
-        weight_tp: float = 0.0,
-        lambda_fp: float = 0.2,
-        tau_fp: float = 0.9,
+        lambda_fp: float = 0.0,
+        lambda_tp: float = 0.0,
+        tau_fptp: float = 0.5,
         reduction: str = "mean",
         eps: float = 1e-6,
         base_loss_fn = bce_with_logits
@@ -74,9 +55,10 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         assert 0.0 <= alpha_pos <= 2.0
         if alpha_neg is None:
             alpha_neg = 1.0 - alpha_pos
-        assert 0.0 <= alpha_neg <= 1.0
-        assert 0.0 <= tau_fp <= 1.0
+        assert 0.0 <= alpha_neg <= 2.0
+        assert 0.0 <= tau_fptp <= 1.0
         assert lambda_fp >= 0.0
+        assert lambda_tp >= 0.0
         assert reduction in ("mean", "sum", "none")
 
         self.alpha_pos = float(alpha_pos)
@@ -84,9 +66,8 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         self.gamma_pos = float(gamma_pos)
         self.gamma_neg = float(gamma_neg)
         self.lambda_fp = float(lambda_fp)
-        self.tau_fp = float(tau_fp)
-        self.weight_fp = float(weight_fp)
-        self.weight_tp = float(weight_tp)
+        self.lambda_tp = float(lambda_tp)
+        self.tau_fptp = float(tau_fptp)
         self.reduction = reduction
         self.eps = float(eps)
         self.base_loss_fn = base_loss_fn
@@ -115,24 +96,8 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         targets = targets.view(-1).float()
         pos_mask = targets >= 0.5
         neg_mask = ~pos_mask
-        """
-        # Asymmetric focal weights
-        weight = torch.zeros_like(base)
-        if pos_mask.any():
-            # alpha_pos * (1 - p)^gamma_pos on positives
-            w_pos = self.alpha_pos * torch.pow((1.0 - p[pos_mask]).clamp_min(self.eps), self.gamma_pos)
-            weight[pos_mask] = w_pos
-        if neg_mask.any():
-            # alpha_neg * (p)^gamma_neg on negatives
-            w_neg = self.alpha_neg * torch.pow(p[neg_mask].clamp_min(self.eps), self.gamma_neg)
-            weight[neg_mask] = w_neg
 
-        focal_term = weight * base
-        """
         # Asymmetric focal weights
-        # Clamp once, vectorized (avoid repeated masks)
-        #p = p.clamp(self.eps, 1.0 - self.eps)
-
         # Compute asymmetric focal weights without boolean indexing copies
         # w = alpha_pos * (1 - p)^gamma_pos on positives, else alpha_neg * p^gamma_neg
         one_minus_p = 1.0 - p
@@ -142,17 +107,20 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
 
         # Focal term
         focal_term = weight * base
-        
-        focal_term += penalty_loss_fp(logits[0], targets, self.weight_fp, self.weight_tp)
 
         # False-positive penalty for negatives: (ReLU(p - tau_fp))^2
         if self.lambda_fp > 0.0 and neg_mask.any():
-            overshoot = torch.relu(p[neg_mask] - self.tau_fp)
-            penalty = overshoot ** 2
+            overshoot = torch.relu(p[neg_mask] - self.tau_fptp)
+            penalty = overshoot # ** 2 #a smooth, differentiable penalty that grows quadratically with the model’s confidence in the wrong direction
             loss = focal_term.clone()
             loss[neg_mask] = loss[neg_mask] + self.lambda_fp * penalty
         else:
             loss = focal_term
+        
+        if self.lambda_tp > 0.0 and pos_mask.any():
+            overshoot = torch.relu(p[pos_mask] - self.tau_fptp)
+            reward = overshoot # ** 2 # 
+            loss[pos_mask] = loss[pos_mask] + self.lambda_tp * reward
 
         if self.reduction == "mean":
             return loss.mean()
