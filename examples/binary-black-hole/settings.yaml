@@ -35,31 +35,30 @@ model_settings:
       context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
     batch_size: 1000
-    training_epochs: 50
+    training_epochs: 100
     learning_rate: 0.001
     report_frequency: 10
     loss:
       base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'mse' (Mean Squared Error)
-      prior_pos: false   # Whether to apply logit adjustment based on prior class probability (signal rate). 
+      prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
-      alpha_pos: 1.0     # Weight for the positive (signal) class. 
+      alpha_pos:  1.0     # Weight for the positive (signal) class. 
                           # Lower (<1) downweights positives, higher (>1) emphasizes them. 
                           # Common range: 0.1–0.5. Set to 1 for no reweighting.
-      alpha_neg: 1.0    # Optional explicit weight for the negative (background) class. 
+      alpha_neg:  1.0     # Optional explicit weight for the negative (background) class. 
                           # If None, uses (1 - alpha_pos). Set to 1 for no reweighting.
-      gamma_pos: 0.0     # Focusing parameter (Focal Loss) for positives. 
+      gamma_pos:  0.0     # Focusing parameter (Focal Loss) for positives. 
                           # Increases focus on hard-to-classify positives. Typical values: 1–2. 
                           # Set to 0 to disable focusing.
-      gamma_neg: 0.0     # Focusing parameter (Focal Loss) for negatives. 
+      gamma_neg:  0.0     # Focusing parameter (Focal Loss) for negatives. 
                           # Higher values (>2) penalize hard negatives more strongly. 
                           # Set to 0 to disable focusing.
-      lambda_fp: 0.0     # Penalty weight for false positives (backgrounds predicted as signal). 
+      lambda_fp:  0.     # Penalty weight for false positives. 
                           # Typical range: 0.1–1.0. Set to 0 for no FP penalty.
-      tau_fp: 0.        # Confidence threshold above which a background prediction counts as a false positive. 
-                          # Typical: 0.9–0.97. Set to 0 to disable thresholding.
-      reduction: mean    # How to aggregate batch loss: 'mean' averages, 'sum' totals, 'none' returns per-sample loss.
-      weight_fp: 0.0
-      weight_tp: 0.0
+      lambda_tp:  0.     # Reward weight for true positives.
+      tau_fptp:   0.5     # Confidence threshold above which a background prediction counts as a false positive. 
+                          # Typical: 0.9–0.97.
+      reduction: mean     # How to aggregate batch loss: 'mean' averages, 'sum' totals, 'none' returns per-sample loss.
 
 simulation_settings: # Settings related to the data, assumes data is in hdf5 format
   theta_labels: # Input parameters as they appear in the simulation data files
