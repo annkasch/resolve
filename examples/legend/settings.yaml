@@ -1,23 +1,16 @@
 path_settings:
-  version: v1.0.3
-  path_to_files_train: ./binary-black-hole/in/data/lf/v1.0/training_cnp
-  path_to_files_predict: ./binary-black-hole/in/data/lf/v1.0/training_regression
-  path_out_model: ./binary-black-hole/out
+  version: v1.0.1
+  path_to_files_train: ./legend/in/data/lf/v1.7/tier3
+  path_to_files_predict: ./legend/in/data/lf/v1.0/training_regression
+  path_out_model: ./legend/out
 model_settings:
   network:
     model_used: ConditionalNeuralProcess # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
     models: 
       ConditionalNeuralProcess:
         representation_size: 32
-        encoder_sizes: [32, 64,48]
-        decoder_sizes: [48, 64, 48, 32]
-      Autoencoder:
-        representation_size: 8
-        encoder_sizes: [64, 32, 16]
-      IsolationForest:
-        n_estimators: 200
-        contamination: 0.05
-        invert_scores: True
+        encoder_sizes: [32, 64, 64, 48]
+        decoder_sizes: [32, 64, 64, 48]
       HCTargetAttnNP:
         representation_size: 128
       HCTargetAttnLNP:
@@ -28,28 +21,25 @@ model_settings:
     dataloader_pin_memory: false
     dataloader_persistent_workers: false
   train:
+    use_staged_training: false
     dataset:
-      seed: 12345
       train_ratio: 0.6
       val_ratio: 0.2
       test_ratio: 0.2
-      mixup_ratio: 1.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
+      mixup_ratio: 0.5 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
+      positive_ratio_train: 0
+      with_replacement: false
       context_is_subset: true # if true, context points are a subset of target points; if false, context and target points are drawn independently
-      context_ratio: 1. # ratio of context points to total points if context_is_subset is true
+      context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
-      use_schedule: false
-      skip_warmup: false
-      positive_ratio_train: null # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
-      max_positive_reuse: 3
-      num_epochs_per_positive_ratio: 2 
     batch_size: 1000
-    training_epochs: 20
+    training_epochs: 100
     learning_rate: 0.001
     report_frequency: 10
     loss:
-      base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error)
+      base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'mse' (Mean Squared Error)
       prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
       alpha_pos:  1.0     # Weight for the positive (signal) class. 
@@ -63,39 +53,43 @@ model_settings:
       gamma_neg:  0.0     # Focusing parameter (Focal Loss) for negatives. 
                           # Higher values (>2) penalize hard negatives more strongly. 
                           # Set to 0 to disable focusing.
-      lambda_fp:  0.     # Penalty weight for false positives. 
+      lambda_fp:  0.0     # Penalty weight for false positives. 
                           # Typical range: 0.1–1.0. Set to 0 for no FP penalty.
-      tau_fp:     0.5
-      lambda_tp:  0.     # Reward weight for true positives.
+      tau_fp:     0.5    
+      lambda_tp:  0.0      # Reward weight for true positives.
       tau_tp:     0.5     # Confidence threshold above which a background prediction counts as a false positive. 
                           # Typical: 0.9–0.97.
+
       reduction: mean     # How to aggregate batch loss: 'mean' averages, 'sum' totals, 'none' returns per-sample loss.
 
-simulation_settings: # Settings related to the data
-  file_format: h5
+simulation_settings: # Settings related to the data, assumes data is in hdf5 format
+  file_format: csv
   theta_labels: # Input parameters as they appear in the simulation data files
-  - metallicity
-  - envelope_eff_alpha
-  - sigma_bh
-  - sigma_ns
+  - radius
+  - thickness
+  - npanels
+  - theta
+  - length
   theta_labels_plot:
-  - metallicity
-  - $\alpha_{CE}$
-  - $\sigma_{BH}$
-  - $\sigma_{NS}$
+  - radius
+  - thickness
+  - npanels
+  - theta
+  - length
   phi_labels:
-  - Equilibrated_At_Birth
-  - Evolution_Status
-  - Mass@ZAMS(1)
-  - Mass@ZAMS(2)
-  - Merger
-  - SN_Kick_Magnitude_Random_N
-  - SemiMajorAxis@ZAMS
-  - Stellar_Type(1)
-  - Stellar_Type(2)
-  - Stellar_Type@ZAMS(2)
+  - r_0[m]
+  - z_0[m]
+  - time_t[ms]
+  - r_t[m]
+  - z_t[m]
+  - L_t[m]
+  - ln(E0vsET)
+  - edep_t[eV]
+  - nsec
   target_labels:
-  - BBH Events
+  - nC_Ge77
+  weights_labels:
+  - nC_Ge77_scaling
   target_label_plot: $\hat{\epsilon}$
   target_range:
   - 0
@@ -103,14 +97,18 @@ simulation_settings: # Settings related to the data
   signal_condition:
   - == 1
   signal_rate:
-  - 0.0073
+  - 0.0008
   theta_min:
-  - 0.0001
+  theta_min:
+  theta_max:
+  - 0
+  - 0
   - 0
   - 0
   - 0
   theta_max:
-  - 0.031
-  - 10
-  - 1000
-  - 1000
+  - 265
+  - 20
+  - 360
+  - 90
+  - 150

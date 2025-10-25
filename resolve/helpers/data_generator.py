@@ -27,10 +27,7 @@ class DataGeneration:
         
         self.files = self._get_hdf5_files(Path(self.config_file["path_settings"][f"path_to_files_{self.mode}"]))
         self.dataloader = None
-        # ensure HDF5 exists (only once)
 
-        if not any(self.files):
-            utils.convert_all_csv_to_hdf5(config_file)
 
         # base parameter spec
         sim = config_file["simulation_settings"]
@@ -40,20 +37,21 @@ class DataGeneration:
             "theta":  {"key": "theta",  "label_key": "theta_headers", "selected_labels": sim["theta_labels"],  "size": len(sim["theta_labels"]),  "selected_indices": None},
             "target": {"key": "target", "label_key": "target_headers","selected_labels": sim["target_labels"], "size": len(sim["target_labels"]), "selected_indices": None},
         }
-        self.parameters["phi"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["phi"])
-        self.parameters["target"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["target"])
-        self.parameters["theta"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["theta"])
+        if self.files[0].endswith(('.h5', '.hdf5')):
+            self.parameters["phi"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["phi"])
+            self.parameters["target"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["target"])
+            self.parameters["theta"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["theta"])
 
-        positive_cond  = self.config_file["simulation_settings"]["signal_condition"]
+        self.positive_condition  = self.config_file["simulation_settings"]["signal_condition"]
 
-        self.positive_condition_function = np.full(len(positive_cond), None) 
-        for i, cond_str in enumerate(positive_cond):
-                self.positive_condition_function[i] = utils.parse_condition(cond_str) 
+        #self.positive_condition_function = np.full(len(positive_cond), None) 
+        #for i, cond_str in enumerate(positive_cond):
+        #        self.positive_condition_function[i] = utils.parse_condition(cond_str) 
 
         self.dataset = None
     # ------------- helpers -------------
     def _get_hdf5_files(self, path_to_files):
-        return sorted(str(p) for p in path_to_files.glob("*.h5"))
+        return sorted(str(p) for p in path_to_files.glob(f"*.{self.config_file['simulation_settings']['file_format']}"))
 
     
     def set_dataset(self, normalizer=Normalizer()):
@@ -67,7 +65,7 @@ class DataGeneration:
                 as_float32=True,
                 device=None,    # or torch.device("cuda")
                 dataset_config=dataset_config,
-                positive_function=self.positive_condition_function,
+                positive_condition=self.positive_condition,
                 normalizer=normalizer,
                 mode=self.mode
             )
