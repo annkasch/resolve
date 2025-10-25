@@ -3,3 +3,5 @@ from .hc_context_aware_target_attn_latent_neural_process_model import HCTargetAt
 from .conditional_neural_process_model import DeterministicEncoder
 from .conditional_neural_process_model import DeterministicDecoder
 from .conditional_neural_process_model import ConditionalNeuralProcess
+from .autoencoder import Autoencoder
+from .isolation_forest import IsolationForestWrapper

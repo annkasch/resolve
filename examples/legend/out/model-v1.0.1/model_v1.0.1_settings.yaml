@@ -1,0 +1,108 @@
+model_settings:
+  dataloader:
+    dataloader_number_of_workers: 4
+    dataloader_persistent_workers: false
+    dataloader_pin_memory: false
+    dataloader_prefetch_factor: 4
+  network:
+    model_used: ConditionalNeuralProcess
+    models:
+      ConditionalNeuralProcess:
+        d_phi: 9
+        d_theta: 5
+        d_y: 1
+        decoder_sizes:
+        - 32
+        - 64
+        - 64
+        - 48
+        encoder_sizes:
+        - 32
+        - 64
+        - 64
+        - 48
+        representation_size: 32
+      HCTargetAttnLNP:
+        representation_size: 128
+      HCTargetAttnNP:
+        representation_size: 128
+  train:
+    batch_size: 1000
+    dataset:
+      context_is_subset: true
+      context_ratio: 0.33
+      mixup_margin: 0.0
+      mixup_ratio: 0.5
+      positive_ratio_train: 0
+      test_ratio: 0.2
+      train_ratio: 0.6
+      use_beta:
+      - 0.1
+      - 0.1
+      use_feature_normalization: zscore
+      val_ratio: 0.2
+      with_replacement: false
+    learning_rate: 0.001
+    loss:
+      alpha_neg: 1.0
+      alpha_pos: 1.0
+      base_loss_fn: log_prob
+      gamma_neg: 0.0
+      gamma_pos: 0.0
+      lambda_fp: 0.0
+      lambda_tp: 0.0
+      prior_pos: false
+      reduction: mean
+      tau_fp: 0.5
+      tau_tp: 0.5
+    report_frequency: 10
+    training_epochs: 100
+    use_staged_training: false
+path_settings:
+  path_out_model: ./legend/out
+  path_to_files_predict: ./legend/in/data/lf/v1.0/training_regression
+  path_to_files_train: ./legend/in/data/lf/v1.7/tier3
+  version: v1.0.1
+simulation_settings:
+  file_format: csv
+  phi_labels:
+  - r_0[m]
+  - z_0[m]
+  - time_t[ms]
+  - r_t[m]
+  - z_t[m]
+  - L_t[m]
+  - ln(E0vsET)
+  - edep_t[eV]
+  - nsec
+  signal_condition:
+  - == 1
+  signal_rate:
+  - 0.0008
+  target_label_plot: $\hat{\epsilon}$
+  target_labels:
+  - nC_Ge77
+  target_range:
+  - 0
+  - 1
+  theta_labels:
+  - radius
+  - thickness
+  - npanels
+  - theta
+  - length
+  theta_labels_plot:
+  - radius
+  - thickness
+  - npanels
+  - theta
+  - length
+  theta_max:
+  - 265
+  - 20
+  - 360
+  - 90
+  - 150
+  theta_min: null
+  weights_labels:
+  - nC_Ge77_scaling

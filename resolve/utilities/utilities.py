@@ -230,6 +230,24 @@ def plot(prediction_y_training, target_y_training, it=None, target_range=[0,1], 
 
         return fig
 
+def make_json_safe(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    elif torch.is_tensor(obj):
+        return obj.detach().cpu().tolist()
+    elif isinstance(obj, dict):
+        return {k: make_json_safe(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [make_json_safe(v) for v in obj]
+    else:
+        return obj
+
 def INFO(output):
     try:
         print(colored('[INFO] '+output, 'green'))

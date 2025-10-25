@@ -33,11 +33,11 @@ class ThetaEncoder(nn.Module):
 # ---------- context encoder: R^{(c,phi|θ)} ----------
 class ContextConditionalEncoder(nn.Module):
     """
-    Encodes (theta_c, phi_c, y_c) -> R^(c)
+    Encodes (context_theta, context_phi, context_y) -> R^(c)
     Shapes:
-      theta_c: (B, Nc, d_theta)
-      phi_c:   (B, Nc, d_phi)
-      y_c:     (B, Nc, d_y)
+      context_theta: (B, Nc, d_theta)
+      context_phi:   (B, Nc, d_phi)
+      context_y:     (B, Nc, d_y)
       return:  (B, Nc, D)
     """
     def __init__(self,
@@ -80,17 +80,17 @@ class ContextConditionalEncoder(nn.Module):
             )
             self.norm = nn.LayerNorm(out_dim) if use_layernorm else nn.Identity()
 
-    def forward(self, phi_c, y_c, theta_c):
-        B, Nc, _ = phi_c.shape
-        theta_emb = self.theta_enc(theta_c)                       # (B,Nc,Eθ)
+    def forward(self, context_phi, context_y, context_theta):
+        B, Nc, _ = context_phi.shape
+        theta_emb = self.theta_enc(context_theta)                       # (B,Nc,Eθ)
 
         if self.mode == "concat":
-            x = torch.cat([phi_c, y_c, theta_emb], dim=-1)        # (B,Nc,·)
+            x = torch.cat([context_phi, context_y, theta_emb], dim=-1)        # (B,Nc,·)
             out = self.content(x.view(B * Nc, -1)).view(B, Nc, -1)
             return self.norm(out)
 
         # FiLM path
-        h = torch.cat([phi_c, y_c], dim=-1).view(B * Nc, -1)      # (B*Nc, d)
+        h = torch.cat([context_phi, context_y], dim=-1).view(B * Nc, -1)      # (B*Nc, d)
         cond = theta_emb.view(B * Nc, -1)                         # (B*Nc, Eθ)
         for lin, film in zip(self.feature_layers, self.film_layers):
             h = lin(h)
@@ -273,9 +273,9 @@ class TargetQueryEncoder(nn.Module):
         in_dim = theta_feat_dim + phi_dim
         self.mlp = MLP([in_dim] + hidden + [out_dim])
 
-    def forward(self, theta_t, phi_t):
-        theta_f = self.theta_enc(theta_t) if self.theta_enc else theta_t
-        x = torch.cat([theta_f, phi_t], dim=-1)
+    def forward(self, query_theta, query_phi):
+        theta_f = self.theta_enc(query_theta) if self.theta_enc else query_theta
+        x = torch.cat([theta_f, query_phi], dim=-1)
         leading = x.shape[:-1]
         out = self.mlp(x.view(-1, x.shape[-1]))
         return out.view(*leading, -1)            # (B,Nt,D)
@@ -290,12 +290,12 @@ class TargetEncoder(nn.Module):
         in_dim = theta_feat_dim + phi_dim + 2*r_dim
         self.mlp = MLP([in_dim] + hidden + [out_dim])
 
-    def forward(self, theta_t, phi_t, r_pos, r_neg):
-        if r_pos.shape[1] == 1 and phi_t.shape[1] > 1:  # safety
-            r_pos = r_pos.expand(-1, phi_t.shape[1], -1)
+    def forward(self, query_theta, query_phi, r_pos, r_neg):
+        if r_pos.shape[1] == 1 and query_phi.shape[1] > 1:  # safety
+            r_pos = r_pos.expand(-1, query_phi.shape[1], -1)
             r_neg = r_neg.expand_as(r_pos)
-        theta_f = self.theta_enc(theta_t) if self.theta_enc else theta_t
-        x = torch.cat([theta_f, phi_t, r_pos, r_neg], dim=-1)
+        theta_f = self.theta_enc(query_theta) if self.theta_enc else query_theta
+        x = torch.cat([theta_f, query_phi, r_pos, r_neg], dim=-1)
         B, Nt, _ = x.shape
         z = self.mlp(x.view(B*Nt, -1))
         return z.view(B, Nt, -1)
@@ -350,16 +350,16 @@ class HCTargetAttnLNP(nn.Module):
         # Bernoulli decoder
         self.decoder = BernoulliHead(d_model)
 
-    def forward(self, theta_c, phi_c, y_c, theta_t, phi_t, **kwargs):
+    def forward(self, query_theta, query_phi, context_theta, context_phi, context_y, **kwargs):
         """
         Forward pass.
 
         Args:
-            theta_c (Tensor): (B, Nc, d_theta)
-            phi_c   (Tensor): (B, Nc, d_phi)
-            y_c     (Tensor): (B, Nc, d_y)
-            theta_t (Tensor): (B, Nt, d_theta)
-            phi_t   (Tensor): (B, Nt, d_phi)
+            context_theta (Tensor): (B, Nc, d_theta)
+            context_phi   (Tensor): (B, Nc, d_phi)
+            context_y     (Tensor): (B, Nc, d_y)
+            query_theta (Tensor): (B, Nt, d_theta)
+            query_phi   (Tensor): (B, Nt, d_phi)
 
         Keyword Args:
             mask_c (Tensor, optional): (B, Nc) boolean mask for valid context rows.
@@ -370,12 +370,12 @@ class HCTargetAttnLNP(nn.Module):
         beta = kwargs.get("beta", 1.0)
         train_mode = kwargs.get("train_mode", True)
 
-        B, Nc, _ = phi_c.shape
+        B, Nc, _ = context_phi.shape
         if mask_c is None:
-            mask_c = torch.ones(B, Nc, dtype=torch.bool, device=phi_c.device)
+            mask_c = torch.ones(B, Nc, dtype=torch.bool, device=context_phi.device)
 
         # 1) Context encodings
-        R_ctx = self.ctx_enc(phi_c, y_c, theta_c)  # (B,Nc,D)
+        R_ctx = self.ctx_enc(context_phi, context_y, context_theta)  # (B,Nc,D)
 
         # --- Latent q(z|C) from pooled context embedding ---
         r_bar = masked_mean(R_ctx, mask_c, dim=1)  # (B,D)
@@ -390,7 +390,7 @@ class HCTargetAttnLNP(nn.Module):
 
         # Optional θ-conditioned prior p(z|θ̄)
         if self.use_theta_prior:
-            theta_bar = masked_mean(theta_c, mask_c, dim=1)  # (B,d_theta)
+            theta_bar = masked_mean(context_theta, mask_c, dim=1)  # (B,d_theta)
             mu_p, logvar_p = self.prior_p(theta_bar)
         else:
             mu_p = torch.zeros_like(mu_q)
@@ -400,7 +400,7 @@ class HCTargetAttnLNP(nn.Module):
         #print(mu_q.norm().mean(), logvar_q.mean(),kl.mean())
 
         # 2) Build per-target query
-        R_t = self.tquery(theta_t, phi_t)              # (B,Nt,D)
+        R_t = self.tquery(query_theta, query_phi)              # (B,Nt,D)
 
         # 3) Latent -> token and base-rate weight
         token, s_base = self.latent_proj(z)            # (B,D), (B,1)
@@ -412,14 +412,14 @@ class HCTargetAttnLNP(nn.Module):
         mask_ext  = torch.cat([mask_c, torch.ones(B,1, dtype=torch.bool, device=mask_c.device)], dim=1)
 
         # class weights for Dual attention: add latent token’s base-rate as its y
-        wS_ctx = y_c.squeeze(-1).clamp(0,1)           # (B,Nc)
+        wS_ctx = context_y.squeeze(-1).clamp(0,1)           # (B,Nc)
         wS_ext = torch.cat([wS_ctx, s_base.unsqueeze(1)], dim=1)  # (B,Nc+1)
 
         # 5) Attention pooling
         r_pos, r_neg = self.attn(Q_src=R_t, K_src=R_ctx_ext, V_src=R_ctx_ext, wS=wS_ext, mask=mask_ext)
 
         # 6) Target encoder and decoder
-        z_t = self.tgt_enc(theta_t, phi_t, r_pos, r_neg)   # (B,Nt,D)
+        z_t = self.tgt_enc(query_theta, query_phi, r_pos, r_neg)   # (B,Nt,D)
         logit = self.decoder(z_t)                          # (B,Nt,1)
 
         # Return KL for ELBO
