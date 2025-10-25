@@ -17,6 +17,10 @@ def log_prob(z, y, **kward):
     log_prob = -1.*dist.log_prob(y)
     return log_prob.view(-1), z[0].view(-1)
 
+def skip_loss(z, y, **kward):
+    Y = torch.full_like(y, float('nan'))
+    return Y, Y
+
 def recon_loss_mse(x_hat, y, x, **kward):
 
     # 2) Align devices
@@ -103,7 +107,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         # Base per-sample loss (N,)
         base, self.p = self.base_loss_fn(z, targets_y, x=targets_x)
         
-        """
+        
         # Masks (allow slightly fuzzy labels; >=0.5 -> positive)
         targets_y = targets_y.view(-1).float()
         pos_mask = targets_y >= self.tau_tp
@@ -134,8 +138,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
             overshoot = torch.relu(self.p[pos_mask] - self.tau_tp)
             reward = overshoot # ** 2 # 
             loss[pos_mask] = loss[pos_mask] - self.lambda_tp * reward
-        """
-        loss = base
+        
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":

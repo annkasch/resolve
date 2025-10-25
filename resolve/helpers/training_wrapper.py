@@ -96,11 +96,9 @@ def _to_dev(obj, device, *, non_blocking=False):
 def _safe_detach_numpy(x: torch.Tensor) -> np.ndarray:
     return x.detach().cpu().numpy()
 
-
 def _is_binary_range(target_range: Tuple[float, float]) -> bool:
     lo, hi = target_range
     return lo >= 0.0 and hi <= 1.0
-
 
 def _compute_metrics(
     y_true: np.ndarray,
@@ -171,7 +169,6 @@ def _compute_metrics(
             metrics["r2"] = float("nan")
     return metrics
 
-
 class Trainer:
     """Compact, efficient trainer with early stopping and checkpointing.
     Assumptions about your dataset:
@@ -220,13 +217,14 @@ class Trainer:
         return output, targets
 
     def _run_epoch(self, loader, optimizer=None, train: bool = True, desc: str = "train") -> Tuple[float, np.ndarray, np.ndarray]:
-        device = next(self.model.parameters()).device
+        #device = next(self.model.parameters()).device
+        device = next(self.model.parameters(), torch.empty(0, device=getattr(self.model, "_out_device", "cpu"))).device
         self.model.train(train)
         running_loss = 0.0
         y_true_all, y_pred_all = [], []
         accum_steps = math.ceil(loader.dataset.batch_size/loader.dataset.meta["batch_size"])
         
-        if train:
+        if train and self.model._get_name() != 'IsolationForestWrapper':
             optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True)
@@ -241,7 +239,7 @@ class Trainer:
             query_x = torch.cat([query.theta, query.phi], dim=2) 
             loss = self.criterion(logit, targets, query_x) + kl_term + add_loss
 
-            if train:
+            if train and self.model._get_name() != 'IsolationForestWrapper':
                 loss.backward()
                 if (i+1) % accum_steps == 0 :
                     optimizer.step()
@@ -253,7 +251,7 @@ class Trainer:
             
             if self.model._get_name()== 'Autoencoder':
                 y_pred_all.append(self.criterion.p.detach().cpu().numpy())
-            elif self.model._get_name() == 'ConditionalNeuralProcess' or not self.is_binary:
+            elif self.model._get_name() == 'ConditionalNeuralProcess' or self.model._get_name() == 'IsolationForestWrapper' or not self.is_binary:
                 y_pred_all.append(_safe_detach_numpy(logit[0]).reshape(-1))
             else:
                 y_pred_all.append(torch.sigmoid(logit[0]).detach().cpu().numpy().reshape(-1))
@@ -293,6 +291,8 @@ class Trainer:
         for epoch in range(self.epoch_start, self.epoch_start + self.epochs):
             # TRAIN
             dataloader = self.dataset.set_loader("train")
+            if self.model._get_name()== 'IsolationForestWrapper' and self.model._fitted == False:
+                self.model.fit(loader=dataloader)
             
             train_loss, y_true_tr, y_pred_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.epochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
@@ -307,7 +307,7 @@ class Trainer:
                     writer.add_scalar(f"train/{k}", v, epoch+1)
 
                 fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=epoch+1)
-                writer.add_figure(f'plot/train', fig, global_step=epoch+1)
+                writer.add_figure(f'plot/score_train', fig, global_step=epoch+1)
             
             # Early stopping / checkpointing
             score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch+1)
@@ -452,23 +452,25 @@ class Trainer:
         self.metrics[dataset_name] = m_v
 
         # Log
+
         if writer and epoch % self._report == 0.:
+
             for k, v in m_v.items():
                 if k == "roc_curve": continue
                 elif k == "precision_recall_curve": continue
                 writer.add_scalar(f"{dataset_name}/{k}", v, epoch)
             fig = utils.plot(y_pred_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
-            writer.add_figure(f'plot/{dataset_name}', fig, global_step=epoch)
+            writer.add_figure(f'plot/score_{dataset_name}', fig, global_step=epoch)
             fig = plt.figure()
             plt.plot(m_v["precision_recall_curve"][0],m_v["precision_recall_curve"][1])
             plt.xlabel("Signal Efficiency (Recall)")
             plt.ylabel("Precision")
-            writer.add_figure(f'plot/{dataset_name}_prec_recall', fig, global_step=epoch)
+            writer.add_figure(f'plot/prec_recall_{dataset_name}', fig, global_step=epoch)
             fig = plt.figure()
             plt.plot(m_v["roc_curve"][1],1-m_v["roc_curve"][0])
             plt.xlabel("Signal Efficiency")
             plt.ylabel("Background Efficiency")
-            writer.add_figure(f'plot/{dataset_name}_roc', fig, global_step=epoch)
+            writer.add_figure(f'plot/roc_curve_{dataset_name}', fig, global_step=epoch)
             # random baseline = positive class fraction
 
             #plt.axhline(m_v["precision_recall_curve"][2], color='k', linestyle='--', label=f"Random (Precision={m_v['precision_recall_curve'][2]:.2f})")

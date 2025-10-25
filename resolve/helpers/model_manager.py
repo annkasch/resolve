@@ -9,8 +9,8 @@ class ModelsManager():
         self._factories = {
             "HCTargetAttnNP": lambda cfg: HCTargetAttnNP(cfg["d_theta"], cfg["d_phi"], cfg["d_y"], cfg.get("representation_size", 32)),
             "HCTargetAttnLNP": lambda cfg: HCTargetAttnLNP(cfg["d_theta"], cfg["d_phi"], cfg["d_y"], cfg.get("representation_size", 32)),
-            "Autoencoder": lambda cfg: Autoencoder(cfg["d_theta"] + cfg["d_phi"], cfg.get("representation_size", 32), cfg.get("encoder_sizes", [128, 64])),
-            "IsolationForest": lambda cfg: IsolationForestWrapper(cfg.get("n_estimators",200),cfg.get("contamination", 0.05), cfg.get("invert_scores", True)),
+            "Autoencoder": lambda cfg: Autoencoder(cfg["d_theta"] + cfg["d_phi"], cfg.get("representation_size", 32), cfg.get("encoder_sizes", [128, 64])),  
+            "IsolationForest": lambda cfg: IsolationForestWrapper(cfg.get("n_estimators",100),cfg.get("max_samples",512),cfg.get("contamination","auto"),cfg.get("max_features",1.0),cfg.get("bootstrap",False),cfg.get("n_jobs",None),cfg.get("random_state",None),cfg.get("warm_star",False), cfg.get("invert_scores",True)),
             "ConditionalNeuralProcess": lambda cfg: ConditionalNeuralProcess(cfg["d_theta"] + cfg["d_phi"]+cfg["d_y"], cfg.get("representation_size", 32), cfg.get("encoder_sizes", [128, 64]), cfg.get("decoder_sizes", [64, 128]), cfg["d_y"])
         }
 

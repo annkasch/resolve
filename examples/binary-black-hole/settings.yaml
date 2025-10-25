@@ -1,5 +1,5 @@
 path_settings:
-  version: v1.0.3
+  version: v1.0.4
   path_to_files_train: ./binary-black-hole/in/data/lf/v1.0/training_cnp
   path_to_files_predict: ./binary-black-hole/in/data/lf/v1.0/training_regression
   path_out_model: ./binary-black-hole/out
@@ -15,8 +15,14 @@ model_settings:
         representation_size: 8
         encoder_sizes: [64, 32, 16]
       IsolationForest:
-        n_estimators: 200
-        contamination: 0.05
+        n_estimators: 1000
+        max_samples: 2048
+        contamination: auto
+        max_features: 0.7
+        bootstrap: False
+        n_jobs: -1
+        random_state: 42
+        warm_start: False
         invert_scores: True
       HCTargetAttnNP:
         representation_size: 128
@@ -37,7 +43,7 @@ model_settings:
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
       context_is_subset: true # if true, context points are a subset of target points; if false, context and target points are drawn independently
-      context_ratio: 1. # ratio of context points to total points if context_is_subset is true
+      context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
       use_schedule: false
       skip_warmup: false
@@ -45,11 +51,11 @@ model_settings:
       max_positive_reuse: 3
       num_epochs_per_positive_ratio: 2 
     batch_size: 1000
-    training_epochs: 20
+    training_epochs: 200
     learning_rate: 0.001
     report_frequency: 10
     loss:
-      base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error)
+      base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest)
       prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
       alpha_pos:  1.0     # Weight for the positive (signal) class. 
