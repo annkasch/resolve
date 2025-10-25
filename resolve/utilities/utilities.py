@@ -206,7 +206,7 @@ def plot(prediction_y_training, target_y_training, it=None, target_range=[0,1], 
             ax[k].set_yscale('log')
             ax[k].set_ylim(1e-1,1e6)
             ax[k].set_ylabel("Count")
-            ax[k].set_xlabel(r'$y_{CNP}$')
+            ax[k].set_xlabel("score")
             ax[k].set_title(sub_title, fontsize=10)
 
             fig.subplots_adjust(bottom=0.3, wspace=0.33)
