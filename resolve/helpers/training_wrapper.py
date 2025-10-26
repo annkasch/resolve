@@ -249,7 +249,7 @@ class Trainer:
             y_true_all.append(_safe_detach_numpy(targets).reshape(-1))
             # For binary, store probabilities for metrics; for regression, raw outputs
             
-            if self.model._get_name()== 'Autoencoder':
+            if self.model._get_name()== 'Autoencoder' or self.model._get_name()== 'VariationalAutoencoder':
                 y_pred_all.append(self.criterion.p.detach().cpu().numpy())
             elif self.model._get_name() == 'ConditionalNeuralProcess' or self.model._get_name() == 'IsolationForestWrapper' or not self.is_binary:
                 y_pred_all.append(_safe_detach_numpy(logit[0]).reshape(-1))
@@ -521,8 +521,7 @@ class Trainer:
                     with torch.inference_mode():
                         output, targets = self._forward_batch(batch, device)
                     logit = output.get("logits", None)
-                    query_x = torch.cat([query_theta, query_phi], dim=2) 
-
+                    query_x = torch.cat([query_theta, query_phi], dim=1) 
                     # Update loss
                     collectors["loss"] += (self.criterion(logit, targets, query_x) + 
                                          output.get("kl_term", 0.0) + 
@@ -596,15 +595,17 @@ class Trainer:
                                 # Save metrics
                                 # Save metrics
                                 m_v = _compute_metrics(collectors["y_true"], collectors["y_pred"], self.is_binary)
+                                
                                 m_v["loss"] = float(collectors["loss"])
 
                                 # Correct: update attributes directly from the dictionary
-                                grp.attrs.update(m_v)
+                                grp.attrs.update({k: v for k, v in m_v.items() if not isinstance(v, (np.ndarray, torch.Tensor, list, tuple, dict))})
 
                         # Log
                         if writer and file_idx % self._report == 0.:
-                            for k, v in m_v.items():
-                                writer.add_scalar(f"{dataset_name}/{k}", v, file_idx)
+                            #for k, v in m_v.items():
+                            #    writer.add_scalar(f"{dataset_name}/{k}", v, file_idx)
+                            for k, v in m_v.items(): writer.add_scalar(f"{dataset_name}/{k}", v, file_idx) if np.isscalar(v) else None
                             fig = utils.plot(collectors["y_pred"], collectors["y_true"], it=file_idx)
                             writer.add_figure(f'plot/{dataset_name}', fig, global_step=file_idx)
 
@@ -612,7 +613,10 @@ class Trainer:
                         if metrics_col.shape[1] != len(m_v):
                             metrics_col =  np.empty((0, len(m_v)))
 
-                        metrics_col = np.vstack([metrics_col, np.array(list(m_v.values())).reshape(1, -1)])
+                        #metrics_col = np.vstack([metrics_col, np.array(list(m_v.values())).reshape(1, -1)])
+                        scalar_keys = globals().get("scalar_keys") or [k for k,v in m_v.items() if np.isscalar(v)]
+                        metrics_col = np.vstack([metrics_col if metrics_col.size and metrics_col.shape[1]==len(scalar_keys) else np.empty((0,len(scalar_keys))), np.array([m_v.get(k, np.nan) if np.isscalar(m_v.get(k, np.nan)) else np.nan for k in scalar_keys], float)[None,:]])
+                        #metrics_col = np.vstack([metrics_col, np.array([v for v in m_v.values() if np.isscalar(v)], dtype=float)[None, :]])
                         # Reset collectors for next file
                         collectors = {
                                 "y_pred": np.zeros((0, sizes["target"])),
@@ -625,13 +629,19 @@ class Trainer:
 
                         pbar.update(1)
 
-            for i, (name, _) in enumerate(m_v.items()):
-                if dataset_name not in self.metrics:
-                    self.metrics[dataset_name] = {}
-                # Store both the average and full values
-                self.metrics[dataset_name][f'{name}_avg'] = np.nanmean(metrics_col[:, i])
-                self.metrics[dataset_name][name] = metrics_col[:, i].tolist()
-            
+            # Filter scalar metric names (consistent with metrics_col columns)
+            scalar_keys = globals().get("scalar_keys") or [
+                k for k, v in m_v.items() if np.isscalar(v)
+            ]
+            # Ensure metrics dict exists for this dataset
+            self.metrics.setdefault(dataset_name, {})
+
+            # Iterate only over scalar keys
+            for i, name in enumerate(scalar_keys):
+                vals = metrics_col[:, i]
+                self.metrics[dataset_name][f"{name}_avg"] = np.nanmean(vals)
+                self.metrics[dataset_name][name] = vals.tolist()
+
             return {"monitor_avg": np.nanmean(self.metrics[dataset_name].get(monitor, float("nan")))}
 
     

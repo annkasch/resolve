@@ -1,17 +1,20 @@
 path_settings:
-  version: v1.0.4
+  version: v1.0.0
   path_to_files_train: ./binary-black-hole/in/data/lf/v1.0/training_cnp
   path_to_files_predict: ./binary-black-hole/in/data/lf/v1.0/training_regression
   path_out_model: ./binary-black-hole/out
 model_settings:
   network:
-    model_used: ConditionalNeuralProcess # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
+    model_used: HCTargetAttnNP  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
     models: 
       ConditionalNeuralProcess:
         representation_size: 32
         encoder_sizes: [32, 64,48]
         decoder_sizes: [48, 64, 48, 32]
       Autoencoder:
+        representation_size: 8
+        encoder_sizes: [64, 32, 16]
+      VariationalAutoencoder:
         representation_size: 8
         encoder_sizes: [64, 32, 16]
       IsolationForest:
@@ -39,34 +42,34 @@ model_settings:
       train_ratio: 0.6
       val_ratio: 0.2
       test_ratio: 0.2
-      mixup_ratio: 1.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
+      mixup_ratio: 0.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
       context_is_subset: true # if true, context points are a subset of target points; if false, context and target points are drawn independently
       context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
-      use_schedule: false
+      use_schedule: true
       skip_warmup: false
-      positive_ratio_train: null # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
+      positive_ratio_train: [0.2,0.1,0.05] # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
       max_positive_reuse: 3
       num_epochs_per_positive_ratio: 2 
     batch_size: 1000
     training_epochs: 200
     learning_rate: 0.001
-    report_frequency: 10
+    report_frequency: 100
     loss:
-      base_loss_fn: log_prob    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest)
+      base_loss_fn: bce_with_logits    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest)
       prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
-      alpha_pos:  1.0     # Weight for the positive (signal) class. 
+      alpha_pos:  136.0     # Weight for the positive (signal) class. 
                           # Lower (<1) downweights positives, higher (>1) emphasizes them. 
                           # Common range: 0.1–0.5. Set to 1 for no reweighting.
       alpha_neg:  1.0     # Optional explicit weight for the negative (background) class. 
                           # If None, uses (1 - alpha_pos). Set to 1 for no reweighting.
-      gamma_pos:  0.0     # Focusing parameter (Focal Loss) for positives. 
+      gamma_pos:  2.0     # Focusing parameter (Focal Loss) for positives. 
                           # Increases focus on hard-to-classify positives. Typical values: 1–2. 
                           # Set to 0 to disable focusing.
-      gamma_neg:  0.0     # Focusing parameter (Focal Loss) for negatives. 
+      gamma_neg:  2.0     # Focusing parameter (Focal Loss) for negatives. 
                           # Higher values (>2) penalize hard negatives more strongly. 
                           # Set to 0 to disable focusing.
       lambda_fp:  0.     # Penalty weight for false positives. 
