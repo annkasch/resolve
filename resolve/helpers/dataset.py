@@ -73,7 +73,7 @@ class InMemoryIterableData(IterableDataset):
             theta_val, theta_test, phi_val, phi_test, y_val, y_test, fidx_val, fidx_test = train_test_split(theta_test, phi_test, y_test, fidx_test, test_size=test_size, random_state=42)
             
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
-                print("applying mixup")
+
                 theta_train, phi_train, y_train, fidx_train = self._mix_by_file_chunks(
                         theta_train, phi_train, y_train, fidx_train,
                         positive_fn=self.positive_fn,
@@ -86,6 +86,14 @@ class InMemoryIterableData(IterableDataset):
                 "train": {"theta": theta_train, "phi": phi_train, "y": y_train, "file_indices": fidx_train, "batches": None},
                 "test": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": None},
                 "validate": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": None}
+            }
+        elif self.mode == "test":
+            theta = self._normalizer.transform(x=theta, feature_grp="theta")
+            phi = self._normalizer.transform(x=phi, feature_grp="phi")
+            if self.as_float32:
+                theta = theta.float(); phi = phi.float()
+            data = {
+                "test": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": None},
             }
         elif self.mode == "predict":
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
@@ -182,7 +190,6 @@ class InMemoryIterableData(IterableDataset):
         reuse = max(1, max_pos_reuse_per_epoch)
         Pmax = nP * reuse
         Pneed = int(round((nN / 1.-target_pos_frac) * target_pos_frac))
-        print(Pmax, Pneed)
 
         Ptot = min(Pneed, Pmax)
         if Ptot == 0:

@@ -27,6 +27,8 @@ import matplotlib.pyplot as plt
 import dataclasses
 from ..utilities import utilities as utils
 from collections.abc import Mapping, Sequence
+from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss
+
 import time, torch
 
 try:
@@ -224,7 +226,7 @@ class Trainer:
         y_true_all, y_pred_all = [], []
         accum_steps = math.ceil(loader.dataset.batch_size/loader.dataset.meta["batch_size"])
         
-        if train and self.model._get_name() != 'IsolationForestWrapper':
+        if train and self.criterion.base_loss_fn is not skip_loss:
             optimizer.zero_grad(set_to_none=True)
 
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True)
@@ -235,11 +237,14 @@ class Trainer:
             logit = output.get("logits", None)
             kl_term = output.get("kl_term", 0.0)
             add_loss = output.get("loss", 0.0)
-            _, query, _ = batch
-            query_x = torch.cat([query.theta, query.phi], dim=2) 
-            loss = self.criterion(logit, targets, query_x) + kl_term + add_loss
+            
 
-            if train and self.model._get_name() != 'IsolationForestWrapper':
+            _, query, _ = batch
+            query_x = torch.cat([query.theta, query.phi], dim=2)
+
+            loss = self.criterion(logit, targets, targets_x = query_x) + kl_term + add_loss
+
+            if train and self.criterion.base_loss_fn is not skip_loss:
                 loss.backward()
                 if (i+1) % accum_steps == 0 :
                     optimizer.step()
@@ -247,14 +252,13 @@ class Trainer:
 
             running_loss += float(loss.detach().cpu())
             y_true_all.append(_safe_detach_numpy(targets).reshape(-1))
-            # For binary, store probabilities for metrics; for regression, raw outputs
             
-            if self.model._get_name()== 'Autoencoder' or self.model._get_name()== 'VariationalAutoencoder':
+            if self.criterion.base_loss_fn is recon_loss_mse: 
                 y_pred_all.append(self.criterion.p.detach().cpu().numpy())
-            elif self.model._get_name() == 'ConditionalNeuralProcess' or self.model._get_name() == 'IsolationForestWrapper' or not self.is_binary:
-                y_pred_all.append(_safe_detach_numpy(logit[0]).reshape(-1))
-            else:
+            elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
                 y_pred_all.append(torch.sigmoid(logit[0]).detach().cpu().numpy().reshape(-1))
+            else:
+                y_pred_all.append(_safe_detach_numpy(logit[0]).reshape(-1))
             
             
             pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
@@ -301,10 +305,7 @@ class Trainer:
 
             # Log
             if writer and epoch % self._report == 0:
-                for k, v in m_tr.items():
-                    if k == "roc_curve": continue
-                    elif k == "precision_recall_curve": continue
-                    writer.add_scalar(f"train/{k}", v, epoch+1)
+                for k, v in m_tr.items(): writer.add_scalar(f"train/{k}", v, epoch+1) if np.isscalar(v) else None
 
                 fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=epoch+1)
                 writer.add_figure(f'plot/score_train', fig, global_step=epoch+1)
@@ -393,11 +394,10 @@ class Trainer:
                 self.metrics["train"] = m_tr
 
                 if writer and (global_epoch % self._report == 0):
-                    for k, v in m_tr.items():
-                        writer.add_scalar(f"train/{k}", v, global_epoch)
-                    
+                    for k, v in m_tr.items(): writer.add_scalar(f"train/{k}", v, global_epoch) if np.isscalar(v) else None
+
                     fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=global_epoch)
-                    writer.add_figure("plot/train", fig, global_step=global_epoch)
+                    writer.add_figure("plot/score_train", fig, global_step=global_epoch)
 
                 val_metrics = self.evaluate(writer=writer, dataset_name="validate", epoch=global_epoch)
                 if isinstance(val_metrics, dict):
@@ -452,13 +452,10 @@ class Trainer:
         self.metrics[dataset_name] = m_v
 
         # Log
-
         if writer and epoch % self._report == 0.:
 
-            for k, v in m_v.items():
-                if k == "roc_curve": continue
-                elif k == "precision_recall_curve": continue
-                writer.add_scalar(f"{dataset_name}/{k}", v, epoch)
+            for k, v in m_v.items(): writer.add_scalar(f"{dataset_name}/{k}", v, epoch) if np.isscalar(v) else None
+                            
             fig = utils.plot(y_pred_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
             writer.add_figure(f'plot/score_{dataset_name}', fig, global_step=epoch)
             fig = plt.figure()

@@ -10,13 +10,12 @@ class DeterministicEncoder(nn.Module):
         enc_layers = []
         prev = input_dim
         for h in hidden_dims:
-            print("encoder", prev, h)
             enc_layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
             if dropout_p > 0:
                 enc_layers.append(nn.Dropout(dropout_p))
             prev = h
         enc_layers += [nn.Linear(prev, latent_dim)]
-        print("encoder", prev, latent_dim)
+
         self.encoder = nn.Sequential(*enc_layers)
 
     def forward(self, context_x, context_y):
@@ -90,11 +89,10 @@ class DeterministicDecoder(nn.Module):
         dec_layers = []
         prev = latent_dim
         for h in hidden_dims:
-            print("decoder",prev, h)
             dec_layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
             prev = h
         dec_layers += [nn.Linear(prev, output_dim*2)]  # linear head for regression-like recon
-        print("decoder",prev,output_dim*2)
+
         self.decoder = nn.Sequential(*dec_layers)
 
     def forward(self, representation, target_x, is_binary):
