@@ -1,12 +1,17 @@
 import os
 import math
+from turtle import mode, update
 import h5py
+import pandas as pd
+import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
-from typing import List, Optional, Sequence, Tuple, Dict
+from typing import List, Optional, Sequence, Tuple, Dict, Union
 from sklearn.model_selection import train_test_split
 import collections
 from resolve.helpers.normalizer import Normalizer
+import operator
+import functools
 
 ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
 QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi"))
@@ -16,12 +21,14 @@ BatchCollection = collections.namedtuple(
     ("context", "query", "target_y")
 )
 
+
+
 class InMemoryIterableData(IterableDataset):
     """Load all HDF5 rows into memory, reshuffle each epoch, shard across workers.
     Optional: build a balanced USED/UNUSED split once from (X,y)."""
     def __init__(self, files: Sequence[str], batch_size: int = 1000, shuffle: bool = True,
                  seed: int = 42, as_float32: bool = True, device: Optional[torch.device] = None,
-                 parameter_config: Dict = None, dataset_config: Dict = None, positive_function: Optional[List]=None,
+                 parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
                  normalizer: Optional[Normalizer]=Normalizer(), mode: Optional[str] = "train") -> None:
         super().__init__()
         
@@ -31,18 +38,28 @@ class InMemoryIterableData(IterableDataset):
         
         self.mode = mode
         self._normalizer = normalizer
+        self.positive_fn = np.full(len(positive_condition), None) 
+        for i, cond_str in enumerate(positive_condition):
+                self.positive_fn[i] = self.parse_condition(cond_str) 
 
         # load all data into memory
-        theta, phi, y, fidx = self._load_all(self.files, self.as_float32, self.parameter_config, positive_function)
+        theta, phi, y, fidx = self._load_all(self.files, self.as_float32, self.parameter_config)
         # get positive indices
-        pos_mask = self._get_positive_indices(y,positive_function)
-        self.positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
-        print("positives ratio ", self.positive_ratio_data)
+        pos_mask = self._get_positive_indices(y, self.positive_fn)
+        positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
+        print("positives ratio ", positive_ratio_data)
         
-        self.data = self._set_data(theta, phi, y, fidx, pos_mask, positive_function)
+        self.data = self._set_data(theta, phi, y, fidx)
+
+        self.state = {"last_neg_subset": None}
+        self.meta = {"batch_size": self.batch_size, "num_batches": max(1, math.ceil(self.data[mode]["phi"].shape[0] / self.batch_size)),
+                "pos_frac": positive_ratio_data}
+        if self.dataset_config.get('use_schedule') == False and self.dataset_config.get('positive_ratio_train', None) != None and self.dataset_config.get('mixup_ratio', 0.) == 0.0:
+            self.update_batch_schedule(target_pos_frac=self.dataset_config.get("positive_ratio_train", None), max_pos_reuse_per_epoch = self.dataset_config.get("max_positive_reuse",0.), sticky_frac = 0.25, seed=self.dataset_config.get("seed",12345))
 
     
-    def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor, pos_mask, positive_function: Optional[List]=None):
+
+    def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
         data = {}
         if self.mode == "train":
             # apply normalization
@@ -51,35 +68,32 @@ class InMemoryIterableData(IterableDataset):
 
             # split into training, validation and testing data
             test_size = 1 - self.dataset_config.get('train_ratio',0.6)
-            theta_train, theta_test, phi_train, phi_test, y_train, y_test, fidx_train, fidx_test, pos_mask_train, _ = train_test_split(theta, phi, y, fidx, pos_mask, test_size=test_size, random_state=42)
+            theta_train, theta_test, phi_train, phi_test, y_train, y_test, fidx_train, fidx_test = train_test_split(theta, phi, y, fidx, test_size=test_size, random_state=42)
             test_size = self.dataset_config.get('val_ratio',0.2)/test_size
             theta_val, theta_test, phi_val, phi_test, y_val, y_test, fidx_val, fidx_test = train_test_split(theta_test, phi_test, y_test, fidx_test, test_size=test_size, random_state=42)
-
+            
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
+
                 theta_train, phi_train, y_train, fidx_train = self._mix_by_file_chunks(
                         theta_train, phi_train, y_train, fidx_train,
-                        positive_fn=positive_function,
+                        positive_fn=self.positive_fn,
                         use_beta=self.dataset_config.get('use_beta', None),
                         margin=float(self.dataset_config.get('mixup_margin', 0.0)),
                         seed=int(self.dataset_config.get('seed', 12345))
                     )
-            
-            # apply positives oversampling if required
-            if  self.dataset_config.get('positive_ratio_train', None) and self.dataset_config.get('mixup_ratio', 0.)==0.:
-                theta_train, phi_train, y_train, self._theta_unused, self._phi_unused, self._y_unused, fidx_train, self._fidx_unused = self._sample_balanced_dataset(
-                    theta_train, phi_train, y_train, fidx_train, pos_mask=pos_mask_train,
-                    ratio=float(self.dataset_config.get('positive_ratio_train', None)),
-                    used_size=self.dataset_config.get('used_size'),
-                    replace=bool(self.dataset_config.get('with_replacement', False)),
-                    seed=int(self.dataset_config.get('seed', 12345)),
-                )
-            else:
-                theta_train, phi_train, y_train, fidx_train, self._theta_unused, self._phi_unused, self._y_unused, self._fidx_unused = theta_train, phi_train, y_train, fidx_train, None, None, None, None
-            
+                
             data = {
-                "train": {"theta": theta_train, "phi": phi_train, "y": y_train, "file_indices": fidx_train},
-                "validate": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test},
-                "test": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val}
+                "train": {"theta": theta_train, "phi": phi_train, "y": y_train, "file_indices": fidx_train, "batches": None},
+                "test": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": None},
+                "validate": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": None}
+            }
+        elif self.mode == "test":
+            theta = self._normalizer.transform(x=theta, feature_grp="theta")
+            phi = self._normalizer.transform(x=phi, feature_grp="phi")
+            if self.as_float32:
+                theta = theta.float(); phi = phi.float()
+            data = {
+                "test": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": None},
             }
         elif self.mode == "predict":
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
@@ -87,41 +101,260 @@ class InMemoryIterableData(IterableDataset):
             if self.as_float32:
                 theta = theta.float(); phi = phi.float()
             data = {
-                "predict": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx},
+                "predict": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": None},
             }
 
         return data
+    
+
+    
+    def update_batch_schedule(self,
+        target_pos_frac: float,
+        max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
+        sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
+        seed: int | None = None,          # reproducible positive order
+    ):
+
+        # train sets the batch size and needs to be processed first
+        if target_pos_frac != None:
+
+            y = self.data["train"]["y"]
+            pos_mask = self._get_positive_indices(y, self.positive_fn)
+            pos_idx, neg_idx = pos_mask.nonzero(as_tuple=False).view(-1), (~pos_mask).nonzero(as_tuple=False).view(-1)
+
+            self.data["train"]["batches"], self.state, self.meta = self._plan_batches(
+                n_total=y.shape[0],
+                batch_size=self.batch_size,
+                pos_idx=pos_idx,
+                neg_idx=neg_idx,
+                target_pos_frac=target_pos_frac,
+                max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
+                sticky_frac=sticky_frac,
+                last_neg_subset=self.state["last_neg_subset"],
+                seed=seed
+            )
+            print(self.meta)
+        else:
+            self.data["train"]["batches"] = None
+            self.state = {"last_neg_subset": None}
+            self.meta = {"batch_size": self.batch_size, "num_batches": max(1, math.ceil(self.data[self.mode]["phi"].shape[0] / self.batch_size)),
+                "pos_frac": 0., "num_epochs": 1}
+
+    def epochs_until_full_coverage(self, n_neg_total: int,
+                                n_neg_per_epoch: int,
+                                sticky_frac: float = 0.25) -> int:
+        """
+        Estimate the number of epochs required until all negatives have been seen once.
+
+        Args:
+            n_neg_total: Total number of available negative samples in the dataset.
+            n_neg_per_epoch: Number of negative samples used per epoch (sum over all batches).
+            sticky_frac: Fraction of negatives carried over (reused) between epochs, e.g. 0.25.
+
+        Returns:
+            int: Estimated number of epochs until all negatives have been seen at least once.
+        """
+        if n_neg_per_epoch <= 0:
+            raise ValueError("n_neg_per_epoch must be > 0")
+        if not (0.0 <= sticky_frac < 1.0):
+            raise ValueError("sticky_frac must be in [0, 1)")
+
+        if n_neg_total <= n_neg_per_epoch:
+            # You already use all negatives in one epoch
+            return 1
+
+        # Derived from coverage formula:
+        # E >= 1 + (N_total / N_per_epoch - 1) / (1 - sticky)
+        epochs = 1 + (n_neg_total / n_neg_per_epoch - 1) / (1.0 - sticky_frac)
+        return math.ceil(epochs)
+
+    def _plan_batches(self,
+        n_total: int,
+        batch_size: int,
+        pos_idx: torch.Tensor,
+        neg_idx: torch.Tensor,
+        target_pos_frac: float,
+        max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
+        sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
+        last_neg_subset: torch.Tensor | None = None,
+        seed: int | None = None,          # reproducible positive order
+    ):
+        assert batch_size >= 2
+        nP, nN = pos_idx.numel(), neg_idx.numel()
+        if nP == 0 or nN == 0:
+            raise ValueError("Both classes required.")
+        # batches to roughly cover n_total rows
+        M = max(1, math.ceil(n_total / batch_size))
+
+        # epoch positive budget
+        reuse = max(1, max_pos_reuse_per_epoch)
+        Pmax = nP * reuse
+        Pneed = int(round((nN / 1.-target_pos_frac) * target_pos_frac))
+
+        Ptot = min(Pneed, Pmax)
+        if Ptot == 0:
+            Nneed = nN
+        else:   
+            Nneed = int(round((Ptot / target_pos_frac) * (1.-target_pos_frac)))
+        n_total = Ptot + Nneed
+        M = max(1, math.ceil(n_total / batch_size))
+
+        # per-batch positive counts (balanced rounding, at least 0, at most B-1)
+        avgk = Ptot / M
+        kfloor = int(math.floor(avgk))
+        rem = Ptot - kfloor * M
+        k_list = [min(batch_size-1, max(0, kfloor + (1 if b < rem else 0))) for b in range(M)]
+
+        # positives: build pool with reuse cap, then shuffle with seed
+        pos_pool = (pos_idx.repeat_interleave(reuse) if max_pos_reuse_per_epoch > 0 else pos_idx)
+        pos_pool = pos_pool[:Ptot]
+        if seed is not None and pos_pool.numel() > 1:
+            g = torch.Generator().manual_seed(seed)
+            perm = torch.randperm(pos_pool.numel(), generator=g)
+            pos_pool = pos_pool[perm]
+
+        # chunk positives
+        pos_chunks, pptr = [], 0
+        for k in k_list:
+            pos_chunks.append(pos_pool[pptr:pptr+k]); pptr += k
+
+        # negatives: sticky + seeded shuffle (no replacement in plan)
+        Nneed = sum(batch_size - k for k in k_list)
+        sticky = (last_neg_subset[: int(sticky_frac * Nneed)]
+                if (last_neg_subset is not None and Nneed > 0) else torch.empty(0, dtype=torch.long))
+
+        # choose remaining negatives by seeded shuffle excluding sticky
+        if Nneed > sticky.numel():
+            take_new = Nneed - sticky.numel()
+
+            # ensure same device/dtype
+            sticky = sticky.to(neg_idx.device).long()
+
+            if sticky.numel() == 0:
+                base = neg_idx
+            else:
+                # Exclude sticky *by value*, not by position
+                mask = ~torch.isin(neg_idx, sticky)
+                base = neg_idx[mask]
+
+            if seed is not None and base.numel() > 1:
+                g = torch.Generator().manual_seed(seed+1)
+                perm = torch.randperm(base.numel(), generator=g)
+                base = base[perm]
+
+            new_block = base[:take_new]
+            neg_plan = torch.cat((sticky, new_block))
+        else:
+            neg_plan = sticky
+
+        # chunk negatives
+        neg_chunks, nptr = [], 0
+        for k in k_list:
+            need = batch_size - k
+            neg_chunks.append(neg_plan[nptr:nptr+need]); nptr += need
+
+        # assemble batches
+        g = torch.Generator()
+        if seed is not None:
+            g.manual_seed(seed+2)
+
+        batches = []
+        for b in range(M):
+            batch = torch.cat((pos_chunks[b], neg_chunks[b]))
+            perm = torch.randperm(batch.numel(), generator=g)
+            batches.append(batch[perm])
+
+        nepochs = self.epochs_until_full_coverage(nN, Nneed, sticky_frac)
+
+        state = {"last_neg_subset": neg_plan}
+        meta  = {"batch_size": batch_size, "num_batches": M,
+                "pos_frac": (Ptot / max(1, (batch_size * M))), "num_epochs": nepochs}
+        return batches, state, meta
+    
+    def _compare(self, x, op, value):
+            """Top-level helper that is picklable."""
+            return op(x, value)
+
+    def parse_condition(self,condition_str):
+        ops = {
+                    '==': operator.eq,
+                    '!=': operator.ne,
+                    '>=': operator.ge,
+                    '<=': operator.le,
+                    '>': operator.gt,
+                    '<': operator.lt
+                }
+
+        for op in ops:
+            if op in condition_str:
+                value_str = condition_str.split(op)[1].strip()
+                break
+        value = float(value_str) if '.' in value_str else int(value_str)
         
+        
+        
+        return functools.partial(self._compare, op=ops[op], value=value)
 
-    @staticmethod
+    @staticmethod    
+    
     def _read_one(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        with h5py.File(file_path, 'r') as hdf:
-            phi = hdf[parameter_config['phi']['key']][:,parameter_config['phi']['selected_indices']]
-            
-            theta = hdf[parameter_config['theta']['key']]
-            
-            if len(parameter_config['theta']['selected_indices']) != 0:
-                if theta.ndim == 1:
-                    theta_vec = theta[parameter_config['theta']['selected_indices']]             # (T,)
-                    # broadcast, then copy once during final assembly
-                    theta = torch.from_numpy(theta_vec).unsqueeze(0).expand(phi.shape[0], -1)
+        if file_path.endswith(('.h5', '.hdf5')):
+            with h5py.File(file_path, 'r') as hdf:
+                phi = hdf[parameter_config['phi']['key']][:,parameter_config['phi']['selected_indices']]
+                
+                theta = hdf[parameter_config['theta']['key']]
+                
+                if len(parameter_config['theta']['selected_indices']) != 0:
+                    if theta.ndim == 1:
+                        theta_vec = theta[parameter_config['theta']['selected_indices']]             # (T,)
+                        # broadcast, then copy once during final assembly
+                        theta = torch.from_numpy(theta_vec).unsqueeze(0).expand(phi.shape[0], -1)
+                    else:
+                        theta = theta[:, parameter_config['theta']['selected_indices']]
                 else:
-                    theta = theta[:, parameter_config['theta']['selected_indices']]
-            else:
-                theta = torch.from_numpy(theta)
+                    theta = torch.from_numpy(theta)
 
-            tgt_ds = hdf[parameter_config['target']['key']]
-            if tgt_ds.ndim > 1 and parameter_config['target']['selected_indices'] != None:
-                y = tgt_ds[:, parameter_config['target']['selected_indices']]
-            else:
-                y = tgt_ds[:].reshape(-1, 1)
+                tgt_ds = hdf[parameter_config['target']['key']]
+                if tgt_ds.ndim > 1 and parameter_config['target']['selected_indices'] != None:
+                    y = tgt_ds[:, parameter_config['target']['selected_indices']]
+                else:
+                    y = tgt_ds[:].reshape(-1, 1)
 
-        phi = torch.from_numpy(phi)
-        y = torch.from_numpy(y)
+            phi = torch.from_numpy(phi)
+            y = torch.from_numpy(y)
+
+        elif file_path.endswith('.csv'):
+            # --- CSV reading using column names (selected_labels) ---
+            df = pd.read_csv(file_path)
+
+            def select_labels(df: pd.DataFrame, labels: Union[str, List[str]]) -> pd.DataFrame:
+                """Select one or multiple columns by name."""
+                if isinstance(labels, str):
+                    return df[[labels]]
+                elif isinstance(labels, list):
+                    return df[labels]
+                else:
+                    raise ValueError(f"Invalid label type: {type(labels)}")
+
+            # Extract φ, θ, and y by column labels
+            phi = select_labels(df, parameter_config['phi']['selected_labels'])
+            theta = select_labels(df, parameter_config['theta']['selected_labels'])
+            y = select_labels(df, parameter_config['target']['selected_labels'])
+
+            # Convert to torch tensors
+            phi = torch.tensor(phi.values, dtype=torch.float32)
+            theta = torch.tensor(theta.values, dtype=torch.float32)
+            y = torch.tensor(y.values, dtype=torch.float32)
+
+            # Ensure y has shape (N, 1)
+            if y.ndim == 1:
+                y = y.unsqueeze(1)
+        else:
+            raise ValueError(f"Unsupported file format: {file_path}")
 
         return theta, phi, y
 
-    def _load_all(self, files: Sequence[str], as_f32: bool, cfg: Dict, positive_function: Optional[List]=None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _load_all(self, files: Sequence[str], as_f32: bool, cfg: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         Thetas, Phis, ys, file_inds = [], [], [], []
         for i, fp in enumerate(files):
             if not os.path.exists(fp): raise FileNotFoundError(fp)
@@ -347,7 +580,11 @@ class InMemoryIterableData(IterableDataset):
         
         return thetam, phim, ym
 
-    def __len__(self) -> int: return self.data[self.mode]["phi"].shape[0]
+    def __len__(self) -> int: 
+        if self.data[self.mode]["batches"]!=None:
+            return len(self.data[self.mode]["batches"])
+        else:
+            return int(math.ceil(self.data[self.mode]["phi"].shape[0]/self.batch_size))
 
     def close(self):
         """Delete all tensors and arrays from memory to free up resources."""
@@ -386,7 +623,61 @@ class InMemoryIterableData(IterableDataset):
             return self._train_iter()
 
     def _train_iter(self):
-        """Iterator for training/validation/testing modes where data is already loaded in memory."""
+        """Iterator for train/validate/test. Uses precomputed batch-index plans if present."""
+        # tensors
+        store = self.data[self.mode]
+        phi   = store["phi"]
+        theta = store.get("theta")
+        y     = store.get("y")
+        dev   = self.device
+
+        # If we have a plan for this split, iterate over its batches; else fall back to natural order.
+        
+        batches = store.get("batches", None)
+
+        if batches is None:
+            # fallback: natural order (or shuffled) like before
+            n = phi.shape[0]
+            perm = (torch.randperm(n, generator=torch.Generator().manual_seed(self._epoch_seed()))
+                    if self.shuffle else torch.arange(n))
+            s, e = self._compute_worker_slice(n)
+            if s >= e:
+                return iter(())
+            bs = self.batch_size
+            shard = perm[s:e]
+
+            for i in range(0, shard.numel(), bs):
+                idx = shard[i:i+bs]
+                phib = phi.index_select(0, idx)
+                thetab = theta.index_select(0, idx) if theta is not None else None
+                yb     = y.index_select(0, idx)     if y     is not None else None
+                if dev is not None:
+                    phib   = phib.to(dev, non_blocking=True)
+                    if thetab is not None: thetab = thetab.to(dev, non_blocking=True)
+                    if yb is not None:     yb     = yb.to(dev, non_blocking=True)
+                yield self._format_batch(thetab, phib, yb)
+            return
+        else:
+            # --- plan path: split batches across workers by batch-count (not by sample-count) ---
+            total_batches = len(batches)
+            b_start, b_end = self._compute_worker_slice(total_batches)  # reuse same helper; it just slices a range
+            if b_start >= b_end:
+                return iter(())
+
+            for b in range(b_start, b_end):
+                idx = batches[b]  # 1D LongTensor of indices for this batch
+                phib = phi.index_select(0, idx)
+                thetab = theta.index_select(0, idx) if theta is not None else None
+                yb     = y.index_select(0, idx)     if y     is not None else None
+                if dev is not None:
+                    phib   = phib.to(dev, non_blocking=True)
+                    if thetab is not None: thetab = thetab.to(dev, non_blocking=True)
+                    if yb is not None:     yb     = yb.to(dev, non_blocking=True)
+                yield self._format_batch(thetab, phib, yb)
+
+    """
+    def _train_iter(self):
+        #Iterator for training/validation/testing modes where data is already loaded in memory.
         n = self.data[self.mode]["phi"].shape[0]
         perm = torch.randperm(n, generator=(torch.Generator().manual_seed(self._epoch_seed()))) if self.shuffle else torch.arange(n)
         s, e = self._compute_worker_slice(n)
@@ -399,7 +690,7 @@ class InMemoryIterableData(IterableDataset):
             if self.device is not None:
                 thetab, phib, yb = thetab.to(self.device, non_blocking=True), phib.to(self.device, non_blocking=True), yb.to(self.device, non_blocking=True)
             yield self._format_batch(thetab, phib, yb)
-
+    """
     def _predict_iter(self):
         """Iterator for prediction mode where we process one file at a time from memory."""
         worker_info = get_worker_info()
