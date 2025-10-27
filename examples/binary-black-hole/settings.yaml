@@ -1,6 +1,7 @@
 path_settings:
-  version: v1.0.0
+  version: v1.0.7
   path_to_files_train: ./binary-black-hole/in/data/lf/v1.0/training_cnp
+  path_to_files_test: ./binary-black-hole/in/data/lf/v1.0/training_regression
   path_to_files_predict: ./binary-black-hole/in/data/lf/v1.0/training_regression
   path_out_model: ./binary-black-hole/out
 model_settings:
@@ -48,20 +49,20 @@ model_settings:
       context_is_subset: true # if true, context points are a subset of target points; if false, context and target points are drawn independently
       context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
-      use_schedule: true
+      use_schedule: false
       skip_warmup: false
-      positive_ratio_train: [0.2,0.1,0.05] # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
+      positive_ratio_train: null # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
       max_positive_reuse: 3
       num_epochs_per_positive_ratio: 2 
     batch_size: 1000
-    training_epochs: 200
+    training_epochs: 1
     learning_rate: 0.001
     report_frequency: 100
     loss:
-      base_loss_fn: bce_with_logits    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest)
+      base_loss_fn: bce_with_logits    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest), 'brier' Brier Loss
       prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
-      alpha_pos:  136.0     # Weight for the positive (signal) class. 
+      alpha_pos:  1.0     # Weight for the positive (signal) class. 
                           # Lower (<1) downweights positives, higher (>1) emphasizes them. 
                           # Common range: 0.1–0.5. Set to 1 for no reweighting.
       alpha_neg:  1.0     # Optional explicit weight for the negative (background) class. 

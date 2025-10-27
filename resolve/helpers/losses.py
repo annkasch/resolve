@@ -21,15 +21,16 @@ def skip_loss(z, y, **kward):
     Y = torch.full_like(y, float('nan'))
     return Y, Y
 
-def recon_loss_mse(x_hat, y, x, **kward):
+def brier(z, y, **kward):
+    z[0]=z[0].view(-1)
+    sigmoid_z = torch.sigmoid(z[0])
+    mse = F.mse_loss(sigmoid_z, y.view(-1), reduction="none")
+    return mse, sigmoid_z
 
-    # 2) Align devices
+def recon_loss_mse(x_hat, y, x, **kward):
     device = x_hat[0].device
     x = x.to(device)
-    # y is unused, but keep consistent if you might use it later
-    # y = y.to(device)
 
-    # 3) Flatten to (N, D) if needed
     if x_hat[0].dim() > 2:
         x_hat[0] = x_hat[0].reshape(-1, x_hat[0].shape[-1])
     if x.dim() > 2:
