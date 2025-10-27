@@ -4,11 +4,19 @@ import numpy as np
 import torch.nn.functional as F
 
 class DeterministicEncoder(nn.Module):
-    def __init__(self, output_sizes):
+    def __init__(self, input_dim, latent_dim, hidden_dims, dropout_p=0.0):
         super(DeterministicEncoder, self).__init__()
-        self.linears = nn.ModuleList()
-        for i in range(len(output_sizes) - 1):
-            self.linears.append(nn.Linear(output_sizes[i], output_sizes[i + 1]))
+        # Encoder
+        enc_layers = []
+        prev = input_dim
+        for h in hidden_dims:
+            enc_layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
+            if dropout_p > 0:
+                enc_layers.append(nn.Dropout(dropout_p))
+            prev = h
+        enc_layers += [nn.Linear(prev, latent_dim)]
+
+        self.encoder = nn.Sequential(*enc_layers)
 
     def forward(self, context_x, context_y):
         """Encodes the inputs into one representation.
@@ -31,11 +39,8 @@ class DeterministicEncoder(nn.Module):
         batch_size, num_context_points, _ = encoder_input.shape
         hidden = encoder_input.view(batch_size * num_context_points, -1)
         
-        # Pass through MLP
-        for i, linear in enumerate(self.linears[:-1]):
-            hidden = torch.relu(linear(hidden))
         # Last layer without a ReLu
-        hidden = self.linears[-1](hidden)
+        hidden = self.encoder(hidden)
         # Bring back into original shape (# Flatten the output feature map into a 1D feature vector)
         hidden = hidden.view(batch_size, num_context_points, -1)
 
@@ -79,15 +84,16 @@ def sigmoid_expectation(mu, sigma):
     return expectation, var
 
 class DeterministicDecoder(nn.Module):
-    def __init__(self, output_sizes):
-        """CNP decoder.
-        Args:
-            output_sizes: An iterable containing the output sizes of the decoder MLP.
-        """
+    def __init__(self, output_dim, latent_dim, hidden_dims):
         super(DeterministicDecoder, self).__init__()
-        self.linears = nn.ModuleList()
-        for i in range(len(output_sizes) - 1):
-            self.linears.append(nn.Linear(output_sizes[i], output_sizes[i + 1]))
+        dec_layers = []
+        prev = latent_dim
+        for h in hidden_dims:
+            dec_layers += [nn.Linear(prev, h), nn.ReLU(inplace=True)]
+            prev = h
+        dec_layers += [nn.Linear(prev, output_dim*2)]  # linear head for regression-like recon
+
+        self.decoder = nn.Sequential(*dec_layers)
 
     def forward(self, representation, target_x, is_binary):
         """Decodes the individual targets.
@@ -110,11 +116,8 @@ class DeterministicDecoder(nn.Module):
         input = torch.cat((representation, target_x), dim=-1)
         hidden = input.view(batch_size * num_total_points, -1)
 
-        # Pass through MLP
-        for i, linear in enumerate(self.linears[:-1]):
-            hidden = torch.relu(linear(hidden))
         # Last layer without a ReLu
-        hidden = self.linears[-1](hidden)
+        hidden = self.decoder(hidden)
 
         # Bring back into original shape
         hidden = hidden.view(batch_size, num_total_points, -1)
@@ -136,21 +139,15 @@ class DeterministicDecoder(nn.Module):
         return mu, sigma
 
 class ConditionalNeuralProcess(nn.Module):
-    def __init__(self, encoder_sizes, decoder_sizes):
+    def __init__(self, input_dim, representation_size, encoder_sizes, decoder_sizes, output_dim, dropout_p=0.0):
         super(ConditionalNeuralProcess, self).__init__()
-        """Initialises the model.
-
-        Args:
-            encoder_output_sizes: An iterable containing the sizes of hidden layers of
-                the encoder. The last one is the size of the representation r.
-            decoder_output_sizes: An iterable containing the sizes of hidden layers of
-                the decoder. The last element should correspond to the dimension of
-                the y * 2 (it encodes both mean and variance concatenated)
+        """Initialises the model
         """
-        self._encoder = DeterministicEncoder(encoder_sizes)
-        self._decoder = DeterministicDecoder(decoder_sizes)
+        self._encoder = DeterministicEncoder(input_dim, representation_size, encoder_sizes, dropout_p)
+    
+        self._decoder = DeterministicDecoder(output_dim, representation_size+input_dim-output_dim, decoder_sizes)
 
-    def forward(self, context_theta, context_phi, context_y, query_theta, query_phi, **kwargs):
+    def forward(self, query_theta, query_phi, context_theta, context_phi, context_y, **kwargs):
         """Returns the predicted mean and variance at the target points.
 
         Args:
