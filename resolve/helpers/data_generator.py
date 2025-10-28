@@ -54,13 +54,14 @@ class DataGeneration:
         return sorted(str(p) for p in path_to_files.glob(f"*.{self.config_file['simulation_settings']['file_format']}"))
 
     
-    def set_dataset(self, normalizer=Normalizer()):
+    def set_dataset(self, normalizer=Normalizer(), shuffle = True):
         dataset_config = self.config_file["model_settings"]["train"]["dataset"]
+
         self.dataset = InMemoryIterableData(
                 files=self.files,
                 batch_size=self.config_file["model_settings"]["train"]["batch_size"],
                 parameter_config=self.parameters,
-                shuffle=True,   # reshuffles every epoch
+                shuffle=shuffle,   # reshuffles every epoch
                 seed=42,
                 as_float32=True,
                 device=None,    # or torch.device("cuda")
@@ -70,10 +71,12 @@ class DataGeneration:
                 mode=self.mode
             )
 
-    def set_loader(self, mode="train"):
-        
-        if self.dataset == None: 
-            self.set_dataset()
+    def set_loader(self, mode="train", shuffle=True):
+
+        if self.dataset == None:
+            self.set_dataset(shuffle=shuffle)
+        else:
+            self.dataset.shuffle = shuffle
             
         self.dataset.set_mode(mode)
         self.dataloader = DataLoader(
