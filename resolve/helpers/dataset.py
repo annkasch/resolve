@@ -33,6 +33,7 @@ class InMemoryIterableData(IterableDataset):
         super().__init__()
         
         self.files, self.batch_size, self.shuffle = list(files), int(batch_size), bool(shuffle)
+
         self.seed, self.as_float32, self.device = int(seed), bool(as_float32), device
         self.parameter_config, self.dataset_config = (parameter_config or {}), dataset_config
         
@@ -66,11 +67,19 @@ class InMemoryIterableData(IterableDataset):
             self._normalizer = Normalizer(self.dataset_config.get("use_feature_normalization", None))
             theta, phi = self.fit_transform(self.as_float32, theta=theta, phi=phi)
 
+            def make_empty_like(*tensors):
+                return [torch.empty_like(t) for t in tensors]
+
+            theta_test, phi_test, y_test, fidx_test = make_empty_like(theta, phi, y, fidx)
+            theta_val,  phi_val,  y_val, fidx_val  = make_empty_like(theta, phi, y, fidx)
+
             # split into training, validation and testing data
-            test_size = 1 - self.dataset_config.get('train_ratio',0.6)
-            theta_train, theta_test, phi_train, phi_test, y_train, y_test, fidx_train, fidx_test = train_test_split(theta, phi, y, fidx, test_size=test_size, random_state=42)
-            test_size = self.dataset_config.get('val_ratio',0.2)/test_size
-            theta_val, theta_test, phi_val, phi_test, y_val, y_test, fidx_val, fidx_test = train_test_split(theta_test, phi_test, y_test, fidx_test, test_size=test_size, random_state=42)
+            val_size = 1 - self.dataset_config.get('train_ratio',0.6)
+            if val_size > 0.:
+                theta, theta_val, phi, phi_val, y, y_val, fidx, fidx_val = train_test_split(theta, phi, y, fidx, test_size=val_size, random_state=42)
+                test_size = self.dataset_config.get('test_ratio',0.2)/val_size
+                if test_size > 0. :
+                    theta_val, theta_test, phi_val, phi_test, y_val, y_test, fidx_val, fidx_test = train_test_split(theta_val, phi_val, y_val, fidx_val, test_size=test_size, random_state=42)
             
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
 
@@ -83,7 +92,7 @@ class InMemoryIterableData(IterableDataset):
                     )
                 
             data = {
-                "train": {"theta": theta_train, "phi": phi_train, "y": y_train, "file_indices": fidx_train, "batches": None},
+                "train": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx, "batches": None},
                 "test": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": None},
                 "validate": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": None}
             }
@@ -638,8 +647,10 @@ class InMemoryIterableData(IterableDataset):
         if batches is None:
             # fallback: natural order (or shuffled) like before
             n = phi.shape[0]
+
             perm = (torch.randperm(n, generator=torch.Generator().manual_seed(self._epoch_seed()))
                     if self.shuffle else torch.arange(n))
+
             s, e = self._compute_worker_slice(n)
             if s >= e:
                 return iter(())
@@ -758,4 +769,65 @@ class InMemoryIterableData(IterableDataset):
             query=QuerySet(theta=self.theta_query, phi=self.phi_query),
             target_y=y_tgt,
         )
+    
+    def get(self, i: int, dev=None):
+        """
+        Return the i-th yielded batch for THIS worker under the current epoch/seed.
+        Supports negative i (e.g., -1 is the last batch of this worker's shard).
+        """
+        # pull tensors for current mode
+        mode = self.mode
+        phi   = self.data[mode]["phi"]
+        theta = self.data[mode].get("theta", None)
+        y     = self.data[mode].get("y", None)
+
+        n = phi.shape[0]
+        if n == 0:
+            raise IndexError("Empty dataset")
+
+        # permutation: MUST mirror __iter__
+        print(self.shuffle)
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self._epoch_seed())
+            perm = torch.randperm(n, generator=g)
+        else:
+            perm = torch.arange(n)
+
+        # worker slice
+        s, e = self._compute_worker_slice(n)
+        if s >= e:
+            raise IndexError("Empty shard for this worker")
+
+        shard = perm[s:e]
+        bs = self.batch_size
+
+        # batch count within this shard
+        total_batches = (shard.numel() + bs - 1) // bs
+        if i < 0:
+            i = total_batches + i
+        if i < 0 or i >= total_batches:
+            raise IndexError(f"Batch index {i} out of range [0, {total_batches-1}]")
+
+        # indices for the i-th batch inside the shard
+        start = i * bs
+        end   = min(start + bs, shard.numel())
+        idx = shard[start:end]
+
+        # index on the same device as source tensors
+        idx_dev = idx.to(device=phi.device, dtype=torch.long)
+
+        phib = phi.index_select(0, idx_dev)
+        thetab = theta.index_select(0, idx_dev) if theta is not None else None
+        yb     = y.index_select(0, idx_dev)     if y     is not None else None
+
+        # optional move to target device (preserve your iteration behavior)
+        move_to = dev if dev is not None else getattr(self, "device", None)
+        if move_to is not None:
+            phib = phib.to(move_to, non_blocking=True)
+            if thetab is not None: thetab = thetab.to(move_to, non_blocking=True)
+            if yb     is not None: yb     = yb.to(move_to, non_blocking=True)
+
+        # match your iterator’s output packing
+        return self._format_batch(thetab, phib, yb)
 
