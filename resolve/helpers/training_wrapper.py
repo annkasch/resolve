@@ -344,7 +344,7 @@ class Trainer:
         patience: int = 15,
         min_delta: float = 0.0,
         save_best: bool = True,
-        max_epochs_per_phase: Optional[int] = None,
+        num_data_pass_per_phase: Optional[int] = 1,
     ) -> Dict[str, float]:
         """
         Warm-up training with staged positive-fraction schedule.
@@ -358,7 +358,7 @@ class Trainer:
             patience: Early-stopping patience (epochs without improvement).
             min_delta: Minimum required improvement.
             save_best: Save and restore best weights.
-            max_epochs_per_phase: Optional epoch override per phase.
+            num_data_pass_per_phase: Optional epoch override per phase.
         """
         device = _device()
         self.model.to(device)
@@ -374,12 +374,13 @@ class Trainer:
         for phase_idx, pos_frac in enumerate(schedule, start=1):
             dataloader = self.dataset.set_loader("train")
 
-            dataloader.dataset.update_batch_schedule(
+            dataloader.dataset.set_batch_schedule(
                 target_pos_frac=pos_frac,
                 max_pos_reuse_per_epoch=dataloader.dataset.dataset_config.get("max_positive_reuse", 0.0),
             )
-            n_epochs = max_epochs_per_phase*dataloader.dataset.meta.get("num_epochs", 1) or dataloader.dataset.meta.get("num_epochs", 1)
-            
+
+            n_epochs = num_data_pass_per_phase*dataloader.dataset.meta.get("num_epochs", 1) or dataloader.dataset.meta.get("num_epochs", 1)
+
             best_score = -float("inf") if mode == "max" else float("inf")
             best_state = None
             no_improve = 0
@@ -433,7 +434,7 @@ class Trainer:
         if save_best and best_state is not None:
             self.model.load_state_dict(best_state)
         self.epoch_start=global_epoch
-        dataloader.dataset.update_batch_schedule(target_pos_frac=None, max_pos_reuse_per_epoch = dataloader.dataset.dataset_config.get("max_positive_reuse",0.))
+        dataloader.dataset.set_batch_schedule(target_pos_frac=None, max_pos_reuse_per_epoch = dataloader.dataset.dataset_config.get("max_positive_reuse",0.))
         return {**self.metrics.get("validate", {}), f"{monitor}_best": best_score}
 
     @torch.inference_mode()
