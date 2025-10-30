@@ -7,37 +7,46 @@ import torch.nn.functional as F
 import numpy as np
 
 def bce_with_logits(z, y, **kward):
-    z[0]=z[0].view(-1)
-    return F.binary_cross_entropy_with_logits(z[0], y.view(-1), reduction="none"), torch.sigmoid(z[0])
+    # z can be list/tuple or tensor
+    z0 = z[0] if isinstance(z, (list, tuple)) else z
+    z0 = z0.reshape(-1)
+    y  = y.reshape(-1)
+    return F.binary_cross_entropy_with_logits(z0, y, reduction="none"), torch.sigmoid(z0)
 
 def log_prob(z, y, **kward):
-    dist = torch.distributions.normal.Normal(loc=z[0], scale=z[1])
-    #dist = torch.distributions.Independent(torch.distributions.Normal(loc=z[0], scale=z[1]), reinterpreted_batch_ndims=1  # This assumes the last dim is your m-dim output
-    #    )
-    log_prob = -1.*dist.log_prob(y)
-    return log_prob.view(-1), z[0].view(-1)
+    z0 = z[0] if isinstance(z, (list, tuple)) else z
+    z1 = z[1] if (isinstance(z, (list, tuple)) and len(z) > 1) else None
+    if z1 is None:
+        raise ValueError("log_prob expects z=[mu, sigma].")
+    dist = torch.distributions.Normal(loc=z0, scale=z1)
+    # per-sample negative log-likelihood
+    nll = -dist.log_prob(y).reshape(-1)
+    return nll, z0.reshape(-1)
 
 def skip_loss(z, y, **kward):
-    Y = torch.full_like(y, float('nan'))
+    Y = torch.full_like(y.reshape(-1), float("nan"))
     return Y, Y
 
 def brier(z, y, **kward):
-    z[0]=z[0].view(-1)
-    sigmoid_z = torch.sigmoid(z[0])
-    mse = F.mse_loss(sigmoid_z, y.view(-1), reduction="none")
-    return mse, sigmoid_z
+    z0 = z[0] if isinstance(z, (list, tuple)) else z
+    z0 = z0.reshape(-1)
+    y  = y.reshape(-1)
+    p = torch.sigmoid(z0)
+    mse = F.mse_loss(p, y, reduction="none")
+    return mse, p
 
 def recon_loss_mse(x_hat, y, x, **kward):
-    device = x_hat[0].device
-    x = x.to(device)
-
-    if x_hat[0].dim() > 2:
-        x_hat[0] = x_hat[0].reshape(-1, x_hat[0].shape[-1])
+    # x_hat[0]: (N, M) or (B, T, M); x ground truth of same last-dim
+    xh = x_hat[0]
+    if x is None:
+        raise ValueError("recon_loss_mse requires keyword arg x=<target features>")
+    # flatten batch/time but keep feature dim
+    if xh.dim() > 2:
+        xh = xh.reshape(-1, xh.shape[-1])
     if x.dim() > 2:
         x = x.reshape(-1, x.shape[-1])
-    mse = F.mse_loss(x_hat[0], x, reduction="none").mean(dim=1)
-
-    return mse,mse
+    mse_vec = F.mse_loss(xh, x, reduction="none").mean(dim=1)  # per-sample
+    return mse_vec, mse_vec
 
 class AsymmetricFocalWithFPPenalty(nn.Module):
     """
@@ -96,56 +105,59 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         self.reduction = reduction
         self.base_loss_fn = base_loss_fn
         self.p = None
+    
+    def _ensure_container(self, logits):
+        # normalize to a list-like [z, ...]
+        if isinstance(logits, (list, tuple)):
+            return list(logits)
+        return [logits]
 
     def forward(self, logits: torch.Tensor, targets_y: torch.Tensor, targets_x: Optional[torch.Tensor] ) -> torch.Tensor:
         """
         logits:  (N,) or (N,1) raw scores
         targets_y: (N,) or (N,1) with values in {0,1}
         """
-        # Shift + probabilities (p used by focal weights and FP penalty)
-        z = logits
+        # Normalize inputs and devices
+        z_list = self._ensure_container(logits)
+        z0 = z_list[0]
+        y=targets_y
+        x= targets_x
 
-        # Base per-sample loss (N,)
-        base, self.p = self.base_loss_fn(z, targets_y, x=targets_x)
+        # Base per-sample loss and probability-like output
+        base_loss, p = self.base_loss_fn(z_list, y, x=x)
+        # base_loss: (N,), p: (N,) probabilities
+        base_loss = base_loss.reshape(-1)
+        p = p.reshape(-1)
+        self.p = p  # expose for metrics when needed
         
-        
-        # Masks (allow slightly fuzzy labels; >=0.5 -> positive)
-        targets_y = targets_y.view(-1).float()
-        pos_mask = targets_y >= self.tau_tp
+        # Masks (>= tau_tp is positive)
+        pos_mask = (y >= self.tau_tp)
         neg_mask = ~pos_mask
 
         # Asymmetric focal weights
-        # Compute asymmetric focal weights without boolean indexing copies
-        # w = alpha_pos * (1 - p)^gamma_pos on positives, else alpha_neg * p^gamma_neg
-
         one_minus_p = 1.0 - self.p
         w_pos = self.alpha_pos * torch.pow(one_minus_p, self.gamma_pos)
         w_neg = self.alpha_neg * torch.pow(self.p,           self.gamma_neg)
         weight = torch.where(pos_mask, w_pos, w_neg)
 
         # Focal term
-        focal_term = weight * base
+        loss = weight * base_loss  # (N,)
 
-        # Start from the base loss
-        loss = focal_term.clone()
+        # False-positive penalty on negatives
+        if self.lambda_fp > 0.0:
+            #overshoot_fp = torch.relu(p[neg_mask] - self.tau_fp)
+            #loss[neg_mask] = loss[neg_mask] + self.lambda_fp * (overshoot_fp ** 2)
+            overshoot_fp = torch.relu(self.p - self.tau_fp)
+            penalty_fp = overshoot_fp ** 2 * (1.0 - targets_y)
+            loss = loss + self.lambda_fp * penalty_fp
 
-        # ----- False-positive penalty (existing) -----
-        if self.lambda_fp > 0.0 and neg_mask.any():
-            overshoot_fp = torch.relu(self.p[neg_mask] - self.tau_fp)
-            penalty_fp = overshoot_fp ** 2
-            loss[neg_mask] = loss[neg_mask] + self.lambda_fp * penalty_fp
-
-        # ----- False-negative penalty (new) -----
-        # penalize positives that fall below tau_fn
-        #if self.lambda_fp > 0.0 and pos_mask.any():
-        #    shortfall_fn = torch.relu(self.tau_fp - self.p[pos_mask])
-        #    penalty_fn = shortfall_fn #** 2
-        #    loss[pos_mask] = loss[pos_mask] + self.lambda_fp * penalty_fn
-        
-        if self.lambda_tp > 0.0 and pos_mask.any():
-            overshoot = torch.relu(self.p[pos_mask] - self.tau_tp)
-            reward = overshoot # ** 2 # 
-            loss[pos_mask] = loss[pos_mask] - self.lambda_tp * reward
+        # True-positive reward on positives
+        if self.lambda_tp > 0.0:
+            #overshoot_tp = torch.relu(p[pos_mask] - self.tau_tp)
+            #loss[pos_mask] = loss[pos_mask] - self.lambda_tp * (overshoot_tp ** 2)
+            overshoot_tp = (p - self.tau_tp).relu()
+            reward_tp = overshoot_tp.square() * y
+            loss = loss - (self.lambda_tp * reward_tp)
         
         if self.reduction == "mean":
             return loss.mean()

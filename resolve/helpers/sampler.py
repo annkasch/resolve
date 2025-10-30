@@ -6,10 +6,9 @@ import numpy as np
 import math
 
 class Sampler():
-    def __init__(self, batch_size: int,  positive_condition: str, shuffle="global", seed: Optional[int] = None, device: Optional[torch.device] = None,) -> None:
+    def __init__(self, batch_size: int,  positive_condition: str, shuffle="global", seed: Optional[int] = None):
         super().__init__()
         self.shuffle = shuffle
-        self.device = device
         self.batch_size = batch_size
         self.positive_fn = self.positive_function(positive_condition) if positive_condition else None
         self.seed = seed
@@ -44,11 +43,10 @@ class Sampler():
         unused_neg_subset: torch.Tensor | None = None,
         seed: int | None = None,          # reproducible positive order
     ):
-        pos_idx = pos_idx.to(self.device).long()
-        neg_idx = neg_idx.to(self.device).long()
+
 
         # positives: build pool with reuse cap, then shuffle with seed
-        pos_pool = torch.empty(0, dtype=torch.long, device=self.device)
+        pos_pool = torch.empty(0, dtype=torch.long)
         if nP_tot > 0:
             pos_pool = (pos_idx.repeat_interleave(pos_idx.numel()*max_pos_reuse_per_epoch) if max_pos_reuse_per_epoch > 0 else pos_idx)
             pos_pool = pos_pool[:nP_tot]
@@ -63,7 +61,7 @@ class Sampler():
         Nneed = n - nP_tot
         keep = int(sticky_frac * Nneed) if last_neg_subset.numel() > 0 else 0
 
-        new_block = torch.empty(0, dtype=torch.long, device=self.device)
+        new_block = torch.empty(0, dtype=torch.long)
         if Nneed > keep:
             take_new = Nneed - keep
 
@@ -79,22 +77,22 @@ class Sampler():
             new_block = base[:take_new] 
             keep = Nneed - take_new + keep
 
-        g = torch.Generator(device=self.device)
+        g = torch.Generator()
         if seed is not None:
             g.manual_seed(seed + 2)
-        perm = torch.randperm(last_neg_subset.numel(), generator=g, device=self.device)
-        sticky = last_neg_subset[perm[:keep]].to(self.device).long() if keep else None
+        perm = torch.randperm(last_neg_subset.numel(), generator=g)
+        sticky = last_neg_subset[perm[:keep]] if keep else None
 
         neg_plan = torch.cat([sticky, new_block]) if sticky!=None else new_block
 
         if last_neg_subset.numel() > 0:
             union_used = torch.unique(
-                torch.cat([neg_plan.to(self.device).long(), last_neg_subset.to(self.device).long()])
+                torch.cat([neg_plan, last_neg_subset])
             )
         else:
-            union_used = neg_plan.to(self.device).long()
+            union_used = neg_plan.to().long()
 
-        used_mask = torch.isin(neg_idx.to(self.device).long(), union_used)
+        used_mask = torch.isin(neg_idx.long(), union_used)
         not_used_mask = ~used_mask
         remaining_negatives = neg_idx[not_used_mask]
 
@@ -263,9 +261,6 @@ class Sampler():
         # choose remaining negatives by seeded shuffle excluding sticky
         if Nneed > sticky.numel():
             take_new = Nneed - sticky.numel()
-
-            # ensure same device/dtype
-            sticky = sticky.to(neg_idx.device).long()
 
             if sticky.numel() == 0:
                 base = neg_idx

@@ -28,34 +28,29 @@ BatchCollection = collections.namedtuple(
 
 class InMemoryIterableData(IterableDataset):
     def __init__(self, files: Sequence[str], batch_size: int = 1000, shuffle: bool = "global",
-                 seed: int = 42, as_float32: bool = True, device: Optional[torch.device] = None,
-                 parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
+                 seed: int = 42, parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
                  normalizer: Optional[Normalizer]=Normalizer(), mode: Optional[str] = "train") -> None:
         super().__init__()
         
-        self.files, self.batch_size, self.shuffle = list(files), int(batch_size), shuffle
+        self.files, self.batch_size, self.shuffle, self.seed = list(files), int(batch_size), shuffle, seed
 
-        self.seed, self.as_float32, self.device = int(seed), bool(as_float32), device
         self.parameter_config, self.dataset_config = (parameter_config or {}), dataset_config
         
         self.mode = mode
         self._normalizer = normalizer
-        self.sampler = Sampler(self.batch_size, positive_condition, shuffle=self.shuffle, seed=self.seed, device=self.device)
+        self.sampler = Sampler(self.batch_size, positive_condition, shuffle=self.shuffle, seed=self.seed)
 
         self.state = None
         self.meta = {}
 
         # load all data into memory
-        theta, phi, y, fidx = self._load_data_to_mem(self.files, self.as_float32, self.parameter_config)
+        theta, phi, y, fidx = self._load_data_to_mem(self.files, self.parameter_config)
         
         self.data = self._set_data(theta, phi, y, fidx)
         
-        
-
         if not isinstance(self.dataset_config.get('positive_ratio_train'), list):
             self.set_batch_schedule(target_pos_frac=self.dataset_config.get("positive_ratio_train", None), max_pos_reuse_per_epoch = self.dataset_config.get("max_positive_reuse",0.), sticky_frac = 0.25, seed=self.dataset_config.get("seed",12345))
         
-
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
         data = {}
 
@@ -65,7 +60,7 @@ class InMemoryIterableData(IterableDataset):
         if self.mode == "train":
             # apply normalization
             self._normalizer = Normalizer(self.dataset_config.get("use_feature_normalization", None))
-            theta, phi = self._normalizer.fit_transform_as_f32(self.as_float32, theta=theta, phi=phi)
+            theta, phi = self._normalizer.fit_transform_as_f32(theta=theta, phi=phi)
 
             def make_empty_like(*tensors):
                 return [torch.empty_like(t) for t in tensors]
@@ -102,8 +97,7 @@ class InMemoryIterableData(IterableDataset):
         else:
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
             phi = self._normalizer.transform(x=phi, feature_grp="phi")
-            if self.as_float32:
-                theta = theta.float(); phi = phi.float()
+            theta = theta.float().contiguous(); phi = phi.float().contiguous()
             batches, self.status, self.meta = self.sampler.build_batches(phi.shape[0])
             self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
 
@@ -192,32 +186,30 @@ class InMemoryIterableData(IterableDataset):
         else:
             raise ValueError(f"Unsupported file format: {file_path}")
 
+        # ensure float32 on CPU
+        phi = phi.contiguous().to(torch.float32)
+        theta = theta.contiguous().to(torch.float32)
+        y = y.contiguous().to(torch.float32)
         return theta, phi, y
 
-    def _load_data_to_mem(self, files: Sequence[str], as_f32: bool, cfg: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _load_data_to_mem(self, files: Sequence[str], cfg: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         Thetas, Phis, ys, file_inds = [], [], [], []
         for i, fp in enumerate(files):
             if not os.path.exists(fp): raise FileNotFoundError(fp)
             Thetai, Phii, yi = self._read_in_from_file(fp, cfg)
             Thetas.append(Thetai); Phis.append(Phii); ys.append(yi)
             file_inds.append(torch.full((Phii.size(0),), i, dtype=torch.long))
-        Theta, Phi, y = torch.cat(Thetas, 0), torch.cat(Phis, 0), torch.cat(ys, 0)
-        file_index = torch.cat(file_inds, 0)
-        if as_f32:
-            Theta = Theta.float(); Phi = Phi.float(); y = y.float() if y.dtype == torch.float64 else y
-        return Theta.contiguous(), Phi.contiguous(), y.contiguous(), file_index
+        Theta, Phi, y, fidx = torch.cat(Thetas, 0).contiguous(), torch.cat(Phis, 0).contiguous(), torch.cat(ys, 0).contiguous(),torch.cat(file_inds, 0).contiguous()
+        return Theta, Phi, y, fidx
 
     def set_mode(self, mode):
         self.mode = mode
     
-    def set_normalizer(self, normalizer: Normalizer):
-        """Attach a Normalizer instance to this object."""
-        self._normalizer = normalizer
-    
-    def set_normalizer(self, method: str):
-        """Attach a Normalizer instance to this object."""
-        self._normalizer = Normalizer(method)
-
+    def set_normalizer(self, method_or_obj):
+        if isinstance(method_or_obj, Normalizer):
+            self._normalizer = method_or_obj
+        else:
+            self._normalizer = Normalizer(method_or_obj)
 
 
     def _compute_worker_slice(self, n: int) -> Tuple[int, int]:
@@ -238,7 +230,6 @@ class InMemoryIterableData(IterableDataset):
         phi   = store["phi"]
         theta = store.get("theta")
         y     = store.get("y")
-        dev   = self.device
 
         batches = store.get("batches", None)
         total_batches = len(batches)
@@ -251,11 +242,25 @@ class InMemoryIterableData(IterableDataset):
             phib = phi.index_select(0, idx)
             thetab = theta.index_select(0, idx) if theta is not None else None
             yb     = y.index_select(0, idx)     if y     is not None else None
-            if dev is not None:
-                phib   = phib.to(dev, non_blocking=True)
-                if thetab is not None: thetab = thetab.to(dev, non_blocking=True)
-                if yb is not None:     yb     = yb.to(dev, non_blocking=True)
+
             yield self._format_batch(thetab, phib, yb)
+    
+    def __getitem__(self, index):
+        """
+        Return the i-th yielded batch for THIS worker under the current epoch/seed.
+        Supports negative i (e.g., -1 is the last batch of this worker's shard).
+        """
+        store = self.data[self.mode]
+        phi   = store["phi"]
+        theta = store.get("theta")
+        y     = store.get("y")
+
+        idx = store.get("batches")[index]
+
+        theta_batch, phi_batch, y_batch = theta.index_select(0, idx), phi.index_select(0, idx), y.index_select(0, idx)
+
+        batch = self._format_batch(theta_batch, phi_batch, y_batch)
+        return batch
 
     def _predict_iter(self):
         """Iterator for prediction mode where we process one file at a time from memory."""
@@ -294,12 +299,6 @@ class InMemoryIterableData(IterableDataset):
                 phi_batch = file_phi[start_idx:end_idx]
                 y_batch = file_y[start_idx:end_idx]
 
-                # Move to device if needed
-                if self.device is not None:
-                    theta_batch = theta_batch.to(self.device, non_blocking=True)
-                    phi_batch = phi_batch.to(self.device, non_blocking=True)
-                    y_batch = y_batch.to(self.device, non_blocking=True)
-
                 # Format and yield batch
                 batch = self._format_batch(theta_batch, phi_batch, y_batch)
                 yield batch, file_idx.item(), end_idx >= n
@@ -313,33 +312,19 @@ class InMemoryIterableData(IterableDataset):
             self.theta_query, self.phi_query, y_tgt = theta, phi, y
             
         else:
-            theta_ctx, phi_ctx, y_ctx = phi[:n_ctx], y[:n_ctx]
+            theta_ctx, phi_ctx, y_ctx = theta[:n_ctx], phi[:n_ctx], y[:n_ctx]
             self.theta_query, self.phi_query, y_tgt = theta[n_ctx:], phi[n_ctx:], y[n_ctx:]
 
         def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
-        theta_ctx, phi_ctx, y_ctx, self.theta_query, self.phi_query, y_tgt = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx, self.theta_query, self.phi_query, y_tgt))
+        theta_ctx, phi_ctx, y_ctx  = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx))
+        self.theta_query, self.phi_query, y_tgt = map(ensure_3d, (self.theta_query, self.phi_query, y_tgt))
         
         return BatchCollection(
-            context=ContextSet(theta=theta_ctx, phi=phi_ctx, y=y_ctx),
-            query=QuerySet(theta=self.theta_query, phi=self.phi_query),
-            target_y=y_tgt,
+            context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous()),
+            query=QuerySet(theta=self.theta_query.contiguous(), phi=self.phi_query.contiguous()),
+            target_y=y_tgt.contiguous(),
         )
     
-    def get(self, i: int, dev=None):
-        """
-        Return the i-th yielded batch for THIS worker under the current epoch/seed.
-        Supports negative i (e.g., -1 is the last batch of this worker's shard).
-        """
-        # pull tensors for current mode
-        mode = self.mode
-        phi   = self.data[mode]["phi"]
-        theta = self.data[mode].get("theta", None)
-        y     = self.data[mode].get("y", None)
-
-        idx = self.data[model]["batches"][i]
-        theta_batch, phi_batch, y_batch = theta.index_select(0, idx), phi.index_select(0, idx), y.index_select(0, idx)
-        batch = self._format_batch(theta_batch, phi_batch, y_batch)
-        return batch
 
 
     def close(self):
@@ -363,8 +348,8 @@ class InMemoryIterableData(IterableDataset):
         # Clear other attributes that might hold data
         self.files = None
 
-    def __len__(self) -> int: 
-        if self.data[self.mode]["batches"]!=None:
-            return len(self.data[self.mode]["batches"])
-        else:
-            return int(math.ceil(self.data[self.mode]["phi"].shape[0]/self.batch_size))
+    def __len__(self) -> int:
+        store = self.data[self.mode]
+        if store.get("batches") is not None:
+            return len(store["batches"])
+        return int(math.ceil(store["phi"].shape[0] / self.batch_size))
