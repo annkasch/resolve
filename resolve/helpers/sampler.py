@@ -212,22 +212,23 @@ class Sampler():
         return math.ceil(epochs)
 
     def _plan_batches(self,
-        n_total: int,
-        batch_size: int,
-        pos_idx: torch.Tensor,
-        neg_idx: torch.Tensor,
+        y: torch.Tensor,
         target_pos_frac: float,
         max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
         sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
         last_neg_subset: torch.Tensor | None = None,
         seed: int | None = None,          # reproducible positive order
     ):
-        assert batch_size >= 2
+        assert self.batch_size >= 2
+        n_total = y.shape[0]
+        pos_mask = self.get_positive_indices(y)
+        pos_idx, neg_idx = pos_mask.nonzero(as_tuple=False).view(-1), (~pos_mask).nonzero(as_tuple=False).view(-1)
+
         nP, nN = pos_idx.numel(), neg_idx.numel()
         if nP == 0 or nN == 0:
             raise ValueError("Both classes required.")
         # batches to roughly cover n_total rows
-        M = max(1, math.ceil(n_total / batch_size))
+        M = max(1, math.ceil(n_total /self.batch_size))
 
         # epoch positive budget
         reuse = max(1, max_pos_reuse_per_epoch)
@@ -240,13 +241,13 @@ class Sampler():
         else:   
             Nneed = int(round((Ptot / target_pos_frac) * (1.-target_pos_frac)))
         n_total = Ptot + Nneed
-        M = max(1, math.ceil(n_total / batch_size))
+        M = max(1, math.ceil(n_total / self.batch_size))
 
         # per-batch positive counts (balanced rounding, at least 0, at most B-1)
         avgk = Ptot / M
         kfloor = int(math.floor(avgk))
         rem = Ptot - kfloor * M
-        k_list = [min(batch_size-1, max(0, kfloor + (1 if b < rem else 0))) for b in range(M)]
+        k_list = [min(self.batch_size-1, max(0, kfloor + (1 if b < rem else 0))) for b in range(M)]
 
         # positives: build pool with reuse cap, then shuffle with seed
         pos_pool = (pos_idx.repeat_interleave(reuse) if max_pos_reuse_per_epoch > 0 else pos_idx)
@@ -262,7 +263,7 @@ class Sampler():
             pos_chunks.append(pos_pool[pptr:pptr+k]); pptr += k
 
         # negatives: sticky + seeded shuffle (no replacement in plan)
-        Nneed = sum(batch_size - k for k in k_list)
+        Nneed = sum(self.batch_size - k for k in k_list)
         sticky = (last_neg_subset[: int(sticky_frac * Nneed)]
                 if (last_neg_subset is not None and Nneed > 0) else torch.empty(0, dtype=torch.long))
 
@@ -293,7 +294,7 @@ class Sampler():
         # chunk negatives
         neg_chunks, nptr = [], 0
         for k in k_list:
-            need = batch_size - k
+            need = self.batch_size - k
             neg_chunks.append(neg_plan[nptr:nptr+need]); nptr += need
 
         # assemble batches
@@ -309,9 +310,9 @@ class Sampler():
 
         nepochs = self.epochs_until_full_coverage(nN, Nneed, sticky_frac)
 
-        state = {"last_neg_subset": neg_plan}
-        meta  = {"batch_size": batch_size, "num_batches": M,
-                "pos_frac": (Ptot / max(1, (batch_size * M))), "num_epochs": nepochs}
+        state = neg_plan
+        meta  = {"batch_size": self.batch_size, "num_batches": M,
+                "pos_frac": (Ptot / max(1, (self.batch_size * M))), "num_epochs": nepochs}
         return batches, state, meta
 
     def positive_function(self, positive_condition):
