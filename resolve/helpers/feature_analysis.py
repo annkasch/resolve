@@ -111,8 +111,8 @@ class UMAPAnalyzer:
     def log_signal_over_background_kde(self, embeddings="global"):
         if self.embeddings is {}:
             self.extract_features()
-        if self.reducer is None:
-            self.fit_umap(embeddings=embeddings)
+        #if self.reducer is None:
+        #    self.fit_umap(embeddings=embeddings)
 
         if embeddings == "global":
             E =  np.hstack([self.embeddings["theta"], self.embeddings["phi"]])
@@ -181,7 +181,7 @@ class UMAPAnalyzer:
             D[i, j] = D[j, i] = d
 
         plt.figure(figsize=(6, 5))
-        sns.heatmap(D, annot=False, cmap="viridis")
+        ax = sns.heatmap(D, annot=False, cmap="viridis")
         plt.title("Pairwise Wasserstein Distances between $\phi$-distributions (signal only)")
         plt.xlabel(r"$\theta_j$")
         plt.ylabel(r"$\theta_i$")
@@ -200,8 +200,9 @@ class UMAPAnalyzer:
             )
             D[i, j] = D[j, i] = d
 
+        zminmax = ax.collections[0].get_clim()  # (vmin, vmax)
         plt.figure(figsize=(6, 5))
-        sns.heatmap(D, annot=False, vmin = 0.0, vmax=0.16,cmap="viridis")
+        sns.heatmap(D, annot=False, vmin = zminmax[0], vmax=zminmax[1],cmap="viridis")
         plt.title("Pairwise Wasserstein Distances between $\phi$-distributions (background only)")
         plt.xlabel(r"$\theta_j$")
         plt.ylabel(r"$\theta_i$")

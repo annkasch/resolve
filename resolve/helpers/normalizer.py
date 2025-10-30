@@ -40,3 +40,19 @@ class Normalizer:
 
     def inverse_transform(self, x: torch.Tensor, feature_grp: str):
         return torch.from_numpy(self._get_scaler(feature_grp).inverse_transform(x))
+
+    def fit_transform_as_f32(self, as_f32, **feature_groups):
+        """
+        Fit and transform multiple feature groups (e.g., theta, phi).
+        
+        Example:
+            theta, phi = self.fit_transform(theta=theta, phi=phi)
+        """
+
+        transformed = {}
+        for name, data in feature_groups.items():
+            transformed[name] = self.fit_transform(data, name)
+            if as_f32:
+                transformed[name] = transformed[name].float();
+                transformed[name].contiguous()
+        return tuple(transformed.values())

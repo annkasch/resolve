@@ -6,7 +6,7 @@ path_settings:
   path_out_model: ./binary-black-hole/out
 model_settings:
   network:
-    model_used: HCTargetAttnNP  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
+    model_used: MarginalizedNeuralRatioEstimator  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
     models: 
       ConditionalNeuralProcess:
         representation_size: 32
@@ -32,8 +32,12 @@ model_settings:
         representation_size: 128
       HCTargetAttnLNP:
         representation_size: 128
+      MarginalizedNeuralRatioEstimator:
+        encoder_sizes: [128, 64]
+        decoder_sizes: [128, 64]
+        dropout_p: 0.0
   dataloader:
-    dataloader_number_of_workers: 4
+    dataloader_number_of_workers: 1
     dataloader_prefetch_factor: 4
     dataloader_pin_memory: false
     dataloader_persistent_workers: false
@@ -43,6 +47,7 @@ model_settings:
       train_ratio: 0.6
       val_ratio: 0.2
       test_ratio: 0.2
+      shuffle_dataset: batch_wise # batch_wise, global, false
       mixup_ratio: 0.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
@@ -51,11 +56,12 @@ model_settings:
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
       use_schedule: false
       skip_warmup: false
-      positive_ratio_train: null # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
+      positive_ratio_train: 0.2 #[0.2, 0.1, 0.05] # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
       max_positive_reuse: 3
       num_epochs_per_positive_ratio: 2 
     batch_size: 1000
-    training_epochs: 1
+    training_epochs: 200
+    patience: 20
     learning_rate: 0.001
     report_frequency: 100
     loss:
