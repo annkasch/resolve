@@ -121,6 +121,7 @@ class InMemoryIterableData(IterableDataset):
 
         # train sets the batch size and needs to be processed first
         if target_pos_frac != None:
+            """
             self.data["train"]["batches"], self.state, self.meta = self.sampler.build_batches_with_target_pos_frac(
                 self.data["train"]["theta"],
                 self.data["train"]["y"],
@@ -129,7 +130,15 @@ class InMemoryIterableData(IterableDataset):
                 sticky_frac=sticky_frac,
                 unused_neg_subset=self.state
             )
-
+            """
+            self.data["train"]["batches"], self.state, self.meta = self.sampler._plan_batches(
+                y=self.data["train"]["y"],
+                target_pos_frac=target_pos_frac,
+                max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
+                sticky_frac=sticky_frac,
+                last_neg_subset=self.state,
+                seed=seed
+            )
         else:
             self.data["train"]["batches"], self.state, self.meta = self.sampler.build_batches(self.data["train"]["phi"].shape[0])
             
