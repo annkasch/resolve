@@ -6,7 +6,7 @@ path_settings:
   path_out_model: ./binary-black-hole/out
 model_settings:
   network:
-    model_used: MarginalizedNeuralRatioEstimator  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
+    model_used: HCTargetAttnNP  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
     models: 
       ConditionalNeuralProcess:
         representation_size: 32
@@ -56,7 +56,7 @@ model_settings:
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
       use_schedule: false
       skip_warmup: false
-      positive_ratio_train: 0.2 # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
+      positive_ratio_train: null # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
       max_positive_reuse: 3
       num_data_pass_per_phase: 2
     batch_size: 1000
