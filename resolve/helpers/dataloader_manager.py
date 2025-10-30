@@ -3,9 +3,10 @@ from pathlib import Path
 from resolve.utilities import utilities as utils
 from torch.utils.data import DataLoader
 import collections
-from resolve.helpers.dataset import InMemoryIterableData
+from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
 utils.set_random_seed(42)
+import torch
 
 ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
 QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi"))
@@ -62,8 +63,6 @@ class DataLoaderManager:
                 parameter_config=self.parameters,
                 shuffle=shuffle,   # reshuffles every epoch
                 seed=42,
-                as_float32=True,
-                device=None,    # or torch.device("cuda")
                 dataset_config=dataset_config,
                 positive_condition=self.positive_condition,
                 normalizer=normalizer,
@@ -88,7 +87,7 @@ class DataLoaderManager:
             batch_size=None,  # required for IterableDataset
             num_workers=self.config_file["model_settings"]["dataloader"]["dataloader_number_of_workers"],
             prefetch_factor=self.config_file["model_settings"]["dataloader"]["dataloader_prefetch_factor"],
-            pin_memory=self.config_file["model_settings"]["dataloader"]["dataloader_pin_memory"],
+            pin_memory=torch.cuda.is_available(),
             persistent_workers=self.config_file["model_settings"]["dataloader"]["dataloader_persistent_workers"]
         )
 

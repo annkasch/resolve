@@ -54,11 +54,11 @@ def get_git_hash(short=True):
         return "unknown"
 
 def _device() -> torch.device:
-    # Prefer MPS if available, else CUDA, else CPU
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
+    # Prefer CUDA, then MPS, then CPU
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 def _to_dev(obj, device, *, non_blocking=False):
@@ -196,7 +196,16 @@ class Trainer:
             self.criterion = AsymmetricFocalWithFPPenalty()
         else:
             self.criterion = torch.nn.BCEWithLogitsLoss() if self.is_binary else torch.nn.HuberLoss()
-        # Formatter (if available)
+        
+        self.device = _device()
+
+        # AMP policy
+        self._use_cuda = (self.device.type == "cuda")
+        self._use_bf16 = (self._use_cuda and torch.cuda.is_bf16_supported())
+        self._amp_enabled = self._use_cuda  # enable autocast on CUDA; off on MPS/CPU
+
+        # GradScaler only when we might need it (fp16 path)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled and not self._use_bf16)
 
         # For logging last epoch metrics
         self.metrics: Dict[str, float] = {}
@@ -207,9 +216,10 @@ class Trainer:
         context, query, targets = batch
 
         # move everything to device
-        targets = _to_dev(targets, device)
-        context = _to_dev(context, device)
-        query   = _to_dev(query, device)
+        nb = (device.type == "cuda")
+        targets = _to_dev(targets, device, non_blocking=nb)
+        context = _to_dev(context, device, non_blocking=nb)
+        query   = _to_dev(query, device, non_blocking=nb)
 
         if not (query.theta == query.theta[:, :1, :]).all():
             print("not all constant")
@@ -231,44 +241,62 @@ class Trainer:
         
         if train and self.criterion.base_loss_fn is not skip_loss:
             optimizer.zero_grad(set_to_none=True)
+        
+        autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
 
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True)
         for i, batch in enumerate(pbar):
+            with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=autocast_dtype):
+                output, targets = self._forward_batch(batch, device)
+
+                logit = output.get("logits", None)
+                if logit[0].dim() == 3:  # (B,T,M)
+                    logit[0] = logit[0].mean(dim=2)
+                kl_term = output.get("kl_term", 0.0)
+                add_loss = output.get("loss", 0.0)
                 
-            output, targets = self._forward_batch(batch, device)
+                _, query, _ = batch
+                query_x = torch.cat([query.theta, query.phi], dim=2)
 
-            logit = output.get("logits", None)
-            if logit[0].dim() == 3:  # (B,T,M)
-                logit[0] = logit[0].mean(dim=2)
-            kl_term = output.get("kl_term", 0.0)
-            add_loss = output.get("loss", 0.0)
-            
-            _, query, _ = batch
-            query_x = torch.cat([query.theta, query.phi], dim=2)
+                # Keep loss numerically stable: do loss in fp32 if needed
+                # fp32 is safer with custom losses
+                if logit[0].dtype != torch.float32:
+                    logit32   = (logit[0]).float()
+                    targets32 = targets.float()
+                    qx32      = query_x.float()
+                else:
+                    logit32, targets32, qx32 = logit[0], targets, query_x
 
-            loss = self.criterion(logit, targets, targets_x = query_x) + kl_term + add_loss
+                loss = self.criterion([logit32], targets32, targets_x=qx32) + kl_term + add_loss
 
             if train and self.criterion.base_loss_fn is not skip_loss:
-                loss.backward()
-                if (i+1) % accum_steps == 0 :
-                    optimizer.step()
+                if self.scaler.is_enabled():  # fp16 path
+                    self.scaler.scale(loss_val).backward()
+                else:  # bf16 or no-AMP
+                    loss.backward()
+
+                if (i + 1) % accum_steps == 0:
+                    if self.scaler.is_enabled():
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
+                    else:
+                        optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
 
             running_loss += float(loss.detach().cpu())
-            y_true_all.append(_safe_detach_numpy(targets).reshape(-1))
+            y_true_all.append(targets.reshape(-1))
             
             if self.criterion.base_loss_fn is recon_loss_mse: 
-                y_pred_all.append(self.criterion.p.detach().cpu().numpy())
+                y_pred_all.append(self.criterion.p.detach())
             elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
-                y_pred_all.append(torch.sigmoid(logit[0]).detach().cpu().numpy().reshape(-1))
+                y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
             else:
-                y_pred_all.append(_safe_detach_numpy(logit[0]).reshape(-1))
-            
+                y_pred_all.append(logit[0].reshape(-1))
             
             pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
 
-        y_true = np.concatenate(y_true_all, axis=0) if y_true_all else np.array([])
-        y_pred = np.concatenate(y_pred_all, axis=0) if y_pred_all else np.array([])
+        y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
+        y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
         avg_loss = running_loss / max(1, len(y_true_all))
         return avg_loss, y_true, y_pred
 
@@ -287,6 +315,14 @@ class Trainer:
 
         device = _device()
         self.model.to(device)
+        if isinstance(self.criterion, torch.nn.Module):
+            self.criterion.to(device)
+        
+        # rebuild optimizer after model to device
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
 
         # Initialize best score based on objective
         if not self.is_binary and monitor.lower() in {"pr_auc", "roc_auc"}:
@@ -330,6 +366,8 @@ class Trainer:
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
         self.metrics["best_model"]={"best_score": float(best_score), "monitor": monitor, "mode": mode, "epochs_ran": epoch - self.epoch_start + 1}
         return self.metrics["best_model"]
@@ -362,6 +400,14 @@ class Trainer:
         """
         device = _device()
         self.model.to(device)
+        if isinstance(self.criterion, torch.nn.Module):
+            self.criterion.to(device)
+        
+        # rebuild optimizer after model to device
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
 
         if mode not in {"max", "min"}:
             raise ValueError("mode must be 'max' or 'min'.")
@@ -435,6 +481,12 @@ class Trainer:
             self.model.load_state_dict(best_state)
         self.epoch_start=global_epoch
         dataloader.dataset.set_batch_schedule(target_pos_frac=None, max_pos_reuse_per_epoch = dataloader.dataset.dataset_config.get("max_positive_reuse",0.))
+        # Memory hygiene
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
         return {**self.metrics.get("validate", {}), f"{monitor}_best": best_score}
 
     @torch.inference_mode()
@@ -448,6 +500,8 @@ class Trainer:
 
         device = _device()
         self.model.to(device)
+        if isinstance(self.criterion, torch.nn.Module):
+            self.criterion.to(device)
 
         dataloader = self.dataset.set_loader(dataset_name)
         with torch.inference_mode():
@@ -458,23 +512,31 @@ class Trainer:
 
         # Log
         if writer and epoch % self._report == 0.:
-
             for k, v in m_v.items(): writer.add_scalar(f"{dataset_name}/{k}", v, epoch) if np.isscalar(v) else None
                             
             fig = utils.plot(y_pred_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
             writer.add_figure(f'plot/score_{dataset_name}', fig, global_step=epoch)
-            fig = plt.figure()
-            plt.plot(m_v["precision_recall_curve"][0],m_v["precision_recall_curve"][1])
-            plt.xlabel("Signal Efficiency (Recall)")
-            plt.ylabel("Precision")
-            writer.add_figure(f'plot/prec_recall_{dataset_name}', fig, global_step=epoch)
-            fig = plt.figure()
-            plt.plot(m_v["roc_curve"][1],1-m_v["roc_curve"][0])
-            plt.xlabel("Signal Efficiency")
-            plt.ylabel("Background Efficiency")
-            writer.add_figure(f'plot/roc_curve_{dataset_name}', fig, global_step=epoch)
+            if "precision_recall_curve" in m_v and isinstance(m_v["precision_recall_curve"], list):
+                fig = plt.figure()
+                plt.plot(m_v["precision_recall_curve"][0],m_v["precision_recall_curve"][1])
+                plt.xlabel("Signal Efficiency (Recall)")
+                plt.ylabel("Precision")
+                writer.add_figure(f'plot/prec_recall_{dataset_name}', fig, global_step=epoch)
+            if "roc_curve" in m_v and isinstance(m_v["roc_curve"], list):
+                fig = plt.figure()
+                plt.plot(m_v["roc_curve"][1],1-m_v["roc_curve"][0])
+                plt.xlabel("Signal Efficiency")
+                plt.ylabel("Background Efficiency")
+                writer.add_figure(f'plot/roc_curve_{dataset_name}', fig, global_step=epoch)
 
         score = m_v.get(monitor.lower(), m_v.get(monitor, float("nan")))
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
         return score
 
     @torch.inference_mode()
@@ -486,6 +548,8 @@ class Trainer:
             device = _device()
             self.model.to(device)
             self.model.eval()
+            if isinstance(self.criterion, torch.nn.Module):
+                self.criterion.to(device)
             
             # Get dimensions from dataset parameters
             sizes = {k: self.dataset.parameters[k]["size"] for k in ["theta", "phi", "target"]}
@@ -511,15 +575,35 @@ class Trainer:
                     query_phi = dataloader.dataset._normalizer.inverse_transform(query.phi[0],"phi")
                     query_theta = dataloader.dataset._normalizer.inverse_transform(query.theta[0],"theta")
 
+                    if not torch.is_tensor(query_phi):
+                        query_phi = torch.from_numpy(query_phi)
+                    if not torch.is_tensor(query_theta):
+                        query_theta = torch.from_numpy(query_theta)
+
+                    query_phi   = query_phi.to(device, non_blocking=(device.type=="cuda"))
+                    query_theta = query_theta.to(device, non_blocking=(device.type=="cuda"))
+
                     # Forward pass
-                    with torch.inference_mode():
+                    autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
+                    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=autocast_dtype):
                         output, targets = self._forward_batch(batch, device)
-                    logit = output.get("logits", None)
-                    query_x = torch.cat([query_theta, query_phi], dim=1) 
+                        logit = output.get("logits", None)
+                        query_x = torch.cat([query_theta, query_phi], dim=1) 
+
+                        # Keep loss numerically stable: do loss in fp32 if needed
+                        # fp32 is safer with custom losses
+                        if logit[0].dtype != torch.float32:
+                            logit32   = (logit[0]).float()
+                            targets32 = targets.float()
+                            qx32      = query_x.float()
+                        else:
+                            logit32, targets32, qx32 = logit[0], targets, query_x
+
+                        loss = self.criterion([logit32], targets32, targets_x=qx32) + output.get("kl_term", 0.0) + output.get("loss", 0.0)
+                    
                     # Update loss
-                    collectors["loss"] += (self.criterion(logit, targets, query_x) + 
-                                         output.get("kl_term", 0.0) + 
-                                         output.get("loss", 0.0))
+                    collectors["loss"] += loss
+                                         
 
                     # Update predictions
                     if self.model._get_name()== 'ConditionalNeuralProcess':
@@ -635,6 +719,13 @@ class Trainer:
                 vals = metrics_col[:, i]
                 self.metrics[dataset_name][f"{name}_avg"] = np.nanmean(vals)
                 self.metrics[dataset_name][name] = vals.tolist()
+
+            # Memory hygiene
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
 
             return {"monitor_avg": np.nanmean(self.metrics[dataset_name].get(monitor, float("nan")))}
 
