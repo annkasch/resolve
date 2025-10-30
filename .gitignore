@@ -6,3 +6,4 @@ examples/legend/out/*
 !examples/legend/out/.gitkeep
 examples/legend/in/data/*
 !examples/legend/in/data/.gitkeep
+*.pt
