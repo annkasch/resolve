@@ -26,6 +26,7 @@ class Sampler():
 
         meta = {"batch_size": self.batch_size, "num_batches": len(batches),
                 "pos_frac": None, "num_epochs": 1}
+
         return batches, None, meta
 
     def _epoch_seed(self) -> int:
@@ -104,7 +105,7 @@ class Sampler():
         """Turn a 1D/ND row tensor into a Python hashable key."""
         return tuple(t.tolist()) if t.ndim > 0 else (t.item(),)
 
-    def build_batches_with_target_pos_frac(
+    def build_batches_with_posneg_ratio_groupaware(
         self,
         theta: torch.Tensor,                     # shape [N] or [N, d]
         y: torch.Tensor,  
@@ -113,73 +114,63 @@ class Sampler():
         sticky_frac: float = 0.25,
         unused_neg_subset: Dict[Any, torch.Tensor] | None = None,  # keyed by group key
     ):
-        """
-        Group rows by identical theta (row-wise) and run sample_positives_negatives per group.
+        # precompute inverse once
+        if theta.ndim == 1:
+            _, inverse = torch.unique(theta, return_inverse=True)
+        else:
+            _, inverse = torch.unique(theta, dim=0, return_inverse=True)
 
-        """
+        num_groups = inverse.max().item() + 1
 
         pos = self.get_positive_indices(y)
         pos_idx = pos.nonzero(as_tuple=False).view(-1)
         neg_idx = (~pos).nonzero(as_tuple=False).view(-1)
 
-        batches = []
-        unused = []
-        # Find unique groups by theta row
-        if theta.ndim == 1:
-            uniq_vals, inverse = torch.unique(theta, return_inverse=True)
-            group_rows = { self._as_key(v): (inverse == i).nonzero(as_tuple=True)[0]
-                        for i, v in enumerate(uniq_vals) }
-        else:
-            uniq_rows, inverse = torch.unique(theta, dim=0, return_inverse=True)
-            group_rows = { self._as_key(uniq_rows[i]): (inverse == i).nonzero(as_tuple=True)[0]
-                        for i in range(uniq_rows.size(0)) }
+        pos_gid = inverse[pos_idx]
+        neg_gid = inverse[neg_idx]
+
         reuse = max(1, max_pos_reuse_per_epoch)
-        n_tmp = pos_idx.numel()*reuse / target_pos_frac if target_pos_frac > 0. else neg_idx.numel()
-        n = int(round( n_tmp/ len(group_rows))) 
+        n_tmp = pos_idx.numel()*reuse/target_pos_frac if target_pos_frac > 0. else neg_idx.numel()
+        n = int(round(n_tmp/num_groups))
+        nN_min = max(2, min(4, int(0.05 * n)))
 
-        # Loop over groups
-        for gi, (gkey, row_idx) in enumerate(group_rows.items()):
-            # Intersect this group's rows with global pos/neg by value
-            in_group = torch.isin(pos_idx, row_idx)
-            pos_g = pos_idx[in_group]
-            in_group = torch.isin(neg_idx, row_idx)
-            neg_g = neg_idx[in_group]
+        batches, unused = [], []
+        nP_tot = 0
+        for gi in range(num_groups):
+            pos_g = pos_idx[pos_gid == gi]
+            neg_g = neg_idx[neg_gid == gi]
+            
+
             unused_neg_g = None
-
             if unused_neg_subset is not None:
-                in_group = torch.isin(unused_neg_subset, row_idx)
-                unused_neg_g = unused_neg_subset[in_group]
+                # if you must, precompute its inverse too
+                inv_unused = inverse[unused_neg_subset]
+                unused_neg_g = unused_neg_subset[inv_unused == gi]
 
-            # Seed offset per group for reproducibility
             gseed = None if self.seed is None else self.seed + gi
 
-            nP_max = pos_g.numel()*reuse
-            n_chunk = n #if n > pos_g.numel()*max_pos_reuse_per_epoch else 2*n
-            nP_max = min(nP_max, n_chunk) if target_pos_frac > 0. else 0
-            # epoch positive budget
+            nP_max = min(pos_g.numel()*reuse, n) if target_pos_frac > 0. else 0
+            nP_tot += nP_max
 
-            # Call your sampler
-            pos_pool, neg_plan, updated_unused_neg_subset = self.sample_positives_negatives(
-                pos_idx=pos_g,
-                neg_idx=neg_g,
-                nP_tot=nP_max,
-                n=n_chunk,
+            pos_pool, neg_plan, rem = self.sample_positives_negatives(
+                pos_idx=pos_g, neg_idx=neg_g,
+                n=n+nN_min, nP_tot=nP_max,
                 max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,
                 sticky_frac=sticky_frac,
                 unused_neg_subset=unused_neg_g,
                 seed=gseed,
             )
+
             selected = torch.cat([pos_pool, neg_plan])
-            b_size = min(n, self.batch_size)
-            chunks = torch.sort(selected).values.split(b_size)
-            batches.extend(chunks)
-            unused.extend(updated_unused_neg_subset)
-            
-        nepochs = self.epochs_until_full_coverage(neg_idx.numel(), n*(1-target_pos_frac), sticky_frac)
-        unused = torch.stack(unused)
+            # don’t sort—preserve randomness, save time
+            b_size = min(n+nN_min, self.batch_size)
+            batches.extend(selected.split(b_size))
+            unused.append(rem)
+
+        unused = torch.cat(unused) if unused else neg_idx.new_empty((0,), dtype=torch.long)
+        nepochs = self.epochs_until_full_coverage(neg_idx.numel(), int((n+nN_min)*(1-target_pos_frac))*len(batches), sticky_frac)
         meta = {"batch_size": b_size, "num_batches": len(batches),
-                "pos_frac": target_pos_frac, "num_epochs": nepochs}
-        
+                "pos_frac": (nP_tot / max(1, (b_size * len(batches)))), "num_epochs": nepochs}
         return batches, unused, meta
     
     @staticmethod
@@ -211,7 +202,7 @@ class Sampler():
         epochs = 1 + (n_neg_total / n_neg_per_epoch - 1) / (1.0 - sticky_frac)
         return math.ceil(epochs)
 
-    def _plan_batches(self,
+    def build_batches_with_posneg_ratio(self,
         y: torch.Tensor,
         target_pos_frac: float,
         max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
@@ -221,10 +212,12 @@ class Sampler():
     ):
         assert self.batch_size >= 2
         n_total = y.shape[0]
+
         pos_mask = self.get_positive_indices(y)
         pos_idx, neg_idx = pos_mask.nonzero(as_tuple=False).view(-1), (~pos_mask).nonzero(as_tuple=False).view(-1)
 
         nP, nN = pos_idx.numel(), neg_idx.numel()
+
         if nP == 0 or nN == 0:
             raise ValueError("Both classes required.")
         # batches to roughly cover n_total rows

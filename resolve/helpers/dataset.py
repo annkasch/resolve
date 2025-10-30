@@ -42,20 +42,26 @@ class InMemoryIterableData(IterableDataset):
         self._normalizer = normalizer
         self.sampler = Sampler(self.batch_size, positive_condition, shuffle=self.shuffle, seed=self.seed, device=self.device)
 
+        self.state = None
+        self.meta = {}
+
         # load all data into memory
         theta, phi, y, fidx = self._load_data_to_mem(self.files, self.as_float32, self.parameter_config)
         
         self.data = self._set_data(theta, phi, y, fidx)
         
-        # get positive indices
-        pos_mask = self.sampler.get_positive_indices(y)
-        positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
-        print("positives ratio ", positive_ratio_data)
-        self.state = None
-        self.set_batch_schedule(target_pos_frac=self.dataset_config.get("positive_ratio_train", None), max_pos_reuse_per_epoch = self.dataset_config.get("max_positive_reuse",0.), sticky_frac = 0.25, seed=self.dataset_config.get("seed",12345))
+        
+
+        if not isinstance(self.dataset_config.get('positive_ratio_train'), list):
+            self.set_batch_schedule(target_pos_frac=self.dataset_config.get("positive_ratio_train", None), max_pos_reuse_per_epoch = self.dataset_config.get("max_positive_reuse",0.), sticky_frac = 0.25, seed=self.dataset_config.get("seed",12345))
+        
 
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
         data = {}
+
+        pos_mask = self.sampler.get_positive_indices(y)
+        positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
+
         if self.mode == "train":
             # apply normalization
             self._normalizer = Normalizer(self.dataset_config.get("use_feature_normalization", None))
@@ -84,28 +90,25 @@ class InMemoryIterableData(IterableDataset):
                         use_beta=self.dataset_config.get('use_beta', None),
                         margin=float(self.dataset_config.get('mixup_margin', 0.0))
                     )
-
+            batches, self.status, self.meta = self.sampler.build_batches(phi.shape[0])
+            self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
 
             data = {
-                "train": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx, "batches": None},
-                "test": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": None},
-                "validate": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": None}
+                "train": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx, "batches": batches},
+                "test": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": self.sampler.build_batches(phi_test.shape[0])[0]},
+                "validate": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": self.sampler.build_batches(phi_val.shape[0])[0]}
             }
-        elif self.mode == "test":
+
+        else:
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
             phi = self._normalizer.transform(x=phi, feature_grp="phi")
             if self.as_float32:
                 theta = theta.float(); phi = phi.float()
+            batches, self.status, self.meta = self.sampler.build_batches(phi.shape[0])
+            self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
+
             data = {
-                "test": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": None},
-            }
-        elif self.mode == "predict":
-            theta = self._normalizer.transform(x=theta, feature_grp="theta")
-            phi = self._normalizer.transform(x=phi, feature_grp="phi")
-            if self.as_float32:
-                theta = theta.float(); phi = phi.float()
-            data = {
-                "predict": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": None},
+                f"{self.mode}": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": batches},
             }
 
         return data
@@ -118,27 +121,20 @@ class InMemoryIterableData(IterableDataset):
     ):
 
         # train sets the batch size and needs to be processed first
-        if target_pos_frac != None:
-            """
-            self.data["train"]["batches"], self.state, self.meta = self.sampler.build_batches_with_target_pos_frac(
-                self.data["train"]["theta"],
+        if self.mode == "train" and target_pos_frac != None and self.dataset_config.get('mixup_ratio', 0.) == 0.0:
+            
+            self.data["train"]["batches"], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
+                self.data["train"]["file_indices"],
                 self.data["train"]["y"],
                 target_pos_frac=target_pos_frac,
                 max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
                 sticky_frac=sticky_frac,
                 unused_neg_subset=self.state
             )
-            """
-            self.data["train"]["batches"], self.state, self.meta = self.sampler._plan_batches(
-                y=self.data["train"]["y"],
-                target_pos_frac=target_pos_frac,
-                max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
-                sticky_frac=sticky_frac,
-                last_neg_subset=self.state,
-                seed=seed
-            )
+
+            print(self.meta)
         else:
-            self.data["train"]["batches"], self.state, self.meta = self.sampler.build_batches(self.data["train"]["phi"].shape[0])
+            self.data[self.mode]["batches"], self.state, self.meta = self.sampler.build_batches(self.data[self.mode]["phi"].shape[0])
             
     @staticmethod
     def _read_in_from_file(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
