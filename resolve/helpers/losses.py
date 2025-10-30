@@ -126,14 +126,21 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         # Focal term
         focal_term = weight * base
 
-        # False-positive penalty for negatives: (ReLU(p - tau_fp))^2
+        # Start from the base loss
+        loss = focal_term.clone()
+
+        # ----- False-positive penalty (existing) -----
         if self.lambda_fp > 0.0 and neg_mask.any():
-            overshoot = torch.relu(self.p[neg_mask] - self.tau_fp)
-            penalty = overshoot ** 2 #a smooth, differentiable penalty that grows quadratically with the model’s confidence in the wrong direction
-            loss = focal_term.clone()
-            loss[neg_mask] = loss[neg_mask] + self.lambda_fp * penalty
-        else:
-            loss = focal_term
+            overshoot_fp = torch.relu(self.p[neg_mask] - self.tau_fp)
+            penalty_fp = overshoot_fp ** 2
+            loss[neg_mask] = loss[neg_mask] + self.lambda_fp * penalty_fp
+
+        # ----- False-negative penalty (new) -----
+        # penalize positives that fall below tau_fn
+        #if self.lambda_fp > 0.0 and pos_mask.any():
+        #    shortfall_fn = torch.relu(self.tau_fp - self.p[pos_mask])
+        #    penalty_fn = shortfall_fn #** 2
+        #    loss[pos_mask] = loss[pos_mask] + self.lambda_fp * penalty_fn
         
         if self.lambda_tp > 0.0 and pos_mask.any():
             overshoot = torch.relu(self.p[pos_mask] - self.tau_tp)

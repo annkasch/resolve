@@ -210,6 +210,9 @@ class Trainer:
         targets = _to_dev(targets, device)
         context = _to_dev(context, device)
         query   = _to_dev(query, device)
+
+        if not (query.theta == query.theta[:, :1, :]).all():
+            print("not all constant")
         output = self.model(
             query_theta=query.theta, query_phi=query.phi,
             context_theta=context.theta, context_phi=context.phi, context_y=context.y,
@@ -235,10 +238,11 @@ class Trainer:
             output, targets = self._forward_batch(batch, device)
 
             logit = output.get("logits", None)
+            if logit[0].dim() == 3:  # (B,T,M)
+                logit[0] = logit[0].mean(dim=2)
             kl_term = output.get("kl_term", 0.0)
             add_loss = output.get("loss", 0.0)
             
-
             _, query, _ = batch
             query_x = torch.cat([query.theta, query.phi], dim=2)
 
@@ -468,14 +472,6 @@ class Trainer:
             plt.xlabel("Signal Efficiency")
             plt.ylabel("Background Efficiency")
             writer.add_figure(f'plot/roc_curve_{dataset_name}', fig, global_step=epoch)
-            # random baseline = positive class fraction
-
-            #plt.axhline(m_v["precision_recall_curve"][2], color='k', linestyle='--', label=f"Random (Precision={m_v['precision_recall_curve'][2]:.2f})")
-
-            
-            
-
-
 
         score = m_v.get(monitor.lower(), m_v.get(monitor, float("nan")))
         return score

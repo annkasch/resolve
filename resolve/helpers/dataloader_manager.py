@@ -20,7 +20,7 @@ def running_average(batch_sum, batch_count, mean, I):
     I += batch_count
     return mean
 
-class DataGeneration:
+class DataLoaderManager:
     def __init__(self, mode, config_file):
         self.mode = mode
         self.config_file = config_file
@@ -53,8 +53,7 @@ class DataGeneration:
     def _get_hdf5_files(self, path_to_files):
         return sorted(str(p) for p in path_to_files.glob(f"*.{self.config_file['simulation_settings']['file_format']}"))
 
-    
-    def set_dataset(self, normalizer=Normalizer(), shuffle = True):
+    def set_dataset(self, normalizer=Normalizer(), shuffle = "global"):
         dataset_config = self.config_file["model_settings"]["train"]["dataset"]
 
         self.dataset = InMemoryIterableData(
@@ -71,12 +70,17 @@ class DataGeneration:
                 mode=self.mode
             )
 
-    def set_loader(self, mode="train", shuffle=True):
-
-        if self.dataset == None:
-            self.set_dataset(shuffle=shuffle)
+    def set_loader(self, mode="train", shuffle=None):
+        if self.dataset is None:
+            # Pass shuffle only if explicitly provided
+            if shuffle is not None:
+                self.set_dataset(shuffle=shuffle)
+            else:
+                self.set_dataset()
         else:
-            self.dataset.shuffle = shuffle
+            # Only change shuffle if provided
+            if shuffle is not None:
+                self.dataset.shuffle = shuffle
             
         self.dataset.set_mode(mode)
         self.dataloader = DataLoader(

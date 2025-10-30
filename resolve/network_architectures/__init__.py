@@ -6,3 +6,4 @@ from .conditional_neural_process_model import ConditionalNeuralProcess
 from .autoencoder import Autoencoder
 from .isolation_forest import IsolationForestWrapper
 from .variational_auotencoder import VariationalAutoencoder
+from .marginalized_neural_ratio_estimator import MarginalizedNeuralRatioEstimator
