@@ -355,7 +355,7 @@ class Sampler():
 
             return pos
     
-    def mix_by_theta_chunks(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor, *,
+    def mix_by_file_chunks(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor, mixup_ratio: float, *,
                         use_beta: Optional[Tuple[float, float]]=(1.,1.),
                         margin: float=0.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -391,11 +391,10 @@ class Sampler():
             
             # Apply mixing to this chunk
             theta_m, phi_m, y_m = self._mix_negatives_positives(theta_chunk, phi_chunk, y_chunk,
-                                                    positive_fn=self.positive_fn,
                                                     use_beta=use_beta,
                                                     margin=margin,
                                                     seed=self.seed,
-                                                    mix_ratio=self.dataset_config.get('mixup_ratio'))
+                                                    mix_ratio=mixup_ratio)
 
             theta_mixed.append(theta_m)
             phi_mixed.append(phi_m)
