@@ -79,12 +79,10 @@ class InMemoryIterableData(IterableDataset):
             
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
 
-                theta_train, phi_train, y_train, fidx_train = self.shuffler.mix_by_file_chunks(
-                        theta_train, phi_train, y_train, fidx_train,
-                        positive_fn=self.positive_fn,
+                theta, phi, y, fidx = self.sampler.mix_by_file_chunks(
+                        theta, phi, y, fidx,self.dataset_config.get('mixup_ratio'),
                         use_beta=self.dataset_config.get('use_beta', None),
-                        margin=float(self.dataset_config.get('mixup_margin', 0.0)),
-                        seed=int(self.dataset_config.get('seed', 12345))
+                        margin=float(self.dataset_config.get('mixup_margin', 0.0))
                     )
 
 
@@ -342,48 +340,11 @@ class InMemoryIterableData(IterableDataset):
         theta = self.data[mode].get("theta", None)
         y     = self.data[mode].get("y", None)
 
-        n = phi.shape[0]
-        if n == 0:
-            raise IndexError("Empty dataset")
+        idx = self.data[model]["batches"][i]
+        theta_batch, phi_batch, y_batch = theta.index_select(0, idx), phi.index_select(0, idx), y.index_select(0, idx)
+        batch = self._format_batch(theta_batch, phi_batch, y_batch)
+        return batch
 
-        
-
-        # worker slice
-        s, e = self._compute_worker_slice(n)
-        if s >= e:
-            raise IndexError("Empty shard for this worker")
-
-        shard = perm[s:e]
-        bs = self.batch_size
-
-        # batch count within this shard
-        total_batches = (shard.numel() + bs - 1) // bs
-        if i < 0:
-            i = total_batches + i
-        if i < 0 or i >= total_batches:
-            raise IndexError(f"Batch index {i} out of range [0, {total_batches-1}]")
-
-        # indices for the i-th batch inside the shard
-        start = i * bs
-        end   = min(start + bs, shard.numel())
-        idx = shard[start:end]
-
-        # index on the same device as source tensors
-        idx_dev = idx.to(device=phi.device, dtype=torch.long)
-
-        phib = phi.index_select(0, idx_dev)
-        thetab = theta.index_select(0, idx_dev) if theta is not None else None
-        yb     = y.index_select(0, idx_dev)     if y     is not None else None
-
-        # optional move to target device (preserve your iteration behavior)
-        move_to = dev if dev is not None else getattr(self, "device", None)
-        if move_to is not None:
-            phib = phib.to(move_to, non_blocking=True)
-            if thetab is not None: thetab = thetab.to(move_to, non_blocking=True)
-            if yb     is not None: yb     = yb.to(move_to, non_blocking=True)
-
-        # match your iterator’s output packing
-        return self._format_batch(thetab, phib, yb)
 
     def close(self):
         """Delete all tensors and arrays from memory to free up resources."""
