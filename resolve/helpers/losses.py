@@ -119,16 +119,13 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         """
         # Normalize inputs and devices
         z_list = self._ensure_container(logits)
-        z0 = z_list[0]
-        y=targets_y
-        x= targets_x
+        y= targets_y
 
-        # Base per-sample loss and probability-like output
-        base_loss, p = self.base_loss_fn(z_list, y, x=x)
-        # base_loss: (N,), p: (N,) probabilities
-        base_loss = base_loss.reshape(-1)
-        p = p.reshape(-1)
-        self.p = p  # expose for metrics when needed
+        # Base per-sample loss (N,)
+        base_loss, self.p = self.base_loss_fn(z_list, targets_y, x=targets_x)
+        
+        # Masks (allow slightly fuzzy labels; >=0.5 -> positive)
+        y = targets_y.view(-1).float()
         
         # Masks (>= tau_tp is positive)
         pos_mask = (y >= self.tau_tp)
@@ -142,7 +139,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
 
         # Focal term
         loss = weight * base_loss  # (N,)
-
+        
         # False-positive penalty on negatives
         if self.lambda_fp > 0.0:
             #overshoot_fp = torch.relu(p[neg_mask] - self.tau_fp)
@@ -158,7 +155,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
             overshoot_tp = (p - self.tau_tp).relu()
             reward_tp = overshoot_tp.square() * y
             loss = loss - (self.lambda_tp * reward_tp)
-        
+
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
