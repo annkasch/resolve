@@ -328,7 +328,7 @@ class HCTargetAttnNP(nn.Module):
         # 5) ComparatorHead: prototype interactions for sharper separation
         #feats = torch.cat([z_t, r_pos.expand_as(z_t), r_neg.expand_as(z_t), z_t*(r_pos-r_neg).expand_as(z_t)], dim=-1)
         # cosine similarity (B,Nt)
-        #cos = torch.nn.functional.cosine_similarity(r_pos, r_neg, dim=-1)
+        cos = torch.nn.functional.cosine_similarity(r_pos, r_neg, dim=-1)
         #print("cos mean:", cos.mean().item(), "cos p95:", cos.quantile(0.95).item())
         # relative L2 gap (B,Nt)
         #rel = (r_pos - r_neg).norm(dim=-1) / (0.5*(r_pos.norm(dim=-1)+r_neg.norm(dim=-1))+1e-8)
@@ -338,7 +338,8 @@ class HCTargetAttnNP(nn.Module):
         logit = self.decoder(z_t)                         # (B,Nt,1)
 
         output = {
-            "logits": [logit]
+            "logits": [logit],
+            "cosine_sim": cos,
         }
         
         return output

@@ -73,7 +73,7 @@ class MarginalizedNeuralRatioEstimator(nn.Module):
         else:
             raise ValueError(f"query_phi must be (B,T,d_phi) or (B,T,M,d_phi), got shape {tuple(query_phi.shape)}")
 
-    def forward(self, query_theta, query_phi, phi_log_weights=None, phi_mask=None, **kwargs):
+    def forward(self, query_theta, query_phi, target_y, phi_log_weights=None, phi_mask=None, **kwargs):
         """
         Args:
             query_theta: (B, T, d_theta)
@@ -115,6 +115,7 @@ class MarginalizedNeuralRatioEstimator(nn.Module):
             if phi_log_weights.shape != (B, T, M):
                 raise ValueError(f"phi_log_weights must be (B,T,M), got {tuple(phi_log_weights.shape)}")
 
+        phi_mask = target_y > 0.5
         if phi_mask is not None:
             # Masked positions get -inf log-weight so they drop out of log-sum-exp
             if phi_mask.shape != (B, T, M):
