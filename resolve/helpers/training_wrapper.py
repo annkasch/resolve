@@ -221,8 +221,6 @@ class Trainer:
         context = _to_dev(context, device, non_blocking=nb)
         query   = _to_dev(query, device, non_blocking=nb)
 
-        if not (query.theta == query.theta[:, :1, :]).all():
-            print("not all constant")
         output = self.model(
             query_theta=query.theta, query_phi=query.phi,
             context_theta=context.theta, context_phi=context.phi, context_y=context.y,
