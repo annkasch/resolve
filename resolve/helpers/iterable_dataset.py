@@ -18,8 +18,8 @@ import functools
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
 
-ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
-QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi"))
+ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y", "theta_cell"))
+QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi", "theta_cell"))
 
 BatchCollection = collections.namedtuple(
     "BatchCollection",
@@ -45,6 +45,9 @@ class InMemoryIterableData(IterableDataset):
 
         # load all data into memory
         theta, phi, y, fidx = self._load_data_to_mem(self.files, self.parameter_config)
+        
+        self.theta_to_id = self.sampler.get_unique_ids(theta)
+
         
         self.data = self._set_data(theta, phi, y, fidx)
         
@@ -129,7 +132,8 @@ class InMemoryIterableData(IterableDataset):
             print(self.meta)
         else:
             self.data[self.mode]["batches"], self.state, self.meta = self.sampler.build_batches(self.data[self.mode]["phi"].shape[0])
-            
+    
+
     @staticmethod
     def _read_in_from_file(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         if file_path.endswith(('.h5', '.hdf5')):
@@ -318,14 +322,15 @@ class InMemoryIterableData(IterableDataset):
         def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
         theta_ctx, phi_ctx, y_ctx  = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx))
         self.theta_query, self.phi_query, y_tgt = map(ensure_3d, (self.theta_query, self.phi_query, y_tgt))
+
+        ctx_theta_cell = self.sampler.to_cell(theta_ctx[0],10).to(torch.float32)
+        qry_theta_cell = self.sampler.to_cell(self.theta_query[0],10).to(torch.float32)
         
         return BatchCollection(
-            context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous()),
-            query=QuerySet(theta=self.theta_query.contiguous(), phi=self.phi_query.contiguous()),
+            context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous(), theta_cell=ctx_theta_cell.contiguous()),
+            query=QuerySet(theta=self.theta_query.contiguous(), phi=self.phi_query.contiguous(), theta_cell=qry_theta_cell.contiguous()),
             target_y=y_tgt.contiguous(),
         )
-    
-
 
     def close(self):
         """Delete all tensors and arrays from memory to free up resources."""

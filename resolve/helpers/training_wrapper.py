@@ -1,4 +1,5 @@
 
+from multiprocessing import context
 import os, time
 import gc
 from turtle import Turtle
@@ -221,10 +222,12 @@ class Trainer:
         context = _to_dev(context, device, non_blocking=nb)
         query   = _to_dev(query, device, non_blocking=nb)
 
+
+
         output = self.model(
             query_theta=query.theta, query_phi=query.phi,
             context_theta=context.theta, context_phi=context.phi, context_y=context.y,
-            target_y=targets
+            target_y=targets, qry_theta_cell=query.theta_cell, return_ctx_for_write=True,
         )
 
         return output, targets
@@ -253,7 +256,7 @@ class Trainer:
                 kl_term = output.get("kl_term", 0.0)
                 add_loss = output.get("loss", 0.0)
                 
-                _, query, _ = batch
+                context, query, _ = batch
                 query_x = torch.cat([query.theta, query.phi], dim=2)
 
                 # Keep loss numerically stable: do loss in fp32 if needed
@@ -269,7 +272,7 @@ class Trainer:
 
             if train and self.criterion.base_loss_fn is not skip_loss:
                 if self.scaler.is_enabled():  # fp16 path
-                    self.scaler.scale(loss_val).backward()
+                    self.scaler.scale(loss).backward()
                 else:  # bf16 or no-AMP
                     loss.backward()
 
@@ -280,23 +283,38 @@ class Trainer:
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-
+            
+            # --- memory write: POSITIVES ONLY (proof of principle) ---
+            with torch.no_grad():
+                R_ctx   = output["R_ctx_for_write"]                  # on model device
+                ctx_theta_cell = _to_dev(context.theta_cell, device)
+                y_write = _to_dev(context.y, device)
+                #k_write = self.model.build_mem_keys(ctx_theta, R_ctx)
+                y_write = context.y
+                #print(context.theta.shape)
+                self.model.memory.write(k=R_ctx, theta_cell=ctx_theta_cell, y=y_write)
+            
+            #with torch.no_grad():
+            #    occ = self.model.memory.pos_mask.sum(dim=1).float().mean().item()
+            #print(f"mean pos protos per θ-cell: {occ:.2f}")
+            
             running_loss += float(loss.detach().cpu())
-            y_true_all.append(targets.reshape(-1))
+            #y_true_all.append(targets.reshape(-1))
             
-            if self.criterion.base_loss_fn is recon_loss_mse: 
-                y_pred_all.append(self.criterion.p.detach())
-            elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
-                y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
-            else:
-                y_pred_all.append(logit[0].reshape(-1))
+            #if self.criterion.base_loss_fn is recon_loss_mse: 
+            #    y_pred_all.append(self.criterion.p.detach())
+            #elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
+            #    y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
+            #else:
+            #    y_pred_all.append(logit[0].reshape(-1))
             
-            pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
+            pbar.set_postfix(loss=f"{running_loss/(i+1):.4f}")
+            #pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
 
-        y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
-        y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
+        #y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
+        #y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
         avg_loss = running_loss / max(1, len(y_true_all))
-        return avg_loss, y_true, y_pred
+        return avg_loss#, y_true, y_pred
 
     def fit(
         self,
@@ -313,6 +331,10 @@ class Trainer:
 
         device = _device()
         self.model.to(device)
+        # move memory buffers once; do NOT call .to(device) again in the loop
+        self.model.memory.to(device)
+
+        
         if isinstance(self.criterion, torch.nn.Module):
             self.criterion.to(device)
         

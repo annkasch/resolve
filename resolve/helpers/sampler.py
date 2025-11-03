@@ -31,6 +31,26 @@ class Sampler():
     def _epoch_seed(self) -> int:
         if not hasattr(self, '_epoch_counter'): self._epoch_counter = 0
         s = self.seed + self._epoch_counter; self._epoch_counter += 1; return s
+    
+    @staticmethod
+    def get_unique_ids(x):
+        if x.ndim == 1:
+            unique_x, inverse = torch.unique(x, return_inverse=True)
+        else:
+            unique_x, inverse = torch.unique(x, dim=0, return_inverse=True)
+
+        x_to_id = {tuple(t.tolist()): i for i, t in enumerate(unique_x)}
+
+        return x_to_id
+    
+    def to_cell(self, x_norm, num_bins):
+
+        t = x_norm.clamp(0.0, 1.0)
+        idx = torch.round(t * (num_bins-1)).long()  # 0..num_bins-1 per dim
+        to_cell = 0
+        for i in range(t.shape[1]):
+            to_cell += idx[:,i] * num_bins**(t.shape[1]-1-(i))
+        return to_cell
 
     def sample_positives_negatives(
         self,
