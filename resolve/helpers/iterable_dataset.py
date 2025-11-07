@@ -323,8 +323,8 @@ class InMemoryIterableData(IterableDataset):
         theta_ctx, phi_ctx, y_ctx  = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx))
         self.theta_query, self.phi_query, y_tgt = map(ensure_3d, (self.theta_query, self.phi_query, y_tgt))
 
-        ctx_theta_cell = self.sampler.to_cell(theta_ctx[0],10).to(torch.float32)
-        qry_theta_cell = self.sampler.to_cell(self.theta_query[0],10).to(torch.float32)
+        ctx_theta_cell = self.sampler.to_cell(theta_ctx[0],1).to(torch.float32)
+        qry_theta_cell = self.sampler.to_cell(self.theta_query[0],1).to(torch.float32)
         
         return BatchCollection(
             context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous(), theta_cell=ctx_theta_cell.contiguous()),

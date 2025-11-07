@@ -18,6 +18,7 @@ class MemoryBank(nn.Module):
         self.J_neg = J_neg
         self.alpha = alpha
         self.tau_assign = tau_assign
+        self.min_seed = J_pos
         #self.device = device
 
         # Prototypes (C, J, D); valid counts per cell
@@ -28,10 +29,45 @@ class MemoryBank(nn.Module):
 
     @torch.no_grad()
     def _assign_and_update(self, table, mask, k, cell, is_pos: bool):
-        """
-        table: (C,J,D), mask: (C,J)
-        k: (D,), cell: int
-        """
+        C, J, D = table.shape
+        entries = table[cell]              # (J, D)
+        valid   = mask[cell]               # (J,)
+        valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)   # (J_valid,)
+        J_valid = valid_idx.numel()
+
+        # --- seeding phase: fill free slots first ---
+        if J_valid < self.min_seed:
+            free_idx = torch.nonzero(~valid, as_tuple=False).squeeze(1)
+            if free_idx.numel() > 0:
+                j_new = int(free_idx[0].item())  # choose first free slot (or round-robin; see §3)
+                entries[j_new].copy_(F.normalize(k, dim=0))
+                mask[cell, j_new] = True
+            return
+
+        # --- normal phase: compute similarity, decide update vs insert ---
+        entries_v = torch.index_select(entries, 0, valid_idx)        # (J_valid, D)
+        sims = torch.mv(entries_v, k.contiguous())                   # (J_valid,)
+        j_local = int(torch.argmax(sims))
+        best_sim = float(sims[j_local])
+        j = int(valid_idx[j_local])                                  # map back to [0, J)
+
+        # create new if not similar enough and capacity available
+        if best_sim < self.tau_assign and J_valid < J:
+            free_idx = torch.nonzero(~valid, as_tuple=False).squeeze(1)
+            if free_idx.numel() > 0:
+                j_new = int(free_idx[0].item())
+                entries[j_new].copy_(F.normalize(k, dim=0))
+                mask[cell, j_new] = True
+            return
+
+        # otherwise EMA-update nearest (in-place)
+        proto = entries[j]                                  # view
+        proto.mul_(self.alpha).add_(k, alpha=(1.0 - self.alpha))
+        proto.div_(proto.norm(p=2).clamp_min_(1e-12))
+    
+    """
+    @torch.no_grad()
+    def _assign_and_update(self, table, mask, k, cell, is_pos: bool):
 
         entries = table[cell]                                  # (J,D)
         valid = mask[cell]                                     # (J,)
@@ -46,15 +82,20 @@ class MemoryBank(nn.Module):
 
         # create new if no valid or too dissimilar and capacity available
         if (not valid.any() or best_sim < self.tau_assign) and valid.sum().item() < entries.size(0):
-            j_new = torch.argmax(~valid).item()               # first free slot
+            #j_new = torch.argmax(~valid).item()               # first free slot
+            free_idx = torch.nonzero(~valid, as_tuple=False).squeeze(1)
+            if free_idx.numel() > 0:
+                j_new = free_idx[0].item()  # first free slot
+            else:
+                return  # no free slot available
             table[cell, j_new] = F.normalize(k, dim=0)
-            #mask[cell, j_new] = True
+            mask[cell, j_new] = True
             return
         # otherwise EMA-update nearest
         if j is not None:
             proto = table[cell, j]
             proto.copy_(F.normalize(self.alpha * proto + (1 - self.alpha) * k, dim=0))
-
+    """
     @torch.no_grad()
     def write(self, k: torch.Tensor, theta_cell: torch.Tensor, y: torch.Tensor, is_hard_neg: torch.Tensor=None):
         """
@@ -85,8 +126,8 @@ class MemoryBank(nn.Module):
             yi = float(ys[i].item())
             if yi >= 0.5:
                 self._assign_and_update(self.pos, self.pos_mask, key, cell, True)
-            #elif is_hard_neg[i].item():
-            #    self._assign_and_update(self.neg, self.neg_mask, key, cell, False)
+            elif is_hard_neg[i].item():
+                self._assign_and_update(self.neg, self.neg_mask, key, cell, False)
 
 
     def _gather_cell_protos(self, table, mask, cells):
@@ -130,11 +171,14 @@ class MemoryBank(nn.Module):
 
             # ---- positives ----
             mpos = self.pos_mask[c]  # (Jp,)
+            #print(mpos.sum().item())
+
             if mpos.any():
                 P = self.pos[c, mpos]                    # (Jp,D)
                 sims = (q_flat[idx] @ P.t()) / tau       # (M,Jp)
                 k = min(K_pos, sims.size(1))
                 vals, ids = torch.topk(sims, k=k, dim=1)
+                #print(vals, ids)
                 w = torch.softmax(vals, dim=1)           # (M,k)
                 P_sel = P[ids]                           # (M,k,D)
                 rpos_flat[idx] = (w.unsqueeze(-1) * P_sel).sum(1)

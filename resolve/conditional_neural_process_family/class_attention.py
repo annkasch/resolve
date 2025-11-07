@@ -20,7 +20,7 @@ class GlobalContextAttention(nn.Module):
         B, N, D = x.shape
         return x.view(B, N, self.n_heads, self.d_k).transpose(1, 2)  # (B,H,N,d_k)
 
-    def forward(self, Q_src, K_src, V_src=None, value_weights=None, mask=None):
+    def attention(self, Q_src, K_src, V_src=None, value_weights=None, mask=None):
         
         #Q_src: (B, Nt, D)  - from targets (R^{(t)})
         #K_src: (B, Nc, D)  - from context
@@ -28,10 +28,12 @@ class GlobalContextAttention(nn.Module):
         #value_weights: (B, Nc) broadcast onto V
 
         if V_src is None: V_src = K_src
+        Wk = self.Wk(K_src)
+        Wv = self.Wv(V_src)
 
         Q = self._split(self.Wq(Q_src))          # (B,H,Nt,d_k)
-        K = self._split(self.Wk(K_src))          # (B,H,Nc,d_k)
-        V = self._split(self.Wv(V_src))          # (B,H,Nc,d_k)
+        K = self._split(Wk)          # (B,H,Nc,d_k)
+        V = self._split(Wv)          # (B,H,Nc,d_k)
 
         # scores and softmax (one time)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)  # (B,H,Nt,Nc)
@@ -46,7 +48,32 @@ class GlobalContextAttention(nn.Module):
 
         B, H, Nt, d_k = context.shape
         context = context.transpose(1, 2).contiguous().view(B, Nt, H*d_k)
-        return self.out(context)                 # (B,Nt,D)
+        return self.out(context), Wk, Wv                 # (B,Nt,D)
+    
+    def forward(self, Q_src, K_src_pos, K_src_neg, V_src_pos=None, value_weights_pos=None, V_src_neg=None, value_weights_neg=None ):
+        r_pos, Wk_pos, Wv_pos = self.attention(Q_src, K_src_pos, V_src=None, value_weights=None)
+        r_neg, Wk_neg, Wv_neg = self.attention(Q_src, K_src_neg, V_src=None, value_weights=None)
+
+        loss = self.l_proj_param(Wk_pos[0], Wk_neg[0], Wv_pos[0], Wv_neg[0], normalize=True, eps=1e-12)
+        return r_pos, r_neg, loss
+
+
+
+
+    def l_proj_param(self, Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
+        # W*: [d_k, d_in] as in nn.Linear(out=d_k, in=d_in).weight
+        def cross_gram(Wa, Wb):
+            return Wa @ Wb.t()  # [d_k, d_k]
+
+        Gk = cross_gram(Wk_pos, Wk_neg)
+        Gv = cross_gram(Wv_pos, Wv_neg)
+
+        if normalize:
+            nk = (Wk_pos.norm(p='fro') * Wk_neg.norm(p='fro')).clamp_min(eps)
+            nv = (Wv_pos.norm(p='fro') * Wv_neg.norm(p='fro')).clamp_min(eps)
+            return (Gk.pow(2).sum() / nk) + (Gv.pow(2).sum() / nv)
+        else:
+            return Gk.pow(2).sum() + Gv.pow(2).sum()
 
 class GlobalContextAttentionDual(nn.Module):
     """

@@ -256,6 +256,7 @@ class Trainer:
                 kl_term = output.get("kl_term", 0.0)
                 add_loss = output.get("loss", 0.0)
                 
+                
                 context, query, _ = batch
                 query_x = torch.cat([query.theta, query.phi], dim=2)
 
@@ -269,6 +270,7 @@ class Trainer:
                     logit32, targets32, qx32 = logit[0], targets, query_x
 
                 loss = self.criterion([logit32], targets32, targets_x=qx32) + kl_term + add_loss
+                #print(self.criterion([logit32], targets32, targets_x=qx32), add_loss, loss)
 
             if train and self.criterion.base_loss_fn is not skip_loss:
                 if self.scaler.is_enabled():  # fp16 path
@@ -285,36 +287,36 @@ class Trainer:
                     optimizer.zero_grad(set_to_none=True)
             
             # --- memory write: POSITIVES ONLY (proof of principle) ---
-            with torch.no_grad():
-                R_ctx   = output["R_ctx_for_write"]                  # on model device
-                ctx_theta_cell = _to_dev(context.theta_cell, device)
-                y_write = _to_dev(context.y, device)
-                #k_write = self.model.build_mem_keys(ctx_theta, R_ctx)
-                y_write = context.y
-                #print(context.theta.shape)
-                self.model.memory.write(k=R_ctx, theta_cell=ctx_theta_cell, y=y_write)
+            if train:
+                with torch.no_grad():
+                    R_ctx   = output["R_ctx_for_write"]                  # on model device
+                    ctx_theta_cell = _to_dev(context.theta_cell, device)
+                    y_write = _to_dev(context.y, device)
+                    #k_write = self.model.build_mem_keys(ctx_theta, R_ctx)
+                    y_write = context.y
+                    #print(context.theta.shape)
+                    self.model.memory.write(k=R_ctx, theta_cell=ctx_theta_cell, y=y_write)
             
             #with torch.no_grad():
             #    occ = self.model.memory.pos_mask.sum(dim=1).float().mean().item()
             #print(f"mean pos protos per θ-cell: {occ:.2f}")
             
             running_loss += float(loss.detach().cpu())
-            #y_true_all.append(targets.reshape(-1))
+            y_true_all.append(targets.reshape(-1))
             
-            #if self.criterion.base_loss_fn is recon_loss_mse: 
-            #    y_pred_all.append(self.criterion.p.detach())
-            #elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
-            #    y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
-            #else:
-            #    y_pred_all.append(logit[0].reshape(-1))
+            if self.criterion.base_loss_fn is recon_loss_mse: 
+                y_pred_all.append(self.criterion.p.detach())
+            elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
+                y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
+            else:
+                y_pred_all.append(logit[0].reshape(-1))
             
-            pbar.set_postfix(loss=f"{running_loss/(i+1):.4f}")
-            #pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
+            pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
 
-        #y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
-        #y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
+        y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
+        y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
         avg_loss = running_loss / max(1, len(y_true_all))
-        return avg_loss#, y_true, y_pred
+        return avg_loss, y_true, y_pred
 
     def fit(
         self,

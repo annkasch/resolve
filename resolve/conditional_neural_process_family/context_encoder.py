@@ -58,7 +58,7 @@ class ContextConditionalEncoder(nn.Module):
         self.theta_enc = ThetaEncoder(theta_in_dim, [], theta_embed_dim)
 
         if self.mode == "concat":
-            in_dim = phi_dim + y_dim + theta_embed_dim
+            in_dim = theta_in_dim + phi_dim + y_dim
             # allow empty hidden
             layers = [in_dim] + (hidden or []) + [out_dim]
             self.content = MLP(layers)
@@ -83,14 +83,14 @@ class ContextConditionalEncoder(nn.Module):
 
     def forward(self, context_phi, context_y, context_theta):
         B, Nc, _ = context_phi.shape
-        theta_emb = self.theta_enc(context_theta)                       # (B,Nc,Eθ)
-
+        
         if self.mode == "concat":
-            x = torch.cat([context_phi, context_y, theta_emb], dim=-1)        # (B,Nc,·)
+            x = torch.cat([context_theta, context_phi, context_y], dim=-1)        # (B,Nc,·)
             out = self.content(x.view(B * Nc, -1)).view(B, Nc, -1)
             return self.norm(out)
 
         # FiLM path
+        theta_emb = self.theta_enc(context_theta)                       # (B,Nc,Eθ)
         h = torch.cat([context_phi, context_y], dim=-1).view(B * Nc, -1)      # (B*Nc, d)
         cond = theta_emb.view(B * Nc, -1)                         # (B*Nc, Eθ)
         for lin, film in zip(self.feature_layers, self.film_layers):
