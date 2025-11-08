@@ -51,8 +51,8 @@ class GlobalContextAttention(nn.Module):
         return self.out(context), Wk, Wv                 # (B,Nt,D)
     
     def forward(self, Q_src, K_src_pos, K_src_neg, V_src_pos=None, value_weights_pos=None, V_src_neg=None, value_weights_neg=None ):
-        r_pos, Wk_pos, Wv_pos = self.attention(Q_src, K_src_pos, V_src=None, value_weights=None)
-        r_neg, Wk_neg, Wv_neg = self.attention(Q_src, K_src_neg, V_src=None, value_weights=None)
+        r_pos, Wk_pos, Wv_pos = self.attention(Q_src, K_src_pos, V_src=V_src_pos, value_weights=value_weights_pos)
+        r_neg, Wk_neg, Wv_neg = self.attention(Q_src, K_src_neg, V_src=V_src_neg, value_weights=value_weights_neg)
 
         loss = self.l_proj_param(Wk_pos[0], Wk_neg[0], Wv_pos[0], Wv_neg[0], normalize=True, eps=1e-12)
         return r_pos, r_neg, loss
@@ -127,11 +127,31 @@ class GlobalContextAttentionDual(nn.Module):
         # two value matmuls: all and weighted
         V_all = V
         V_pos = V * wS[:, None, :, None]      # broadcast (B,1,Nc,1)
+        wB = ~wS
 
         context_all = torch.matmul(attn, V_all)     # (B,H,Nt,d_k)
         context_pos = torch.matmul(attn, V_pos)     # (B,H,Nt,d_k)
         context_neg = context_all - context_pos                 # uses wB = 1 - wS
 
+        r_all = self.out(self._merge(context_all))
         r_pos = self.out(self._merge(context_pos))  # (B,Nt,D)
         r_neg = self.out(self._merge(context_neg))  # (B,Nt,D)
-        return r_pos, r_neg
+
+        #loss = self.l_proj_param(K*wS[:, :, :, :], V*wS[:, :, :, :], K*wB[:, :,:,:], V*wB[:, :,:,:], normalize=True, eps=1e-12)
+
+        return r_pos, r_neg, r_all
+    
+    def l_proj_param(self, Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
+        # W*: [d_k, d_in] as in nn.Linear(out=d_k, in=d_in).weight
+        def cross_gram(Wa, Wb):
+            return Wa @ Wb.t()  # [d_k, d_k]
+
+        Gk = cross_gram(Wk_pos, Wk_neg)
+        Gv = cross_gram(Wv_pos, Wv_neg)
+
+        if normalize:
+            nk = (Wk_pos.norm(p='fro') * Wk_neg.norm(p='fro')).clamp_min(eps)
+            nv = (Wv_pos.norm(p='fro') * Wv_neg.norm(p='fro')).clamp_min(eps)
+            return (Gk.pow(2).sum() / nk) + (Gv.pow(2).sum() / nv)
+        else:
+            return Gk.pow(2).sum() + Gv.pow(2).sum()

@@ -8,3 +8,4 @@ from .memory_bank import MemoryBank
 from .target_encoder import TargetEncoder, TargetQueryEncoder
 from .context_encoder import ContextConditionalEncoder, ThetaEncoder, MLP
 from .transformer_encoder import ContextTransformerEncoder
+from .transformer_decoder import TargetTransformerDecoder

@@ -32,6 +32,8 @@ from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_
 
 import time, torch
 
+
+
 try:
     from .data_generator import BatchFormatter
 except Exception:
@@ -44,6 +46,46 @@ except Exception:
     AsymmetricFocalWithFPPenalty = None  # type: ignore
 
 import subprocess
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, roc_auc_score
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+def _linear_probe(H: np.ndarray, y: np.ndarray):
+    clf = LogisticRegression(
+        penalty="l2", solver="saga", max_iter=2000,
+        class_weight="balanced", n_jobs=-1
+    )
+    clf.fit(H, y)
+    scores = clf.decision_function(H)
+    pr = float(average_precision_score(y, scores))
+    roc = float(roc_auc_score(y, scores)) if len(np.unique(y)) > 1 else float("nan")
+    return {"pr_auc": pr, "roc_auc": roc}, clf, scores
+
+def _fisher_direction(H: np.ndarray, y: np.ndarray, lam_scale: float = 1e-3):
+    yb = y.astype(bool)
+    Xp, Xn = H[yb], H[~yb]
+    if len(Xp) < 2 or len(Xn) < 2:
+        return {"pr_auc": float("nan"), "roc_auc": float("nan")}, None, None
+    mu_p, mu_n = Xp.mean(0), Xn.mean(0)
+
+    def cov_unbiased(A):
+        A0 = A - A.mean(0, keepdims=True)
+        n = max(len(A) - 1, 1)
+        return (A0.T @ A0) / n
+
+    Sw = cov_unbiased(Xp) + cov_unbiased(Xn)
+    D = Sw.shape[0]
+    lam = lam_scale * (np.trace(Sw) / max(D, 1))
+    w = np.linalg.solve(Sw + lam * np.eye(D), (mu_p - mu_n))
+    w = w / (np.linalg.norm(w) + 1e-12)
+
+    z = H @ w
+    pr = float(average_precision_score(y.astype(int), z))
+    roc = float(roc_auc_score(y.astype(int), z)) if len(np.unique(y)) > 1 else float("nan")
+    return {"pr_auc": pr, "roc_auc": roc}, w, z
 
 def get_git_hash(short=True):
     try:
@@ -287,16 +329,18 @@ class Trainer:
                     optimizer.zero_grad(set_to_none=True)
             
             # --- memory write: POSITIVES ONLY (proof of principle) ---
-            if train:
+            """
+            mem=False
+            if train and mem ==True:
                 with torch.no_grad():
                     R_ctx   = output["R_ctx_for_write"]                  # on model device
                     ctx_theta_cell = _to_dev(context.theta_cell, device)
                     y_write = _to_dev(context.y, device)
                     #k_write = self.model.build_mem_keys(ctx_theta, R_ctx)
-                    y_write = context.y
+                    #y_write = context.y
                     #print(context.theta.shape)
                     self.model.memory.write(k=R_ctx, theta_cell=ctx_theta_cell, y=y_write)
-            
+            """
             #with torch.no_grad():
             #    occ = self.model.memory.pos_mask.sum(dim=1).float().mean().item()
             #print(f"mean pos protos per θ-cell: {occ:.2f}")
@@ -334,7 +378,7 @@ class Trainer:
         device = _device()
         self.model.to(device)
         # move memory buffers once; do NOT call .to(device) again in the loop
-        self.model.memory.to(device)
+        #self.model.memory.to(device)
 
         
         if isinstance(self.criterion, torch.nn.Module):
@@ -367,6 +411,7 @@ class Trainer:
 
             # Log
             if writer and epoch % self._report == 0:
+                self.run_embedding_probes(split="validate", writer=writer, global_step=epoch+1)
                 for k, v in m_tr.items(): writer.add_scalar(f"train/{k}", v, epoch+1) if np.isscalar(v) else None
 
                 fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=epoch+1)
@@ -393,6 +438,87 @@ class Trainer:
 
         self.metrics["best_model"]={"best_score": float(best_score), "monitor": monitor, "mode": mode, "epochs_ran": epoch - self.epoch_start + 1}
         return self.metrics["best_model"]
+
+    def run_embedding_probes(self, split: str = "validate", writer=None, global_step: int | None = None):
+        """
+        Collect key embeddings & labels, run linear probe and Fisher, and (optionally) log.
+        """
+        H, y = self.collect_key_embeddings(split)
+        if H.shape[0] == 0 or len(np.unique(y)) < 2:
+            print("[probe] Not enough data or classes to run probes.")
+            return {"linear_pr_auc": float("nan"), "fisher_pr_auc": float("nan")}
+
+        lin_metrics, _, _ = _linear_probe(H, y)
+        fish_metrics, _, _ = _fisher_direction(H, y, lam_scale=1e-3)
+
+        print(f"[probe/{split}] Linear PR-AUC={lin_metrics['pr_auc']:.4f}, ROC-AUC={lin_metrics['roc_auc']:.4f}")
+        print(f"[probe/{split}] Fisher PR-AUC={fish_metrics['pr_auc']:.4f}, ROC-AUC={fish_metrics['roc_auc']:.4f}")
+
+        if writer is not None:
+            step = int(global_step) if global_step is not None else 0
+            writer.add_scalar(f"probe/{split}_linear_pr_auc", lin_metrics["pr_auc"], step)
+            if not np.isnan(lin_metrics["roc_auc"]):
+                writer.add_scalar(f"probe/{split}_linear_roc_auc", lin_metrics["roc_auc"], step)
+            writer.add_scalar(f"probe/{split}_fisher_pr_auc", fish_metrics["pr_auc"], step)
+            if not np.isnan(fish_metrics["roc_auc"]):
+                writer.add_scalar(f"probe/{split}_fisher_roc_auc", fish_metrics["roc_auc"], step)
+
+        return {
+            "linear_pr_auc": lin_metrics["pr_auc"],
+            "linear_roc_auc": lin_metrics["roc_auc"],
+            "fisher_pr_auc": fish_metrics["pr_auc"],
+            "fisher_roc_auc": fish_metrics["roc_auc"],
+        }
+    @torch.no_grad()
+    def collect_key_embeddings(self, split: str = "validate"):
+        """
+        Returns:
+            H: (N_keys, D) numpy array of key embeddings from output["R_ctx_for_write"]
+            y: (N_keys,)   numpy array of {0,1} labels from context.y
+        """
+        device = _device()
+        self.model.to(device).eval()
+        if isinstance(self.criterion, torch.nn.Module):
+            self.criterion.to(device)
+
+        loader = self.dataset.set_loader(split)
+        Hs, Ys = [], []
+
+        for batch in tqdm(loader, total=len(loader), desc=f"probe collect [{split}]"):
+            # We need context to get labels; _forward_batch returns output,targets only,
+            # so we unpack here and move to device ourselves:
+            context, query, targets = batch
+            nb = (device.type == "cuda")
+            context = _to_dev(context, device, non_blocking=nb)
+            query   = _to_dev(query, device, non_blocking=nb)
+            targets = _to_dev(targets, device, non_blocking=nb)
+
+            # Forward once (same as _forward_batch but we keep context here)
+            output = self.model(
+                query_theta=query.theta, query_phi=query.phi,
+                context_theta=context.theta, context_phi=context.phi, context_y=context.y,
+                target_y=targets, qry_theta_cell=query.theta_cell, return_ctx_for_write=True,
+            )
+
+            # Key embeddings the model already exposes (on model device)
+            R_ctx = output.get("R_ctx_for_write", None)   # expected: (B, Nc, D) or (B*, Nc, D)
+            if R_ctx is None:
+                # If your model names it differently, adjust the key here.
+                continue
+
+            # Labels per key (1=positive); match your earlier wS=(context_y>0.5)
+            y_keys = (context.y.squeeze(-1) > 0.5)  # (B, Nc) bool
+
+            # Flatten and move to CPU/np
+            Hs.append(R_ctx.reshape(-1, R_ctx.size(-1)).detach().cpu().numpy())
+            Ys.append(y_keys.reshape(-1).cpu().numpy().astype(int))
+
+        if not Hs:
+            return np.zeros((0, 1), dtype=np.float32), np.zeros((0,), dtype=np.int64)
+
+        H = np.concatenate(Hs, axis=0)
+        y = np.concatenate(Ys, axis=0)
+        return H, y
 
     def warm_up(
         self,

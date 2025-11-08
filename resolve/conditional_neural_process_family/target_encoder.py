@@ -23,21 +23,14 @@ class TargetQueryEncoder(nn.Module):
 
 class TargetEncoder(nn.Module):
     """z_t = f([θ^t, φ^t, r^+_t, r^-_t])."""
-    def __init__(self, theta_in_dim, phi_dim, r_dim, hidden, out_dim, theta_encoder=None):
+    def __init__(self, theta_in_dim, phi_dim, r_dim, hidden, out_dim):
         super().__init__()
-        self.theta_enc = theta_encoder
-        theta_feat_dim = theta_in_dim if theta_encoder is None else \
-                         theta_encoder.mlp.net[-1].out_features
-        in_dim = 4 + phi_dim + 5*r_dim
+
+        in_dim = theta_in_dim + phi_dim + r_dim
         self.mlp = MLP([in_dim] + hidden + [out_dim])
 
-    def forward(self, query_theta, query_phi, r_pos, r_neg, diff, m1, m2):
-        if r_pos.shape[1] == 1 and query_phi.shape[1] > 1:  # safety
-            r_pos = r_pos.expand(-1, query_phi.shape[1], -1)
-            r_neg = r_neg.expand_as(r_pos)
-        #theta_f = self.theta_enc(query_theta) if self.theta_enc else query_theta
-        theta_f = query_theta
-        x = torch.cat([theta_f, query_phi, r_pos, r_neg, diff, m1, m2], dim=-1)
+    def forward(self, query_theta, query_phi, r):
+        x = torch.cat([query_theta, query_phi, r], dim=-1)
         B, Nt, _ = x.shape
         z = self.mlp(x.view(B*Nt, -1))
         return z.view(B, Nt, -1)
