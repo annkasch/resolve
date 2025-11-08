@@ -2,8 +2,43 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def l_proj_param(Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
+    # W*: [d_k, d_in] as in nn.Linear(out=d_k, in=d_in).weight
+    def cross_gram(Wa, Wb):
+        return Wa @ Wb.t()  # [d_k, d_k]
+
+    Gk = cross_gram(Wk_pos, Wk_neg)
+    Gv = cross_gram(Wv_pos, Wv_neg)
+
+    if normalize:
+        nk = (Wk_pos.norm(p='fro') * Wk_neg.norm(p='fro')).clamp_min(eps)
+        nv = (Wv_pos.norm(p='fro') * Wv_neg.norm(p='fro')).clamp_min(eps)
+        return (Gk.pow(2).sum() / nk) + (Gv.pow(2).sum() / nv)
+    else:
+        return Gk.pow(2).sum() + Gv.pow(2).sum()
+
+def l_proj_param_batched(Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
+    """
+    All inputs: (B*H, d_k, Nc). Returns scalar loss averaged over B*H.
+    """
+    # Cross-grams: (B*H, d_k, d_k)
+    Gk = torch.bmm(Wk_pos, Wk_neg.transpose(1, 2))
+    Gv = torch.bmm(Wv_pos, Wv_neg.transpose(1, 2))
+
+    if normalize:
+        nk = (Wk_pos.norm(dim=(1, 2)) * Wk_neg.norm(dim=(1, 2))).clamp_min(eps)  # (B*H,)
+        nv = (Wv_pos.norm(dim=(1, 2)) * Wv_neg.norm(dim=(1, 2))).clamp_min(eps)
+        loss_k = (Gk.pow(2).sum(dim=(1, 2)) / nk)  # (B*H,)
+        loss_v = (Gv.pow(2).sum(dim=(1, 2)) / nv)
+        return (loss_k + loss_v).mean()
+    else:
+        return (Gk.pow(2).sum(dim=(1, 2)) + Gv.pow(2).sum(dim=(1, 2))).mean()
+
+
+
 # ---------- attention pooling (per target) ----------
-class GlobalContextAttention(nn.Module):
+class CrossAttention(nn.Module):
     
     def __init__(self, d_model, n_heads=4, out_dim=None):
         super().__init__()
@@ -54,28 +89,10 @@ class GlobalContextAttention(nn.Module):
         r_pos, Wk_pos, Wv_pos = self.attention(Q_src, K_src_pos, V_src=V_src_pos, value_weights=value_weights_pos)
         r_neg, Wk_neg, Wv_neg = self.attention(Q_src, K_src_neg, V_src=V_src_neg, value_weights=value_weights_neg)
 
-        loss = self.l_proj_param(Wk_pos[0], Wk_neg[0], Wv_pos[0], Wv_neg[0], normalize=True, eps=1e-12)
+        loss = l_proj_param(Wk_pos[0], Wk_neg[0], Wv_pos[0], Wv_neg[0], normalize=True, eps=1e-12)
         return r_pos, r_neg, loss
 
-
-
-
-    def l_proj_param(self, Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
-        # W*: [d_k, d_in] as in nn.Linear(out=d_k, in=d_in).weight
-        def cross_gram(Wa, Wb):
-            return Wa @ Wb.t()  # [d_k, d_k]
-
-        Gk = cross_gram(Wk_pos, Wk_neg)
-        Gv = cross_gram(Wv_pos, Wv_neg)
-
-        if normalize:
-            nk = (Wk_pos.norm(p='fro') * Wk_neg.norm(p='fro')).clamp_min(eps)
-            nv = (Wv_pos.norm(p='fro') * Wv_neg.norm(p='fro')).clamp_min(eps)
-            return (Gk.pow(2).sum() / nk) + (Gv.pow(2).sum() / nv)
-        else:
-            return Gk.pow(2).sum() + Gv.pow(2).sum()
-
-class GlobalContextAttentionDual(nn.Module):
+class CrossAttentionDual(nn.Module):
     """
     Multi-head attention that returns (context_pos, context_neg) given a single
     per-key weight vector wS in [0,1]. Computes scores/softmax once, then
@@ -102,7 +119,7 @@ class GlobalContextAttentionDual(nn.Module):
         B, H, N, d_k = x.shape
         return x.transpose(1, 2).reshape(B, N, H * d_k)
 
-    def forward(self, Q_src, K_src, V_src, wS, mask=None):
+    def forward(self, Q_src, K_src, wS, V_src=None, mask=None):
         """
         Q_src: (B, Nt, D)
         K_src: (B, Nc, D)
@@ -113,6 +130,7 @@ class GlobalContextAttentionDual(nn.Module):
         """
         B, Nt, _ = Q_src.shape
         _, Nc, _ = K_src.shape
+        if V_src is None: V_src = K_src
 
         Q = self._split(self.Wq(Q_src))   # (B,H,Nt,d_k)
         K = self._split(self.Wk(K_src))   # (B,H,Nc,d_k)
@@ -137,21 +155,41 @@ class GlobalContextAttentionDual(nn.Module):
         r_pos = self.out(self._merge(context_pos))  # (B,Nt,D)
         r_neg = self.out(self._merge(context_neg))  # (B,Nt,D)
 
-        #loss = self.l_proj_param(K*wS[:, :, :, :], V*wS[:, :, :, :], K*wB[:, :,:,:], V*wB[:, :,:,:], normalize=True, eps=1e-12)
+        # Build weight matrices for pos/neg
+        # wS: (B, Nc) in [0,1] or bool → cast to dtype of V/K
+        wS = wS.float()    # (B, Nc)
+        eps_lbl = 0.05                                     # try 0.01–0.1
+        wS = wS * (1 - 2*eps_lbl) + eps_lbl        # 0→ε, 1→1-ε
+        wS_f  = wS.to(V.dtype)                       # (B, Nc)
+        wS_b  = wS_f[:, None, :, None]               # (B, 1, Nc, 1)
+        wB_b  = (1.0 - wS_f)[:, None, :, None]       # (B, 1, Nc, 1)
 
-        return r_pos, r_neg, r_all
-    
-    def l_proj_param(self, Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
-        # W*: [d_k, d_in] as in nn.Linear(out=d_k, in=d_in).weight
-        def cross_gram(Wa, Wb):
-            return Wa @ Wb.t()  # [d_k, d_k]
+        # Respect mask if provided
+        if mask is not None:
+            m_b  = mask.to(V.dtype)[:, None, :, None]  # (B, 1, Nc, 1)
+            wS_b = wS_b * m_b
+            wB_b = wB_b * m_b
 
-        Gk = cross_gram(Wk_pos, Wk_neg)
-        Gv = cross_gram(Wv_pos, Wv_neg)
+        # Apply weights to keys/values for the loss
+        K_pos = K * wS_b
+        V_pos = V * wS_b
+        K_neg = K * wB_b
+        V_neg = V * wB_b
 
-        if normalize:
-            nk = (Wk_pos.norm(p='fro') * Wk_neg.norm(p='fro')).clamp_min(eps)
-            nv = (Wv_pos.norm(p='fro') * Wv_neg.norm(p='fro')).clamp_min(eps)
-            return (Gk.pow(2).sum() / nk) + (Gv.pow(2).sum() / nv)
-        else:
-            return Gk.pow(2).sum() + Gv.pow(2).sum()
+        # Compute loss with separate pos/neg projections
+        # Build per-(B,H) matrices and call the batched loss
+        BH, d_k, Nc = K_pos.shape[0] * K_pos.shape[1], K_pos.shape[-1], K_pos.shape[2]
+        Wk_pos_bh = K_pos.transpose(-1, -2).reshape(BH, d_k, Nc)
+        Wk_neg_bh = K_neg.transpose(-1, -2).reshape(BH, d_k, Nc)
+        Wv_pos_bh = V_pos.transpose(-1, -2).reshape(BH, d_k, Nc)
+        Wv_neg_bh = V_neg.transpose(-1, -2).reshape(BH, d_k, Nc)
+        loss = l_proj_param_batched(Wk_pos_bh, Wk_neg_bh, Wv_pos_bh, Wv_neg_bh, normalize=True, eps=1e-12)
+
+        #Wk_pos = K_pos.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
+        #Wk_neg = K_neg.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
+        #Wv_pos = V_pos.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
+        #Wv_neg = V_neg.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
+        #loss1 = l_proj_param(Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12)
+        #print("loss", loss1.item(), loss.item())
+
+        return r_pos, r_neg, r_all, loss

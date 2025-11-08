@@ -87,7 +87,6 @@ class CrossAttention(nn.Module):
 
         return x
 
-
 class TransformerDecoderBlock(nn.Module):
     """Self-attn on target tokens -> Cross-attn to encoder_repr -> MLP."""
     def __init__(self, dim, num_heads, mlp_ratio=4.0, qkv_bias=True, drop=0.0, attn_drop=0.0):
@@ -106,7 +105,6 @@ class TransformerDecoderBlock(nn.Module):
         x_tgt = x_tgt + self.cross_attn(self.norm_ca_q(x_tgt), encoder_tokens, wS)
         x_tgt = x_tgt + self.mlp(self.norm_mlp(x_tgt))
         return x_tgt
-
 
 class TargetTransformerDecoder(nn.Module):
     """
@@ -174,7 +172,6 @@ class TargetTransformerDecoder(nn.Module):
             cls = self.cls_token.expand(tgt_tokens.shape[0], 1, self.embed_dim)
             tgt_tokens = torch.cat([cls, tgt_tokens], dim=1)
 
-
         wS = (context_y.squeeze(-1) > 0.5) 
         encoder = encoder_repr
         enc = self.enc_proj(encoder)     # (B, Nc, D)
@@ -183,45 +180,12 @@ class TargetTransformerDecoder(nn.Module):
         x = tgt_tokens
         for blk in self.blocks:
             x = blk(x, enc, wS)
-            
 
         x = self.norm(x)
         h = self._aggregate(x)
 
         #y_hat = self.pred_head(h)
         return h.view(B, Nt, -1)
-
-    def extract_key_embeddings(self, target_theta, target_phi, encoder_repr, context_y):
-        """
-        Returns:
-          H: (N_keys_total, D) float32
-          y: (N_keys_total,)   int {0,1}  (1=positive key)
-        """
-        self.eval()
-        with torch.no_grad():
-            B, Nt, _ = target_theta.shape
-            Be, Nc, De = encoder_repr.shape
-            assert B == Be
-
-            feats = torch.cat([target_theta, target_phi], dim=-1).reshape(B * Nt, self.F_total)
-            tgt_tokens = self.tokenizer(feats)
-            if self.use_cls:
-                cls = self.cls_token.expand(tgt_tokens.shape[0], 1, self.embed_dim)
-                tgt_tokens = torch.cat([cls, tgt_tokens], dim=1)
-
-            enc = self.enc_proj(encoder_repr).repeat_interleave(Nt, dim=0)   # (B*Nt, Nc, D)
-
-            # Build key labels for attention from context_y
-            key_mask = (context_y.squeeze(-1) > 0.5).repeat_interleave(Nt, dim=0)  # (B*Nt, Nc) bool
-
-            # Call a single decoder block’s cross-attn to get keys (choose the first block)
-            blk = self.blocks[0]
-            _ = blk.norm_sa(tgt_tokens)  # no-op to keep shapes consistent
-            _, k_lin, y_keys = blk.cross_attn(tgt_tokens, enc, key_mask, return_keys=True)
-
-            H = k_lin.reshape(-1, k_lin.size(-1)).cpu()
-            y = y_keys.reshape(-1).cpu().to(torch.int64)
-            return H, y
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):

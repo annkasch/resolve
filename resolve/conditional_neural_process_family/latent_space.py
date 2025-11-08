@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from resolve.conditional_neural_process_family.context_encoder import MLP
+from resolve.conditional_neural_process_family.feature_encoder import MLP
 
 def masked_mean(x, mask, dim=1, keepdim=False, eps=1e-8):
     # x: (B,N,*) , mask: (B,N) bool
