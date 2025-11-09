@@ -14,10 +14,12 @@ def bce_with_logits(z, y, **kward):
     return F.binary_cross_entropy_with_logits(z0, y, reduction="none"), torch.sigmoid(z0)
 
 def log_prob(z, y, **kward):
+
     z0 = z[0] if isinstance(z, (list, tuple)) else z
     z1 = z[1] if (isinstance(z, (list, tuple)) and len(z) > 1) else None
     if z1 is None:
         raise ValueError("log_prob expects z=[mu, sigma].")
+
     dist = torch.distributions.Normal(loc=z0, scale=z1)
     # per-sample negative log-likelihood
     nll = -dist.log_prob(y).reshape(-1)
@@ -119,6 +121,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         """
         # Normalize inputs and devices
         z_list = self._ensure_container(logits)
+
         y= targets_y
 
         # Base per-sample loss (N,)

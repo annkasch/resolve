@@ -259,8 +259,10 @@ class Trainer:
                 output, targets = self._forward_batch(batch, device)
 
                 logit = output.get("logits", None)
-                if logit[0].dim() == 3:  # (B,T,M)
-                    logit[0] = logit[0].mean(dim=2)
+
+                #if logit[0].dim() == 3:  # (B,T,M)
+                #    logit = [x.mean(dim=2) for x in logit]
+
                 kl_term = output.get("kl_term", 0.0)
                 add_loss = output.get("loss", 0.0)
                 
@@ -271,13 +273,13 @@ class Trainer:
                 # Keep loss numerically stable: do loss in fp32 if needed
                 # fp32 is safer with custom losses
                 if logit[0].dtype != torch.float32:
-                    logit32   = (logit[0]).float()
+                    logit32 = [x.float() for x in logit]
                     targets32 = targets.float()
                     qx32      = query_x.float()
                 else:
-                    logit32, targets32, qx32 = logit[0], targets, query_x
+                    logit32, targets32, qx32 = logit, targets, query_x
 
-                loss = self.criterion([logit32], targets32, targets_x=qx32) + kl_term + add_loss
+                loss = self.criterion(logit32, targets32, targets_x=qx32) + kl_term + add_loss
                 #print(self.criterion([logit32], targets32, targets_x=qx32).item(), add_loss.item(), loss.item())
 
             if train and self.criterion.base_loss_fn is not skip_loss:
@@ -319,7 +321,7 @@ class Trainer:
             elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
                 y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
             else:
-                y_pred_all.append(logit[0].reshape(-1))
+                y_pred_all.append(logit[0].detach().reshape(-1))
             
             pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
 

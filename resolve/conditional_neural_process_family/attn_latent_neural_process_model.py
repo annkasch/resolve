@@ -3,6 +3,8 @@ import torch.nn as nn
 from resolve.conditional_neural_process_family.class_attention import CrossAttentionDual,  CrossAttention
 from resolve.conditional_neural_process_family.feature_encoder import FeatureEncoder, MLPEncoder, MLP
 from resolve.conditional_neural_process_family.latent_space import LatentPosterior, LatentPriorTheta, LatentTokenProj, masked_mean, kl_gauss
+from resolve.conditional_neural_process_family.transformer_encoder import ContextTransformerEncoder
+import torch.nn.functional as F
 
 class FeedForward(nn.Module):
     def __init__(self, d_model, expansion=4, dropout=0.1):
@@ -17,25 +19,62 @@ class FeedForward(nn.Module):
         )
     def forward(self, x):
         return self.net(x)
-    
-class BernoulliHead(nn.Module):
-    """Maps z_t -> logit."""
-    def __init__(self, in_dim, hidden=[256, 256]):
+
+class BilinearFull(nn.Module):
+    def __init__(self, D):
         super().__init__()
-        self.net = MLP([in_dim] + hidden + [1])
+        self.Wp = nn.Parameter(torch.zeros(D, D))
+        self.Wn = nn.Parameter(torch.zeros(D, D))
+        self.Wd = nn.Parameter(torch.zeros(D, D))
+        nn.init.xavier_uniform_(self.Wp)
+        nn.init.xavier_uniform_(self.Wn)
+        nn.init.xavier_uniform_(self.Wd)
+        #self.ln_t = nn.LayerNorm(D); self.ln_c = nn.LayerNorm(D)
+
+    def forward(self, r_t, r_pos, r_neg, r_diff=None):
+        #r_t  = self.ln_t(r_t); r_pos = self.ln_c(r_pos); r_neg = self.ln_c(r_neg), r_diff = self.ln_c(r_diff)
+        # Δ_pos = r_t^T Wp r_pos, Δ_neg = r_t^T Wn r_neg, Δ_diff = r_t^T Wd r_diff
+        delta_pos = torch.einsum('bnd,df,bnf->bn', r_t, self.Wp, r_pos).unsqueeze(-1)
+        delta_neg = torch.einsum('bnd,df,bnf->bn', r_t, self.Wn, r_neg).unsqueeze(-1)
+        delta = delta_pos - delta_neg
+        if r_diff is not None: 
+            delta_diff = torch.einsum('bnd,df,bnf->bn', r_t, self.Wd, r_diff).unsqueeze(-1)
+            delta += delta_diff
+        return delta
+    
+class DecoderHead(nn.Module):
+    """Maps z_t -> logit."""
+    def __init__(self, in_dim, hidden=[256, 256], out_dim=1):
+        super().__init__()
+        self.net = MLP([in_dim] + hidden + [out_dim])
+        #self.net = MLP([in_dim] + hidden + [out_dim*2])
 
     def forward(self, z_t):
-        B, Nt, _ = z_t.shape
-        return self.net(z_t.view(B*Nt, -1)).view(B, Nt, 1)
+        hidden = self.net(z_t)
+        #mu, rho = torch.split(hidden, hidden.size(-1) // 2, dim=-1)
+        #sigma = F.softplus(rho) + 1e-6
+        return hidden
 
 # ---------- full model ----------
 class AttnLNP(nn.Module):
     def __init__(self, d_theta, d_phi, d_y, d_model=32, encoder_hidden=[128,128], mode="concat", theta_embed_dim=None, n_heads=4, z_dim=8, use_theta_prior=True):
         super().__init__()
         # Context side
-        self.ctx_enc = FeatureEncoder(
-            phi_dim=d_phi, y_dim=d_y, theta_in_dim=d_theta, hidden=encoder_hidden, out_dim=d_model,
-            mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
+        #self.ctx_enc = FeatureEncoder(
+        #    phi_dim=d_phi, y_dim=d_y, theta_in_dim=d_theta, hidden=encoder_hidden, out_dim=d_model,
+        #    mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
+        #)
+        # Context side
+        self.ctx_enc = ContextTransformerEncoder(theta_dim=d_theta,
+            phi_dim=d_phi,
+            y_dim=d_y,
+            embed_dim= d_model,
+            depth= 4,
+            num_heads= 4,
+            mlp_ratio= 4.0,
+            dropout= 0.0,
+            proj_out_dim= None,  # if set, final linear to this dim
+            use_cls_token= False       # set False: mean over feature tokens
         )
         
         # Latent bits
@@ -69,10 +108,13 @@ class AttnLNP(nn.Module):
         self.norm_q  = nn.LayerNorm(d_model)   # for queries (targets)
         self.norm_kv = nn.LayerNorm(d_model)   # for keys/values (context)
         self.norm_ff = nn.LayerNorm(d_model)   # before FFN
+        self.norm_r = nn.LayerNorm(d_model)   # before FFN
         self.ffn   = FeedForward(d_model, expansion=4, dropout=0.1)
 
         # Bernoulli decoder
-        self.decoder = BernoulliHead(d_model)
+        self.base_decoder = DecoderHead(2*d_model,out_dim=d_y)
+        self.bilinear_head= BilinearFull(d_model)
+
 
     def forward(self, query_theta, query_phi, context_theta, context_phi, context_y, **kwargs):
         """
@@ -114,13 +156,9 @@ class AttnLNP(nn.Module):
             else:
                 z = mu_q  # mean at eval (or sample multiple z’s outside)
 
-            # Optional θ-conditioned prior p(z|θ̄)
-            if self.use_theta_prior:
-                theta_bar = masked_mean(context_theta, mask_c, dim=1)  # (B,d_theta)
-                mu_p, logvar_p = self.prior_p(theta_bar)
-            else:
-                mu_p = torch.zeros_like(mu_q)
-                logvar_p = torch.zeros_like(logvar_q)
+
+            mu_p = torch.zeros_like(mu_q)
+            logvar_p = torch.zeros_like(logvar_q)
 
             kl = kl_gauss(mu_q, logvar_q, mu_p, logvar_p)  # (B,)
             loss_kl = (beta * kl.mean())
@@ -137,20 +175,29 @@ class AttnLNP(nn.Module):
             wS_ctx = torch.cat([wS_ctx, s_base.unsqueeze(1)], dim=1)  # (B,Nc+1)
 
         # Build per-target query
-        R_t = self.qry_enc(theta=query_theta, phi=query_phi)              # (B,Nt,D)
+        R_t = self.norm_q(self.qry_enc(theta=query_theta, phi=query_phi))             # (B,Nt,D)
 
         # Attention pooling
-        r_pos, r_neg, r_all, loss_attn = self.attn(Q_src=self.norm_q(R_t), K_src=self.norm_kv(R_ctx), wS=wS_ctx, mask=mask_c)
+        r_all, r_pos, r_neg, r_diff = self.attn(Q_src=R_t, K_src=self.norm_kv(R_ctx), wS_ctx=wS_ctx)
+        
+        # Normalize contexts for stability
+        r_all  = self.norm_r(r_all)
+        r_pos  = self.norm_r(r_pos)
+        r_neg  = self.norm_r(r_neg)
+        r_diff = self.norm_r(r_diff)
 
-        x = R_t + r_all               # residual after attention
-        # Feed-Forward + Residual
-        x = x + self.ffn(self.norm_ff(x))
-        logit = self.decoder(x)                          # (B,Nt,1)
+        # pool r_all over Nt to form r_C baseline summary
+        rC_pooled = r_all.mean(dim=1, keepdim=True).expand(-1, R_t.shape[1], -1)   # (B,Nt,D)
+
+        # Baseline CNP decoder on (r_t, r_C) → mu0 (logit)
+        base_in = torch.cat([R_t, rC_pooled], dim=-1)                  # (B,Nt,2D)
+        mu0 = self.base_decoder(base_in)                               # (B,Nt,1)  logit baseline
+        delta = self.bilinear_head(R_t, r_pos, r_neg, r_diff)
 
         # Return KL for ELBO
         output = {
-            "logits": [logit],
-            "loss": loss_kl + loss_attn
+            "logits": mu0+delta,
+            "loss": loss_kl
         }
-        
+
         return output

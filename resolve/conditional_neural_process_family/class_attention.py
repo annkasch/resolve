@@ -119,7 +119,7 @@ class CrossAttentionDual(nn.Module):
         B, H, N, d_k = x.shape
         return x.transpose(1, 2).reshape(B, N, H * d_k)
 
-    def forward(self, Q_src, K_src, wS, V_src=None, mask=None):
+    def forward(self, Q_src, K_src, wS_ctx, V_src=None, mask_c=None):
         """
         Q_src: (B, Nt, D)
         K_src: (B, Nc, D)
@@ -128,68 +128,57 @@ class CrossAttentionDual(nn.Module):
         mask:  (B, Nc) bool, True for VALID keys
         Returns: (r_pos, r_neg) each (B, Nt, D_out)
         """
-        B, Nt, _ = Q_src.shape
-        _, Nc, _ = K_src.shape
+            
+        B, Nc, Dk = K_src.shape
+
+        # Multi-head split
+        def _split(x, H):
+            B_, N_, D_ = x.shape
+            dk = D_ // H
+            return x.view(B_, N_, H, dk).permute(0, 2, 1, 3)           # (B,H,N,dk)
+
         if V_src is None: V_src = K_src
+        Q = _split(self.Wq(Q_src), self.n_heads)                               # (B,H,Nt,dk)
+        K = _split(self.Wk(K_src), self.n_heads)                             # (B,H,Nc,dk)
+        V = _split(self.Wv(V_src), self.n_heads)                             # (B,H,Nc,dk)
 
-        Q = self._split(self.Wq(Q_src))   # (B,H,Nt,d_k)
-        K = self._split(self.Wk(K_src))   # (B,H,Nc,d_k)
-        V = self._split(self.Wv(V_src))   # (B,H,Nc,d_k)
+        # Shared scores once
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (Dk ** 0.5)    # (B,H,Nt,Nc)
+        if mask_c is not None:
+            scores = scores.masked_fill(~mask_c[:, None, None, :], float('-inf'))
+        attn_all = torch.softmax(scores, dim=-1)                       # shared attention (B,H,Nt,Nc)
 
-        # scores and softmax (one time)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.d_k ** 0.5)  # (B,H,Nt,Nc)
-        if mask is not None:
-            scores = scores.masked_fill(~mask[:, None, None, :], float('-inf'))
-        attn = torch.softmax(scores, dim=-1)  # (B,H,Nt,Nc)
+        # Build class-renormalized attentions (no leakage)
+        # wS for forward path: hard/soft labels but NO epsilon smoothing
+        wS = wS_ctx.float().clamp(0., 1.)                              # (B,Nc)
+        wS_attn = wS[:, None, None, :]                                 # (B,1,1,Nc)
 
-        # two value matmuls: all and weighted
-        V_all = V
-        V_pos = V * wS[:, None, :, None]      # broadcast (B,1,Nc,1)
-        wB = ~wS
+        attn_pos = attn_all * wS_attn
+        Zp = attn_pos.sum(-1, keepdim=True).clamp_min(1e-12)
+        attn_pos = attn_pos / Zp
 
-        context_all = torch.matmul(attn, V_all)     # (B,H,Nt,d_k)
-        context_pos = torch.matmul(attn, V_pos)     # (B,H,Nt,d_k)
-        context_neg = context_all - context_pos                 # uses wB = 1 - wS
+        attn_neg = attn_all * (1.0 - wS_attn)
+        Zn = attn_neg.sum(-1, keepdim=True).clamp_min(1e-12)
+        attn_neg = attn_neg / Zn
 
-        r_all = self.out(self._merge(context_all))
-        r_pos = self.out(self._merge(context_pos))  # (B,Nt,D)
-        r_neg = self.out(self._merge(context_neg))  # (B,Nt,D)
+        # Contexts
+        C_all  = torch.matmul(attn_all, V)                             # (B,H,Nt,dk)
+        C_pos  = torch.matmul(attn_pos, V)                             # (B,H,Nt,dk)
+        C_neg  = torch.matmul(attn_neg, V)                             # (B,H,Nt,dk)
 
-        # Build weight matrices for pos/neg
-        # wS: (B, Nc) in [0,1] or bool → cast to dtype of V/K
-        wS = wS.float()    # (B, Nc)
-        eps_lbl = 0.05                                     # try 0.01–0.1
-        wS = wS * (1 - 2*eps_lbl) + eps_lbl        # 0→ε, 1→1-ε
-        wS_f  = wS.to(V.dtype)                       # (B, Nc)
-        wS_b  = wS_f[:, None, :, None]               # (B, 1, Nc, 1)
-        wB_b  = (1.0 - wS_f)[:, None, :, None]       # (B, 1, Nc, 1)
+        # Signed comparison channel (no renorm; captures margin in same neighborhood)
+        s_signed = (2.0 * wS - 1.0)[:, None, None, :]                  # (B,1,1,Nc)
+        C_diff   = torch.matmul(attn_all * s_signed, V)                # (B,H,Nt,dk)
 
-        # Respect mask if provided
-        if mask is not None:
-            m_b  = mask.to(V.dtype)[:, None, :, None]  # (B, 1, Nc, 1)
-            wS_b = wS_b * m_b
-            wB_b = wB_b * m_b
+        # Merge heads + output projection
+        def _merge(x):
+            B_, H_, Nt_, dk_ = x.shape
+            return x.permute(0, 2, 1, 3).contiguous().view(B_, Nt_, H_ * dk_)
 
-        # Apply weights to keys/values for the loss
-        K_pos = K * wS_b
-        V_pos = V * wS_b
-        K_neg = K * wB_b
-        V_neg = V * wB_b
+        r_all  = self.out(_merge(C_all))                               # (B,Nt,D)
+        r_pos  = self.out(_merge(C_pos))                               # (B,Nt,D)
+        r_neg  = self.out(_merge(C_neg))                               # (B,Nt,D)
+        r_diff = self.out(_merge(C_diff))                              # (B,Nt,D)
 
-        # Compute loss with separate pos/neg projections
-        # Build per-(B,H) matrices and call the batched loss
-        BH, d_k, Nc = K_pos.shape[0] * K_pos.shape[1], K_pos.shape[-1], K_pos.shape[2]
-        Wk_pos_bh = K_pos.transpose(-1, -2).reshape(BH, d_k, Nc)
-        Wk_neg_bh = K_neg.transpose(-1, -2).reshape(BH, d_k, Nc)
-        Wv_pos_bh = V_pos.transpose(-1, -2).reshape(BH, d_k, Nc)
-        Wv_neg_bh = V_neg.transpose(-1, -2).reshape(BH, d_k, Nc)
-        loss = l_proj_param_batched(Wk_pos_bh, Wk_neg_bh, Wv_pos_bh, Wv_neg_bh, normalize=True, eps=1e-12)
 
-        #Wk_pos = K_pos.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
-        #Wk_neg = K_neg.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
-        #Wv_pos = V_pos.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
-        #Wv_neg = V_neg.transpose(-1, -2).mean(dim=(0, 1))  # (d_k, Nc)
-        #loss1 = l_proj_param(Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12)
-        #print("loss", loss1.item(), loss.item())
-
-        return r_pos, r_neg, r_all, loss
+        return r_all, r_pos, r_neg, r_diff

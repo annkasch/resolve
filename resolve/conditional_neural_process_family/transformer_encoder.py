@@ -135,10 +135,10 @@ class ContextTransformerEncoder(nn.Module):
             return x[:, 0, :]
         return x.mean(dim=1)
 
-    def forward(self, context_theta, context_phi, context_y):
-        B, Nc, _ = context_phi.shape
+    def forward(self, theta, phi, y):
+        B, Nc, _ = phi.shape
         # Concatenate features per context point: (B, Nc, F_total)
-        feats = torch.cat([context_theta, context_phi, context_y], dim=-1).reshape(B * Nc, self.F_total)
+        feats = torch.cat([theta, phi, y], dim=-1).reshape(B * Nc, self.F_total)
 
         # Feature tokens (L = #features)
         tokens = self.tokenizer(feats)  # (B*Nc, L, D)
