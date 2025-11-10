@@ -157,7 +157,8 @@ class IsolationForestWrapper(nn.Module):
             scores = -scores  # higher => more anomalous
 
         scores_t = self._from_2d_numpy(scores, original_shape).to(self._out_device)
-        return {"logits": [scores_t]}
+        out={"logits": [scores_t]}
+        return out
 
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:

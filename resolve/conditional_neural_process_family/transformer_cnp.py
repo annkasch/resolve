@@ -73,9 +73,6 @@ class TransformerCNP(nn.Module):
         # Bernoulli decoder
         logit = self.decoder(z_t)                         # (B,Nt,1)
 
-        output = {
-            "logits": [logit],
-        }
         out = {"logits": [logit]}
 
         if return_ctx_for_write:

@@ -178,7 +178,8 @@ class ConditionalNeuralProcess(nn.Module):
         mu, sigma = self._decoder(representation, target_x, is_binary)
         
         output = {
-            "logits": [mu,sigma]
+            "logits": [mu,sigma],
+            "probs": [mu,sigma]
         }
         
         return output

@@ -39,8 +39,7 @@ model_settings:
         theta_embed_dim: null
         n_heads: 4 
         mode: concat  # concat
-        z_dim: null
-        use_theta_prior: False
+        z_dim: 8
       MarginalizedNeuralRatioEstimator:
         encoder_sizes: [128, 64]
         decoder_sizes: [128, 64]

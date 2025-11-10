@@ -119,7 +119,7 @@ class CrossAttentionDual(nn.Module):
         B, H, N, d_k = x.shape
         return x.transpose(1, 2).reshape(B, N, H * d_k)
 
-    def forward(self, Q_src, K_src, wS_ctx, V_src=None, mask_c=None):
+    def forward(self, Q_src, K_src, wS_ctx, V_src=None, mask=None):
         """
         Q_src: (B, Nt, D)
         K_src: (B, Nc, D)
@@ -144,8 +144,8 @@ class CrossAttentionDual(nn.Module):
 
         # Shared scores once
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (Dk ** 0.5)    # (B,H,Nt,Nc)
-        if mask_c is not None:
-            scores = scores.masked_fill(~mask_c[:, None, None, :], float('-inf'))
+        if mask is not None:
+            scores = scores.masked_fill(~mask[:, None, None, :], float('-inf'))
         attn_all = torch.softmax(scores, dim=-1)                       # shared attention (B,H,Nt,Nc)
 
         # Build class-renormalized attentions (no leakage)

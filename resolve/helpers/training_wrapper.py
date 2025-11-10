@@ -191,7 +191,7 @@ class Trainer:
     def __init__(self, model, dataset, epochs: int = 10):
         self.model = model
         self.dataset = dataset
-        self.epochs = epochs
+        self.nepochs = epochs
         self.epoch_start = 0
         self._report = 1
         self.bce = nn.BCELoss()
@@ -219,7 +219,7 @@ class Trainer:
         # For logging last epoch metrics
         self.metrics: Dict[str, float] = {}
 
-    def _forward_batch(self, batch: dict, device) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _forward_batch(self, batch: dict, device, train=True, step = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         """Format and forward a single batch. Expects keys consistent with your data pipeline."""
         # unpack the batch:
         context, query, targets = batch
@@ -230,12 +230,10 @@ class Trainer:
         context = _to_dev(context, device, non_blocking=nb)
         query   = _to_dev(query, device, non_blocking=nb)
 
-
-
         output = self.model(
-            query_theta=query.theta, query_phi=query.phi,
+            query_theta=query.theta, query_phi=query.phi, query_y=targets,
             context_theta=context.theta, context_phi=context.phi, context_y=context.y,
-            target_y=targets, qry_theta_cell=query.theta_cell, return_ctx_for_write=True,
+            target_y=targets, qry_theta_cell=query.theta_cell, return_ctx_for_write=True,train=train, step=step
         )
 
         return output, targets
@@ -256,7 +254,7 @@ class Trainer:
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True)
         for i, batch in enumerate(pbar):
             with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=autocast_dtype):
-                output, targets = self._forward_batch(batch, device)
+                output, targets = self._forward_batch(batch, device, train=train, step=i+self.epoch*len(loader))
 
                 logit = output.get("logits", None)
 
@@ -366,13 +364,14 @@ class Trainer:
         best_score = -float("inf") if mode == "max" else float("inf")
         no_improve = 0
 
-        for epoch in range(self.epoch_start, self.epoch_start + self.epochs):
+        for epoch in range(self.epoch_start, self.epoch_start + self.nepochs):
             # TRAIN
+            self.epoch = epoch
             dataloader = self.dataset.set_loader("train")
             if self.model._get_name()== 'IsolationForestWrapper' and self.model._fitted == False:
                 self.model.fit(loader=dataloader)
             
-            train_loss, y_true_tr, y_pred_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.epochs}")
+            train_loss, y_true_tr, y_pred_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.nepochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
             m_tr["loss"] = train_loss
             self.metrics["train"] = m_tr
