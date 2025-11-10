@@ -121,8 +121,6 @@ class AttnLNP(nn.Module):
         # Latent
         self.z_dim           = int(z_dim) if z_dim is not None else 0
         self.use_latent      = (self.z_dim > 0)
-        self.use_context_prior = True
-        self.use_theta_prior   = bool(use_theta_prior)
 
         in_dim = 2*d_model
         if self.use_latent:

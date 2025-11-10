@@ -9,7 +9,7 @@ class ModelsManager():
         self._models = {}
         self._factories = {
             "TransformerCNP": lambda cfg: TransformerCNP(cfg["d_theta"], cfg["d_phi"], cfg["d_y"], cfg.get("representation_size", 32),cfg.get("encoder_sizes", [128, 128]), cfg.get("n_heads", 4)),
-            "AttnLNP": lambda cfg: AttnLNP(d_theta=cfg["d_theta"], d_phi=cfg["d_phi"], d_y=cfg["d_y"], d_model=cfg.get("representation_size", 32), encoder_hidden=cfg.get("encoder_sizes", [128, 128]), mode=cfg.get("mode", "concat"), theta_embed_dim=cfg.get("theta_embed_dim", None), n_heads=cfg.get("n_heads", 4), z_dim=cfg.get("z_dim", 0), use_theta_prior=cfg.get("use_theta_prior", False)),
+            "AttnLNP": lambda cfg: AttnLNP(d_theta=cfg["d_theta"], d_phi=cfg["d_phi"], d_y=cfg["d_y"], d_model=cfg.get("representation_size", 32), encoder_hidden=cfg.get("encoder_sizes", [128, 128]), mode=cfg.get("mode", "concat"), theta_embed_dim=cfg.get("theta_embed_dim", None), n_heads=cfg.get("n_heads", 4), z_dim=cfg.get("z_dim", 0)),
             "Autoencoder": lambda cfg: Autoencoder(cfg["d_theta"] + cfg["d_phi"], cfg.get("representation_size", 32), cfg.get("encoder_sizes", [128, 64])), 
             "VariationalAutoencoder": lambda cfg: VariationalAutoencoder(cfg["d_theta"] + cfg["d_phi"], cfg.get("representation_size", 32), cfg.get("encoder_sizes", [128, 64])),  
             "IsolationForest": lambda cfg: IsolationForestWrapper(cfg.get("n_estimators",100),cfg.get("max_samples",512),cfg.get("contamination","auto"),cfg.get("max_features",1.0),cfg.get("bootstrap",False),cfg.get("n_jobs",None),cfg.get("random_state",None),cfg.get("warm_star",False), cfg.get("invert_scores",True)),
