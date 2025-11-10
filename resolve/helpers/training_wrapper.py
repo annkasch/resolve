@@ -467,7 +467,7 @@ class Trainer:
             no_improve = 0
 
             for local_epoch in range(n_epochs):
-
+                self.epoch = global_epoch
                 global_epoch += 1
                 dataloader = self.dataset.set_loader("train")
                 train_loss, y_true_tr, y_pred_tr = self._run_epoch(

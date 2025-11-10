@@ -180,7 +180,7 @@ class AttnLNP(nn.Module):
         t_mask  = torch.ones(B, R_t_raw.size(1), dtype=torch.bool, device=device)
 
         # Deterministic warmup (no z)
-        if self.use_latent or (train and step < latent_warmup_steps):
+        if not self.use_latent or (train and step < latent_warmup_steps):
             r_all, r_pos, r_neg, r_diff = self.attn(
                 Q_src=R_t,
                 K_src=self.norm_kv(R_ctx),
