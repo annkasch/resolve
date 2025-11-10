@@ -68,7 +68,7 @@ model_settings:
       max_positive_reuse: 3
       num_data_pass_per_phase: 2
     batch_size: 1000
-    training_epochs: 200
+    training_epochs: 2
     patience: 200
     learning_rate: 0.001
     report_frequency: 100

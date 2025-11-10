@@ -7,3 +7,5 @@ examples/legend/out/*
 examples/legend/in/data/*
 !examples/legend/in/data/.gitkeep
 *.pt
+*__pycache__
+*.egg-info/
