@@ -182,7 +182,7 @@ class UMAPAnalyzer:
 
         plt.figure(figsize=(6, 5))
         ax = sns.heatmap(D, annot=False, cmap="viridis")
-        plt.title("Pairwise Wasserstein Distances between $\phi$-distributions (signal only)")
+        plt.title(r"Pairwise Wasserstein Distances between $\phi$-distributions (signal only)")
         plt.xlabel(r"$\theta_j$")
         plt.ylabel(r"$\theta_i$")
         plt.show()
@@ -203,7 +203,7 @@ class UMAPAnalyzer:
         zminmax = ax.collections[0].get_clim()  # (vmin, vmax)
         plt.figure(figsize=(6, 5))
         sns.heatmap(D, annot=False, vmin = zminmax[0], vmax=zminmax[1],cmap="viridis")
-        plt.title("Pairwise Wasserstein Distances between $\phi$-distributions (background only)")
+        plt.title(r"Pairwise Wasserstein Distances between $\phi$-distributions (background only)")
         plt.xlabel(r"$\theta_j$")
         plt.ylabel(r"$\theta_i$")
         plt.show()

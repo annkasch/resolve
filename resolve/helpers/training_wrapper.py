@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import math
 from tqdm import tqdm
+in_slurm = "SLURM_JOB_ID" in os.environ
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
@@ -65,9 +66,11 @@ def get_git_hash(short=True):
 def _device() -> torch.device:
     # Prefer CUDA, then MPS, then CPU
     if torch.cuda.is_available():
+        print("running on gpu")
         return torch.device("cuda")
     if torch.backends.mps.is_available():
         return torch.device("mps")
+    print("running on cpu")
     return torch.device("cpu")
 
 def _to_dev(obj, device, *, non_blocking=False):
@@ -214,7 +217,7 @@ class Trainer:
         self._amp_enabled = self._use_cuda  # enable autocast on CUDA; off on MPS/CPU
 
         # GradScaler only when we might need it (fp16 path)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self._amp_enabled and not self._use_bf16)
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=self._amp_enabled and not self._use_bf16)
 
         # For logging last epoch metrics
         self.metrics: Dict[str, float] = {}
@@ -251,9 +254,9 @@ class Trainer:
         
         autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
 
-        pbar = tqdm(loader, total=len(loader), desc=desc, leave=True)
+        pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
         for i, batch in enumerate(pbar):
-            with torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=autocast_dtype):
+            with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=autocast_dtype):
                 output, targets = self._forward_batch(batch, device, train=train, step=i+self.epoch*len(loader))
 
                 logit = output.get("logits", None)
@@ -341,14 +344,13 @@ class Trainer:
         os.makedirs(ckpt_dir, exist_ok=True)
         best_ckpt = os.path.join(ckpt_dir, ckpt_name)
 
-        device = _device()
-        self.model.to(device)
+        self.model.to(self.device)
         # move memory buffers once; do NOT call .to(device) again in the loop
         #self.model.memory.to(device)
 
         
         if isinstance(self.criterion, torch.nn.Module):
-            self.criterion.to(device)
+            self.criterion.to(self.device)
         
         # rebuild optimizer after model to device
         for s in optimizer.state.values():
@@ -431,10 +433,10 @@ class Trainer:
             save_best: Save and restore best weights.
             num_data_pass_per_phase: Optional epoch override per phase.
         """
-        device = _device()
-        self.model.to(device)
+
+        self.model.to(self.device)
         if isinstance(self.criterion, torch.nn.Module):
-            self.criterion.to(device)
+            self.criterion.to(self.device)
         
         # rebuild optimizer after model to device
         for s in optimizer.state.values():
@@ -530,11 +532,11 @@ class Trainer:
         monitor: str = "pr_auc",  # for binary; for regression we'll silently map to 'rmse'
         epoch: int = 0,
     ) -> Dict[str, float]:
-
-        device = _device()
-        self.model.to(device)
+        
+        self.epoch = epoch
+        self.model.to(self.device)
         if isinstance(self.criterion, torch.nn.Module):
-            self.criterion.to(device)
+            self.criterion.to(self.device)
 
         dataloader = self.dataset.set_loader(dataset_name)
         with torch.inference_mode():
@@ -578,11 +580,11 @@ class Trainer:
             Run the model in prediction mode over the given dataset.
             Processes data file by file and saves predictions back to the same files.
             """
-            device = _device()
-            self.model.to(device)
+
+            self.model.to(self.device)
             self.model.eval()
             if isinstance(self.criterion, torch.nn.Module):
-                self.criterion.to(device)
+                self.criterion.to(self.device)
             
             # Get dimensions from dataset parameters
             sizes = {k: self.dataset.parameters[k]["size"] for k in ["theta", "phi", "target"]}
@@ -600,7 +602,7 @@ class Trainer:
             metrics_col =  np.empty((0, 4))
             
             dataloader = self.dataset.set_loader(mode="predict")
-            with tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file") as pbar:
+            with tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file" , disable=in_slurm) as pbar:
                 for batch, file_idx, file_completed in dataloader:
                     _, query, _ = batch
                     #query_phi = dataloader.dataset._normalizer.inverse_transform(query.phi[0], "phi").cpu().numpy()
@@ -613,13 +615,13 @@ class Trainer:
                     if not torch.is_tensor(query_theta):
                         query_theta = torch.from_numpy(query_theta)
 
-                    query_phi   = query_phi.to(device, non_blocking=(device.type=="cuda"))
-                    query_theta = query_theta.to(device, non_blocking=(device.type=="cuda"))
+                    query_phi   = query_phi.to(self.device, non_blocking=(self.device.type=="cuda"))
+                    query_theta = query_theta.to(self.device, non_blocking=(self.device.type=="cuda"))
 
                     # Forward pass
                     autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
-                    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=self._amp_enabled, dtype=autocast_dtype):
-                        output, targets = self._forward_batch(batch, device)
+                    with torch.inference_mode(), torch.amp.autocast(self.device.type,enabled=self._amp_enabled, dtype=autocast_dtype):
+                        output, targets = self._forward_batch(batch, self.device)
                         logit = output.get("logits", None)
                         query_x = torch.cat([query_theta, query_phi], dim=1) 
 
