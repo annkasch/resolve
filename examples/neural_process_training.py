@@ -10,6 +10,7 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 import json
 import argparse
+import multiprocessing as mp
 
 def main(path_to_settings):
     # Set the path to the yaml settings file here
@@ -63,6 +64,9 @@ def main(path_to_settings):
     # Instantiate the training wrapper for the first phase
     trainer = Trainer(model, dataset_train)
 
+    model.memory_bank.build(dataset_train.dataset.data["train"]["theta"][0],dataset_train.dataset.data["train"]["phi"][0])
+
+    print("memory build end")
     trainer.nepochs = config_file["model_settings"]["train"]["training_epochs"]
 
     if isinstance(utils.get_nested(config_file, ["model_settings","train","dataset","positive_ratio_train"], False), list):
@@ -151,5 +155,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--settings", type=str, required=True)
     args = parser.parse_args()
-
+    mp.set_start_method("spawn", force=True)  # critical on macOS
     main(args.settings)

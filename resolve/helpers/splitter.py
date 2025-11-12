@@ -8,13 +8,14 @@ class Splitter():
         self.mode = mode
         self.seed = seed
     
-    def train_test_split(self,*arrays, groups, test_size=0.2, seed=None,):
+    def train_test_split(self,*arrays, groups, test_size=0.2, seed=None):
+        seed = seed if seed is not None else self.seed
         if self.mode == "batch_wise":
-            return self.train_test_groupwise_split(*arrays, groups=groups, test_size=test_size, seed=self.seed)
+            return self.train_test_groupwise_split(*arrays, groups=groups, test_size=test_size, seed=seed)
         elif self.mode == "global":
-            return train_test_split(*arrays, test_size=test_size, random_state=self.seed)
+            return train_test_split(*arrays, test_size=test_size, random_state=seed)
         else:
-            return train_test_split(*arrays, test_size=test_size, random_state=self.seed)
+            return train_test_split(*arrays, test_size=test_size, random_state=seed)
         
     def train_test_groupwise_split(
             self,
@@ -31,6 +32,8 @@ class Splitter():
             gen = torch.Generator(device=device)
             if seed is not None:
                 gen.manual_seed(seed)
+            else:
+                gen.manual_seed(self.seed)
 
             # unique groups and inverse map
             if g.ndim == 1:

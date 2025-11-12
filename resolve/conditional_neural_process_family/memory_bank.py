@@ -1,202 +1,174 @@
+from os import device_encoding
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import numpy as np
+import os, faiss
+os.environ["OMP_NUM_THREADS"] = "4"
+faiss.omp_set_num_threads(4)
 
-class MemoryBank(nn.Module):
-    """
-    θ-aware EMA prototype memory with separate positive/negative slots.
-    - keys are L2-normalized embeddings in R^D (same D as your ctx/tgt features)
-    - per θ-cell we keep up to J_pos positive and J_neg negative prototypes
-    """
-    def __init__(self, num_theta_cells: int, dim: int, J_pos: int = 5, J_neg: int = 10,
-                 alpha: float = 0.99, tau_assign: float = 0.5, device="cpu"):
-        super().__init__()
-        self.C = num_theta_cells
-        self.D = dim
-        self.J_pos = J_pos
-        self.J_neg = J_neg
-        self.alpha = alpha
-        self.tau_assign = tau_assign
-        self.min_seed = J_pos
-        #self.device = device
-
-        # Prototypes (C, J, D); valid counts per cell
-        self.register_buffer("pos", torch.zeros(self.C, self.J_pos, self.D, device=device))
-        self.register_buffer("neg", torch.zeros(self.C, self.J_neg, self.D, device=device))
-        self.register_buffer("pos_mask", torch.zeros(self.C, self.J_pos, dtype=torch.bool, device=device))
-        self.register_buffer("neg_mask", torch.zeros(self.C, self.J_neg, dtype=torch.bool, device=device))
+class MemoryBank:
+    def __init__(self, d, encoder_online, encoder_momentum, tau=0.999, use_faiss=True):
+        self.N, self.d = 0, d
+        self.online, self.momentum = encoder_online, encoder_momentum
+        self.tau = tau
+        self.E = None
+        self.use_faiss = use_faiss
+        if use_faiss:
+            self.index = faiss.IndexFlatIP(d)
 
     @torch.no_grad()
-    def _assign_and_update(self, table, mask, k, cell, is_pos: bool):
-        C, J, D = table.shape
-        entries = table[cell]              # (J, D)
-        valid   = mask[cell]               # (J,)
-        valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(1)   # (J_valid,)
-        J_valid = valid_idx.numel()
+    def build_from_loader(self, dataset, dtype=torch.float32):
+        assert hasattr(self, "momentum")
+        assert hasattr(self, "E")
+        dataloader = dataset.set_loader("train")
+        self.N = len(dataloader.dataset)*dataloader.dataset.batch_size_tgt
+        self.E = torch.empty(self.N, self.d, dtype=torch.float32)
+        
+        device = next(self.momentum.parameters()).device
+        self.E = self.E.to(device)
+        
+        self.momentum.eval()
+        torch.set_grad_enabled(False)
 
-        # --- seeding phase: fill free slots first ---
-        if J_valid < self.min_seed:
-            free_idx = torch.nonzero(~valid, as_tuple=False).squeeze(1)
-            if free_idx.numel() > 0:
-                j_new = int(free_idx[0].item())  # choose first free slot (or round-robin; see §3)
-                entries[j_new].copy_(F.normalize(k, dim=0))
-                mask[cell, j_new] = True
-            return
+        with torch.amp.autocast(device.type, enabled=(device.type == "cuda")), torch.no_grad():
+            for batch in dataloader:
+                _, features,_ = batch
+                theta = features.theta.to(device)
+                phi = features.phi.to(device)
 
-        # --- normal phase: compute similarity, decide update vs insert ---
-        entries_v = torch.index_select(entries, 0, valid_idx)        # (J_valid, D)
-        sims = torch.mv(entries_v, k.contiguous())                   # (J_valid,)
-        j_local = int(torch.argmax(sims))
-        best_sim = float(sims[j_local])
-        j = int(valid_idx[j_local])                                  # map back to [0, J)
-
-        # create new if not similar enough and capacity available
-        if best_sim < self.tau_assign and J_valid < J:
-            free_idx = torch.nonzero(~valid, as_tuple=False).squeeze(1)
-            if free_idx.numel() > 0:
-                j_new = int(free_idx[0].item())
-                entries[j_new].copy_(F.normalize(k, dim=0))
-                mask[cell, j_new] = True
-            return
-
-        # otherwise EMA-update nearest (in-place)
-        proto = entries[j]                                  # view
-        proto.mul_(self.alpha).add_(k, alpha=(1.0 - self.alpha))
-        proto.div_(proto.norm(p=2).clamp_min_(1e-12))
+                # encode with momentum encoder
+                idx = features.idx.to(device)
+                hb = self.momentum(theta=theta, phi=phi)
+                hb = torch.nn.functional.normalize(hb, dim=-1)
+                hb = hb.to(dtype=dtype).contiguous()
+                self.E[idx] = hb
     
-    """
     @torch.no_grad()
-    def _assign_and_update(self, table, mask, k, cell, is_pos: bool):
+    def build(self, theta_all: torch.Tensor, phi_all: torch.Tensor,
+                batch_size: int = 8192):
+        """
+        Build memory bank from full tensors in RAM.
+        Assumes: bank row i == dataset id i (recommended).
+        Stores bank on CPU float32; builds FAISS IndexFlatIP with cosine.
+        """
+        device = next(self.momentum.parameters()).device
+        self.momentum.eval()
+        N = theta_all.size(0)
 
-        entries = table[cell]                                  # (J,D)
-        valid = mask[cell]                                     # (J,)
+        self.N = N
+        self.E = torch.empty((N, self.d), dtype=torch.float32, device="cpu")
 
-        if valid.any():
-            sims = torch.mv(entries[valid], k)                 # (J_valid,)
-            j_local = torch.argmax(sims).item()
-            best_sim = sims[j_local].item()
-            j = torch.arange(valid.numel(), device=valid.device)[valid][j_local].item()
-        else:
-            best_sim, j = -1.0, None
+        use_amp = (device.type == "cuda")
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            theta = theta_all[start:end].to(device, non_blocking=True)
+            phi = phi_all[start:end].to(device, non_blocking=True)
 
-        # create new if no valid or too dissimilar and capacity available
-        if (not valid.any() or best_sim < self.tau_assign) and valid.sum().item() < entries.size(0):
-            #j_new = torch.argmax(~valid).item()               # first free slot
-            free_idx = torch.nonzero(~valid, as_tuple=False).squeeze(1)
-            if free_idx.numel() > 0:
-                j_new = free_idx[0].item()  # first free slot
+            with torch.amp.autocast(device.type, enabled=use_amp), torch.no_grad():
+                h = self.momentum(theta=theta.unsqueeze(0), phi=phi.unsqueeze(0))              # (B, d)
+            h = torch.nn.functional.normalize(h, dim=-1).float().cpu()
+
+            self.E[start:end] = h
+
+        # Build FAISS (cosine via inner product on L2-normalized vectors)
+        if self.use_faiss:
+            X = self.E.numpy().astype("float32", copy=False)
+            if X.size == 0:
+                raise ValueError("Empty embedding bank (N=0).")
+            X = np.ascontiguousarray(X)                # ensure C-order
+            if not np.isfinite(X).all():
+                raise ValueError("Embeddings contain NaN/Inf.")
+
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            X = X / np.clip(norms, 1e-12, None)        # avoid divide-by-zero
+            self.index = faiss.IndexFlatIP(self.d)
+            self.index.add(X)
+
+        return self.E
+    
+    @torch.no_grad()
+    def _encode_targets(self, theta_t: torch.Tensor, phi_t: torch.Tensor) -> torch.Tensor:
+        """
+        Encode targets with the momentum encoder (inputs-only) and L2-normalize.
+        Input:  theta_t, phi_t with shape (B, Nt, …)
+        Output: z with shape (B, Nt, D), float32 (on CPU)
+        """
+        device = next(self.momentum.parameters()).device
+        use_amp = (device.type == "cuda")
+
+        with torch.amp.autocast(device.type, enabled=use_amp):
+            z = self.momentum(theta=theta_t.to(device, non_blocking=True),
+                              phi=phi_t.to(device,   non_blocking=True))  # (B,Nt,D)
+        z = F.normalize(z, dim=-1).float().cpu()  # unit vectors for cosine/IP
+        return z  # (B,Nt,D) CPU tensor
+
+    @torch.no_grad()
+    def topM_batch(self,
+                   theta_t: torch.Tensor,
+                   phi_t: torch.Tensor,
+                   M: int = 128,
+                   self_ids: torch.Tensor | None = None):
+        """
+        Batched retrieval with optional self-exclusion.
+
+        Args:
+            theta_t, phi_t: (B, Nt, …) target inputs
+            M:              top-M neighbors per target
+            self_ids:       optional (B, Nt) LongTensor of dataset ids to exclude
+
+        Returns:
+            ids:  (B, Nt, M) np.int64  — neighbor indices (bank rows; = dataset ids if you built 1:1)
+            sims: (B, Nt, M) np.float32 — similarity scores (cosine if IndexFlatIP + unit-norm)
+        """
+        assert self.index is not None, "FAISS index not built."
+        z = self._encode_targets(theta_t, phi_t)  # (B,Nt,D) CPU float32
+        B, Nt, D = z.shape
+        assert D == self.d, f"Dim mismatch: query D={D}, index d={self.d}"
+
+        # Flatten to (B*Nt, D) for FAISS
+        q = z.reshape(B * Nt, D).contiguous().numpy().astype("float32", copy=False)
+        
+        ids_flat, sims_flat = self.faiss_search_chunked(self.index, q, M, self_ids=None, chunk=100)
+        ids  = ids_flat.reshape(B, Nt, M)
+        sims = sims_flat.reshape(B, Nt, M)
+        return ids, sims
+
+    def faiss_search_chunked(self, index, q, M, self_ids=None, chunk=100):
+
+        Bn, d = q.shape
+        K = int(M + (1 if self_ids is not None else 0))
+        K = min(K, getattr(index, "ntotal", K))      # cap to ntotal
+
+        all_I = np.empty((Bn, M), dtype=np.int64)
+        all_D = np.empty((Bn, M), dtype=np.float32)
+
+        for s in range(0, Bn, chunk):
+            print("1",s, chunk)
+            e = min(s + chunk, Bn)
+            D_blk, I_blk = index.search(q[s:e], K)   # (blk, K)
+            print("2",s, chunk)
+
+            if self_ids is None:
+                all_I[s:e] = I_blk[:, :M]
+                all_D[s:e] = D_blk[:, :M].astype(np.float32, copy=False)
             else:
-                return  # no free slot available
-            table[cell, j_new] = F.normalize(k, dim=0)
-            mask[cell, j_new] = True
-            return
-        # otherwise EMA-update nearest
-        if j is not None:
-            proto = table[cell, j]
-            proto.copy_(F.normalize(self.alpha * proto + (1 - self.alpha) * k, dim=0))
-    """
-    @torch.no_grad()
-    def write(self, k: torch.Tensor, theta_cell: torch.Tensor, y: torch.Tensor, is_hard_neg: torch.Tensor=None):
-        """
-        k: (B,N,D) normalized keys to write (teacher/stable encoder)
-        theta_cell: (B,N) long ids in [0,C)
-        y: (B,N,1) labels in {0,1} or probabilities
-        is_hard_neg: (B,N,1) bool (optional) – marks negatives to store
-        """
-        B, N, D = k.shape
-        assert D == self.D
-        kf = k.reshape(B*N, D)
-        cells = theta_cell.reshape(B*N).long()
-
-        ys = y.reshape(B*N, -1)
-
-        if is_hard_neg is None:
-            is_hard_neg = torch.zeros_like(ys, dtype=torch.bool)
-        else:
-            is_hard_neg = is_hard_neg.reshape(B*N, -1).bool()
-        
-        for i in range(B*N):
-            cell = int(cells[i].item())
-
-            if cell < 0 or cell >= self.C:  # skip invalid cell ids
-                continue
-            key = kf[i]
-
-            yi = float(ys[i].item())
-            if yi >= 0.5:
-                self._assign_and_update(self.pos, self.pos_mask, key, cell, True)
-            elif is_hard_neg[i].item():
-                self._assign_and_update(self.neg, self.neg_mask, key, cell, False)
-
-
-    def _gather_cell_protos(self, table, mask, cells):
-        # cells: (B,Nt) long -> list of (B,Nt,J,D) with invalid entries masked later
-        B, Nt = cells.shape
-        J = table.size(1)
-        out = table[cells]             # (B,Nt,J,D)
-        msk = mask[cells]              # (B,Nt,J)
-        return out, msk
-
-    @torch.no_grad()
-    def read(self, q: torch.Tensor, qry_theta_cell: torch.Tensor,
-            K_pos: int = 4, K_neg: int = 0, tau: float = 0.1, lambda_neg: float = 0.5):
-        """
-        Memory-efficient read:
-        - loops over unique θ cells present in the batch,
-        - no (B,Nt,J,D) gathers,
-        - only small (M,J,D) matrices live briefly.
-
-        q: (B,Nt,D) normalized
-        qry_theta_cell: (B,Nt) long
-        returns: r_mem, r_pos, r_neg each (B,Nt,D)
-        """
-        dev = q.device
-        B, Nt, D = q.shape
-        r_pos = torch.zeros(B, Nt, D, device=dev)
-        r_neg = torch.zeros(B, Nt, D, device=dev)
-
-        cells_flat = qry_theta_cell.view(-1).long()
-        uniq_cells = torch.unique(cells_flat)
-
-        q_flat = q.view(B * Nt, D)
-        rpos_flat = r_pos.view(B * Nt, D)
-        rneg_flat = r_neg.view(B * Nt, D)
-
-        
-        for c in uniq_cells.tolist():
-            idx = (cells_flat == c).nonzero(as_tuple=False).squeeze(1)  # (M,)
-            if idx.numel() == 0:
-                continue
-
-            # ---- positives ----
-            mpos = self.pos_mask[c]  # (Jp,)
-            #print(mpos.sum().item())
-
-            if mpos.any():
-                P = self.pos[c, mpos]                    # (Jp,D)
-                sims = (q_flat[idx] @ P.t()) / tau       # (M,Jp)
-                k = min(K_pos, sims.size(1))
-                vals, ids = torch.topk(sims, k=k, dim=1)
-                #print(vals, ids)
-                w = torch.softmax(vals, dim=1)           # (M,k)
-                P_sel = P[ids]                           # (M,k,D)
-                rpos_flat[idx] = (w.unsqueeze(-1) * P_sel).sum(1)
-
-            
-            # ---- negatives (optional) ----
-            if K_neg > 0:
-                mneg = self.neg_mask[c]
-                if mneg.any():
-                    N = self.neg[c, mneg]                # (Jn,D)
-                    sims_n = (q_flat[idx] @ N.t()) / tau
-                    k = min(K_neg, sims_n.size(1))
-                    v, idn = torch.topk(sims_n, k=k, dim=1)
-                    w = torch.softmax(v, dim=1)
-                    N_sel = N[idn]
-                    rneg_flat[idx] = (w.unsqueeze(-1) * N_sel).sum(1)
-
-        r_pos = rpos_flat.view(B, Nt, D)
-        r_neg = rneg_flat.view(B, Nt, D)
-        r_mem = r_pos - lambda_neg * r_neg
-        return r_mem, r_pos, r_neg
+                sid = np.asarray(self_ids[s:e], dtype=np.int64)
+                out_i = np.empty((e - s, M), dtype=I_blk.dtype)
+                out_d = np.empty((e - s, M), dtype=D_blk.dtype)
+                for r in range(e - s):
+                    keep_i, keep_d = [], []
+                    for i, d in zip(I_blk[r], D_blk[r]):
+                        if i == sid[r]:        # self-exclude
+                            continue
+                        keep_i.append(i); keep_d.append(d)
+                        if len(keep_i) == M: break
+                    # pad if fewer than M (rare)
+                    if len(keep_i) < M:
+                        pad = M - len(keep_i)
+                        keep_i += [-1]*pad
+                        keep_d += [np.float32(-1)]*pad
+                    out_i[r], out_d[r] = keep_i, np.asarray(keep_d, dtype=np.float32)
+                all_I[s:e], all_D[s:e] = out_i, out_d
+        return all_I, all_D

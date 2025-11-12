@@ -1,3 +1,5 @@
+from email.policy import strict
+from resolve.conditional_neural_process_family.memory_bank import MemoryBank
 import torch
 import torch.nn as nn
 from resolve.conditional_neural_process_family.class_attention import CrossAttentionDual,  CrossAttention
@@ -54,58 +56,23 @@ class DecoderHead(nn.Module):
         #mu, rho = torch.split(hidden, hidden.size(-1) // 2, dim=-1)
         #sigma = F.softplus(rho) + 1e-6
         return hidden
-"""
-# Context side
-        self.ctx_enc = ContextTransformerEncoder(theta_dim=d_theta,
-            phi_dim=d_phi,
-            y_dim=d_y,
-            embed_dim= d_model,
-            depth= 4,
-            num_heads= 4,
-            mlp_ratio= 4.0,
-            dropout= 0.0,
-            proj_out_dim= None,  # if set, final linear to this dim
-            use_cls_token= False       # set False: mean over feature tokens
-        )
-"""
-class AttnLNP(nn.Module):
+
+class AttnCNP(nn.Module):
     def __init__(self,
                  d_theta, d_phi, d_y,
                  d_model=32,
                  encoder_hidden=[128,128],
                  mode="concat",
                  theta_embed_dim=None,
-                 n_heads=4,
-                 z_dim=8):
+                 n_heads=4):
         super().__init__()
-
-        # Context encoder (set-based). You had a Transformer; that’s fine too.
-        # Keep this line if you want the transformer version instead:
-        # self.ctx_enc = ContextTransformerEncoder(...)
-
-        # Simpler & consistent with qry/tgt encoders:
-        #self.ctx_enc = FeatureEncoder(
-        #    phi_dim=d_phi, y_dim=d_y, theta_in_dim=d_theta,
-        #    hidden=encoder_hidden, out_dim=d_model,
-        #    mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
-        #)
-        self.ctx_enc = ContextTransformerEncoder(theta_dim=d_theta,
-            phi_dim=d_phi,
-            y_dim=d_y,
-            embed_dim= d_model,
-            depth= 8,
-            num_heads= 4,
-            mlp_ratio= 4.0,
-            dropout= 0.0,
-            proj_out_dim= None,  # if set, final linear to this dim
-            use_cls_token= False       # set False: mean over feature tokens
-        )
 
         self.d_model = d_model
         self.d_theta = d_theta
         self.d_phi   = d_phi
         self.d_y     = d_y
 
+        # encoders
         # Target query encoder: x_t = (theta,phi)  → R_t (no y_t)
         self.qry_enc = FeatureEncoder(
             phi_dim=d_phi, y_dim=None, theta_in_dim=d_theta,
@@ -113,12 +80,23 @@ class AttnLNP(nn.Module):
             mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
         )
 
-        # Target encoder for the POSTERIOR path ONLY (uses y_t at train)
-        self.tgt_enc = FeatureEncoder(
+        self.mom_enc = FeatureEncoder(
+            phi_dim=d_phi, y_dim=None, theta_in_dim=d_theta,
+            hidden=encoder_hidden, out_dim=d_model,
+            mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
+        )
+        self.mom_enc.load_state_dict(self.qry_enc.state_dict(), strict=True)   # start identical
+        self.mom_enc.eval()
+        for p in self.mom_enc.parameters(): p.requires_grad_(False)
+        self.memory_bank = MemoryBank(d_model, self.qry_enc, self.mom_enc, tau=0.999, use_faiss=True)
+
+        # Simpler & consistent with qry/tgt encoders:
+        self.ctx_enc = FeatureEncoder(
             phi_dim=d_phi, y_dim=d_y, theta_in_dim=d_theta,
             hidden=encoder_hidden, out_dim=d_model,
             mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
         )
+
 
         # Cross-attention (class-conditional dual)
         self.attn = CrossAttentionDual(d_model, n_heads=n_heads, out_dim=d_model)
@@ -128,17 +106,7 @@ class AttnLNP(nn.Module):
         self.norm_kv = nn.LayerNorm(d_model)
         self.norm_r  = nn.LayerNorm(d_model)
 
-        # Latent
-        self.z_dim           = int(z_dim) if z_dim is not None else 0
-        self.use_latent      = (self.z_dim > 0)
-
         in_dim = 2*d_model
-        if self.use_latent:
-            self.post_q      = LatentPosteriorCT(d_model=self.d_model, z_dim=self.z_dim)   # q(z|C,T)
-            self.prior_p     = LatentPriorC(d_model=self.d_model,    z_dim=self.z_dim)     # p(z|C)
-            self.prior_theta = LatentPriorTheta(d_theta=self.d_theta, z_dim=self.z_dim)    # p(z|θ̄)
-            self.latent_proj = LatentTokenProj(z_dim=self.z_dim, d_model=self.d_model, s_bias_init=-3.0)
-            in_dim += self.z_dim
 
         # Bernoulli decoder: base + Δ (additive logit)
         self.base_decoder  = DecoderHead(in_dim, out_dim=1)  # logits
@@ -176,8 +144,9 @@ class AttnLNP(nn.Module):
         wS_ctx = (context_y.squeeze(-1) > 0.5).float()                            # (B,Nc) in [0,1]
 
         # target query (x_t) → R_t
-        R_t_raw = self.qry_enc(theta=query_theta, phi=query_phi)                  # (B,Nt,D)
-        R_t     = self.norm_q(R_t_raw)
+        
+        R_t = self.qry_enc(theta=query_theta, phi=query_phi)                  # (B,Nt,D)
+        ids, sims = self.memory_bank.topM_batch(query_theta, query_phi, M=5)
 
         r_all,_,_,_ = self.attn(
             Q_src=R_t,

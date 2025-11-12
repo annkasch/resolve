@@ -153,11 +153,11 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
 
         # True-positive reward on positives
         if self.lambda_tp > 0.0:
-            #overshoot_tp = torch.relu(self.p[pos_mask] - self.tau_tp)
-            #loss[pos_mask] = loss[pos_mask] - self.lambda_tp * (overshoot_tp ** 2)
-            overshoot_tp = (self.p - self.tau_tp).relu()
-            reward_tp = overshoot_tp.square() * y
-            loss = loss - (self.lambda_tp * reward_tp)
+            overshoot_tp = torch.relu(self.tau_t-self.p[pos_mask])
+            loss[pos_mask] = loss[pos_mask] + self.lambda_tp * (overshoot_tp ** 2)
+            #overshoot_tp = (self.p - self.tau_tp).relu()
+            #reward_tp = overshoot_tp.square() * y
+            #loss = loss - (self.lambda_tp * reward_tp)
 
         if self.reduction == "mean":
             return loss.mean()

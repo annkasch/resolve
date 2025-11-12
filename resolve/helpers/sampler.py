@@ -6,27 +6,28 @@ import numpy as np
 import math
 
 class Sampler():
-    def __init__(self, batch_size: int,  positive_condition: str, shuffle="global", seed: Optional[int] = None):
+    def __init__(self, positive_condition: str, seed, shuffle="global"):
         super().__init__()
         self.shuffle = shuffle
-        self.batch_size = batch_size
         self.positive_fn = self.positive_function(positive_condition) if positive_condition else None
         self.seed = seed
     
-    def build_batches(self, n_samples: int):
+    def build_batches(self, n_samples: int, batch_size: int, randperm = None):
+        rperm = randperm
         if self.shuffle == "global":
             perm = torch.randperm(n_samples, generator=torch.Generator().manual_seed(self._epoch_seed()))
         elif self.shuffle == "batch_wise":
-            perm = torch.cat([torch.arange(i * self.batch_size, min((i + 1) * self.batch_size, n_samples)) for i in torch.randperm((n_samples + self.batch_size - 1) // self.batch_size, generator=torch.Generator().manual_seed(self._epoch_seed()))])
+            rperm = torch.randperm((n_samples + batch_size - 1) // batch_size, generator=torch.Generator().manual_seed(self._epoch_seed())) if rperm is None else rperm
+            perm = torch.cat([torch.arange(i * batch_size, min((i + 1) * batch_size, n_samples)) for i in rperm])
         else:
             perm = torch.arange(n_samples)
 
-        batches = torch.split(perm, split_size_or_sections=self.batch_size)
-
-        meta = {"batch_size": self.batch_size, "num_batches": len(batches),
+        batches = torch.split(perm, split_size_or_sections=batch_size)
+        
+        meta = {"batch_size": batch_size, "num_batches": len(batches),
                 "pos_frac": None, "num_epochs": 1}
 
-        return batches, None, meta
+        return batches, None, meta, rperm
 
     def _epoch_seed(self) -> int:
         if not hasattr(self, '_epoch_counter'): self._epoch_counter = 0
@@ -64,13 +65,13 @@ class Sampler():
         seed: int | None = None,          # reproducible positive order
     ):
 
-
+        seed=seed if seed is not None else self.seed
         # positives: build pool with reuse cap, then shuffle with seed
         pos_pool = torch.empty(0, dtype=torch.long)
         if nP_tot > 0:
             pos_pool = (pos_idx.repeat_interleave(pos_idx.numel()*max_pos_reuse_per_epoch) if max_pos_reuse_per_epoch > 0 else pos_idx)
             pos_pool = pos_pool[:nP_tot]
-            if seed is not None and pos_pool.numel() > 1:
+            if pos_pool.numel() > 1:
                 g = torch.Generator().manual_seed(seed)
                 perm = torch.randperm(pos_pool.numel(), generator=g)
                 pos_pool = pos_pool[perm]
@@ -90,7 +91,7 @@ class Sampler():
             else:
                 base = unused_neg_subset
 
-            if seed is not None and base.numel() > 1:
+            if base.numel() > 1:
                 g = torch.Generator().manual_seed(seed+1)
                 perm = torch.randperm(base.numel(), generator=g)
                 base = base[perm]
@@ -98,8 +99,7 @@ class Sampler():
             keep = Nneed - take_new + keep
 
         g = torch.Generator()
-        if seed is not None:
-            g.manual_seed(seed + 2)
+        g.manual_seed(seed + 2)
         perm = torch.randperm(last_neg_subset.numel(), generator=g)
         sticky = last_neg_subset[perm[:keep]] if keep else None
 
@@ -128,10 +128,14 @@ class Sampler():
         theta: torch.Tensor,                     # shape [N] or [N, d]
         y: torch.Tensor,  
         target_pos_frac: float,
+        batch_size: int,
         max_pos_reuse_per_epoch: int = 0,
         sticky_frac: float = 0.25,
         unused_neg_subset: Dict[Any, torch.Tensor] | None = None,  # keyed by group key
+        seed = None
     ):
+        
+
         # precompute inverse once
         if theta.ndim == 1:
             _, inverse = torch.unique(theta, return_inverse=True)
@@ -158,6 +162,7 @@ class Sampler():
             pos_g = pos_idx[pos_gid == gi]
             neg_g = neg_idx[neg_gid == gi]
             
+            gseed = seed if seed is not None else self.seed + gi
 
             unused_neg_g = None
             if unused_neg_subset is not None:
@@ -165,7 +170,7 @@ class Sampler():
                 inv_unused = inverse[unused_neg_subset]
                 unused_neg_g = unused_neg_subset[inv_unused == gi]
 
-            gseed = None if self.seed is None else self.seed + gi
+            
 
             nP_max = min(pos_g.numel()*reuse, n) if target_pos_frac > 0. else 0
             nP_tot += nP_max
@@ -181,14 +186,33 @@ class Sampler():
 
             selected = torch.cat([pos_pool, neg_plan])
             # don’t sort—preserve randomness, save time
-            b_size = min(n+nN_min, self.batch_size)
+            b_size = min(n+nN_min, batch_size)
             batches.extend(selected.split(b_size))
             unused.append(rem)
+
+        # global shuffle across all items, then re-split to fixed b_size
+        if self.shuffle == "global":
+            if len(batches) == 0:
+                flat = selected.new_empty(0)
+            else:
+                flat = torch.cat(batches, dim=0)                    # preserves device/dtype
+
+            perm = flat[torch.randperm(flat.numel(), device=flat.device)]
+            # keep or drop the last short batch:
+            # drop_last = True  -> drop it; False -> keep it
+            drop_last = False
+            if drop_last:
+                L = (perm.numel() // batch_size) * batch_size
+                perm = perm[:L]
+
+            batches = list(perm.split(batch_size))                      # list[Tensor]
+            b_size = batch_size
 
         unused = torch.cat(unused) if unused else neg_idx.new_empty((0,), dtype=torch.long)
         nepochs = self.epochs_until_full_coverage(neg_idx.numel(), int((n+nN_min)*(1-target_pos_frac))*len(batches), sticky_frac)
         meta = {"batch_size": b_size, "num_batches": len(batches),
                 "pos_frac": (nP_tot / max(1, (b_size * len(batches)))), "num_epochs": nepochs}
+
         return batches, unused, meta
     
     @staticmethod
@@ -223,12 +247,13 @@ class Sampler():
     def build_batches_with_posneg_ratio(self,
         y: torch.Tensor,
         target_pos_frac: float,
+        batch_size: int,
         max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
         sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
         last_neg_subset: torch.Tensor | None = None,
         seed: int | None = None,          # reproducible positive order
     ):
-        assert self.batch_size >= 2
+        assert batch_size >= 2
         n_total = y.shape[0]
 
         pos_mask = self.get_positive_indices(y)
@@ -239,7 +264,7 @@ class Sampler():
         if nP == 0 or nN == 0:
             raise ValueError("Both classes required.")
         # batches to roughly cover n_total rows
-        M = max(1, math.ceil(n_total /self.batch_size))
+        M = max(1, math.ceil(n_total /batch_size))
 
         # epoch positive budget
         reuse = max(1, max_pos_reuse_per_epoch)
@@ -252,18 +277,19 @@ class Sampler():
         else:   
             Nneed = int(round((Ptot / target_pos_frac) * (1.-target_pos_frac)))
         n_total = Ptot + Nneed
-        M = max(1, math.ceil(n_total / self.batch_size))
+        M = max(1, math.ceil(n_total / batch_size))
 
         # per-batch positive counts (balanced rounding, at least 0, at most B-1)
         avgk = Ptot / M
         kfloor = int(math.floor(avgk))
         rem = Ptot - kfloor * M
-        k_list = [min(self.batch_size-1, max(0, kfloor + (1 if b < rem else 0))) for b in range(M)]
+        k_list = [min(batch_size-1, max(0, kfloor + (1 if b < rem else 0))) for b in range(M)]
 
         # positives: build pool with reuse cap, then shuffle with seed
         pos_pool = (pos_idx.repeat_interleave(reuse) if max_pos_reuse_per_epoch > 0 else pos_idx)
         pos_pool = pos_pool[:Ptot]
-        if seed is not None and pos_pool.numel() > 1:
+        seed = seed if seed is not None else self.seed
+        if pos_pool.numel() > 1:
             g = torch.Generator().manual_seed(seed)
             perm = torch.randperm(pos_pool.numel(), generator=g)
             pos_pool = pos_pool[perm]
@@ -274,7 +300,7 @@ class Sampler():
             pos_chunks.append(pos_pool[pptr:pptr+k]); pptr += k
 
         # negatives: sticky + seeded shuffle (no replacement in plan)
-        Nneed = sum(self.batch_size - k for k in k_list)
+        Nneed = sum(batch_size - k for k in k_list)
         sticky = (last_neg_subset[: int(sticky_frac * Nneed)]
                 if (last_neg_subset is not None and Nneed > 0) else torch.empty(0, dtype=torch.long))
 
@@ -289,7 +315,7 @@ class Sampler():
                 mask = ~torch.isin(neg_idx, sticky)
                 base = neg_idx[mask]
 
-            if seed is not None and base.numel() > 1:
+            if base.numel() > 1:
                 g = torch.Generator().manual_seed(seed+1)
                 perm = torch.randperm(base.numel(), generator=g)
                 base = base[perm]
@@ -302,13 +328,12 @@ class Sampler():
         # chunk negatives
         neg_chunks, nptr = [], 0
         for k in k_list:
-            need = self.batch_size - k
+            need = batch_size - k
             neg_chunks.append(neg_plan[nptr:nptr+need]); nptr += need
 
         # assemble batches
         g = torch.Generator()
-        if seed is not None:
-            g.manual_seed(seed+2)
+        g.manual_seed(seed+2)
 
         batches = []
         for b in range(M):
@@ -319,9 +344,9 @@ class Sampler():
         nepochs = self.epochs_until_full_coverage(nN, Nneed, sticky_frac)
 
         state = neg_plan
-        meta  = {"batch_size": self.batch_size, "num_batches": M,
-                "pos_frac": (Ptot / max(1, (self.batch_size * M))), "num_epochs": nepochs}
-        return batches, state, meta
+        meta  = {"batch_size": batch_size, "num_batches": M,
+                "pos_frac": (Ptot / max(1, (batch_size * M))), "num_epochs": nepochs}
+        return batches, state, meta, perm
 
     def positive_function(self, positive_condition):
         positive_fn = np.full(len(positive_condition), None) 
@@ -365,7 +390,7 @@ class Sampler():
     
     def mix_by_file_chunks(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor, mixup_ratio: float, *,
                         use_beta: Optional[Tuple[float, float]]=(1.,1.),
-                        margin: float=0.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        margin: float=0.0, seed: int | None = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Apply _mix_bg_sig separately to chunks of data that share the same file ID.
         
@@ -398,10 +423,11 @@ class Sampler():
             y_chunk = y[mask]
             
             # Apply mixing to this chunk
+            seed = seed if seed is not None else self.seed
             theta_m, phi_m, y_m = self._mix_negatives_positives(theta_chunk, phi_chunk, y_chunk,
                                                     use_beta=use_beta,
                                                     margin=margin,
-                                                    seed=self.seed,
+                                                    seed=seed,
                                                     mix_ratio=mixup_ratio)
 
             theta_mixed.append(theta_m)
@@ -417,7 +443,7 @@ class Sampler():
 
     def _mix_negatives_positives(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, *,
                     use_beta: Optional[Tuple[float, float]]=(1.,1.), margin: float=0.0,
-                    seed: int=42, mix_ratio: float=1.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                    seed: int=None, mix_ratio: float=1.0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Mix negative and positive samples, replacing a portion of the original samples with mixed versions.
         
@@ -440,6 +466,7 @@ class Sampler():
         neg_idx = (~pos).nonzero(as_tuple=False).view(-1)
         
         # Initialize random generator
+        seed = seed if seed is not None else self.seed
         g = torch.Generator().manual_seed(seed)
         
         # Initialize output tensors with original data

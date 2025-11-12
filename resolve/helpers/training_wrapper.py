@@ -69,6 +69,7 @@ def _device() -> torch.device:
         print("running on gpu")
         return torch.device("cuda")
     if torch.backends.mps.is_available():
+        print("running on mps")
         return torch.device("mps")
     print("running on cpu")
     return torch.device("cpu")
@@ -210,6 +211,7 @@ class Trainer:
             self.criterion = torch.nn.BCEWithLogitsLoss() if self.is_binary else torch.nn.HuberLoss()
         
         self.device = _device()
+        self.model.to(self.device)
 
         # AMP policy
         self._use_cuda = (self.device.type == "cuda")
@@ -236,18 +238,17 @@ class Trainer:
         output = self.model(
             query_theta=query.theta, query_phi=query.phi, query_y=targets,
             context_theta=context.theta, context_phi=context.phi, context_y=context.y,
-            target_y=targets, qry_theta_cell=query.theta_cell, return_ctx_for_write=True,train=train, step=step
+            target_y=targets, train=train, step=step
         )
 
         return output, targets
 
     def _run_epoch(self, loader, optimizer=None, train: bool = True, desc: str = "train") -> Tuple[float, np.ndarray, np.ndarray]:
         #device = next(self.model.parameters()).device
-        device = next(self.model.parameters(), torch.empty(0, device=getattr(self.model, "_out_device", "cpu"))).device
         self.model.train(train)
         running_loss = 0.0
         y_true_all, y_pred_all = [], []
-        accum_steps = math.ceil(loader.dataset.batch_size/loader.dataset.meta["batch_size"])
+        accum_steps = math.ceil(loader.dataset.batch_size_tgt/loader.dataset.meta["batch_size"])
         
         if train and self.criterion.base_loss_fn is not skip_loss:
             optimizer.zero_grad(set_to_none=True)
@@ -257,7 +258,7 @@ class Trainer:
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
         for i, batch in enumerate(pbar):
             with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=autocast_dtype):
-                output, targets = self._forward_batch(batch, device, train=train, step=i+self.epoch*len(loader))
+                output, targets = self._forward_batch(batch, self.device, train=train, step=i+self.epoch*len(loader))
 
                 logit = output.get("logits", None)
 
@@ -297,23 +298,6 @@ class Trainer:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
             
-            # --- memory write: POSITIVES ONLY (proof of principle) ---
-            """
-            mem=False
-            if train and mem ==True:
-                with torch.no_grad():
-                    R_ctx   = output["R_ctx_for_write"]                  # on model device
-                    ctx_theta_cell = _to_dev(context.theta_cell, device)
-                    y_write = _to_dev(context.y, device)
-                    #k_write = self.model.build_mem_keys(ctx_theta, R_ctx)
-                    #y_write = context.y
-                    #print(context.theta.shape)
-                    self.model.memory.write(k=R_ctx, theta_cell=ctx_theta_cell, y=y_write)
-            """
-            #with torch.no_grad():
-            #    occ = self.model.memory.pos_mask.sum(dim=1).float().mean().item()
-            #print(f"mean pos protos per θ-cell: {occ:.2f}")
-            
             running_loss += float(loss.detach().cpu())
             y_true_all.append(targets.reshape(-1))
             
@@ -344,7 +328,7 @@ class Trainer:
         os.makedirs(ckpt_dir, exist_ok=True)
         best_ckpt = os.path.join(ckpt_dir, ckpt_name)
 
-        self.model.to(self.device)
+        
         # move memory buffers once; do NOT call .to(device) again in the loop
         #self.model.memory.to(device)
 

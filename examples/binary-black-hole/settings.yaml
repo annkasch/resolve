@@ -6,7 +6,7 @@ path_settings:
   path_out_model: ./binary-black-hole/out
 model_settings:
   network:
-    model_used: AttnLNP  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
+    model_used: AttnCNP  # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
     models: 
       ConditionalNeuralProcess:
         representation_size: 32
@@ -34,12 +34,27 @@ model_settings:
         encoder_sizes: [128]
         n_heads: 4 
       AttnLNP:
-        representation_size: 32
-        encoder_sizes: [128,128]
-        theta_embed_dim: null
+        representation_size: 64
+        encoder_sizes: [64,128,256,128,64]
+        theta_embed_dim: 32
         n_heads: 4 
-        mode: concat  # concat
-        z_dim: 8
+        mode: concat  # concat # film
+        z_dim: null
+      AttnCNP:
+        representation_size: 64
+        encoder_sizes: [64,128,256,128,64]
+        theta_embed_dim: 32
+        n_heads: 4 
+        mode: concat  # concat # film
+      GraphCNP:
+        representation_size: 64
+        encoder_sizes: [128,128]
+      TCL_CNP_LocalGAT:
+        representation_size: 64
+        encoder_sizes: [64,128,256,128,64]
+        theta_embed_dim: 32
+        n_heads: 4 
+        mode: concat  # concat # film
       MarginalizedNeuralRatioEstimator:
         encoder_sizes: [128, 64]
         decoder_sizes: [128, 64]
@@ -60,15 +75,15 @@ model_settings:
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
       context_is_subset: false # if true, context points are a subset of target points; if false, context and target points are drawn independently
-      context_ratio: 0.33 # ratio of context points to total points if context_is_subset is true
+      context_ratio: 0.5 # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
       use_schedule: false
       skip_warmup: false
       positive_ratio_train: null # null, for scheduled warmup [0.2, 0.1, 0.05], background only 0
-      max_positive_reuse: 3
+      max_positive_reuse: 5
       num_data_pass_per_phase: 2
     batch_size: 1000
-    training_epochs: 2
+    training_epochs: 10
     patience: 200
     learning_rate: 0.001
     report_frequency: 100
@@ -76,11 +91,11 @@ model_settings:
       base_loss_fn: bce_with_logits    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest), 'brier' Brier Loss
       prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
-      alpha_pos:  1.0     # Weight for the positive (signal) class. 
+      alpha_pos:  0.99     # Weight for the positive (signal) class. 
                           # Lower (<1) downweights positives, higher (>1) emphasizes them. 
                           # Common range: 0.1–0.5. Set to 1 for no reweighting.
-      alpha_neg:  1.0     # Optional explicit weight for the negative (background) class. 
-                          # If None, uses (1 - alpha_pos). Set to 1 for no reweighting.
+      alpha_neg:  null     # Optional explicit weight for the negative (background) class. 
+                          # If None (null), uses (1 - alpha_pos). Set to 1 for no reweighting.
       gamma_pos:  2.0     # Focusing parameter (Focal Loss) for positives. 
                           # Increases focus on hard-to-classify positives. Typical values: 1–2. 
                           # Set to 0 to disable focusing.

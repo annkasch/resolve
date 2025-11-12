@@ -1,5 +1,6 @@
 from .transformer_cnp import TransformerCNP
 from .attn_latent_neural_process_model import AttnLNP
+from .attn_neural_process_model import AttnCNP
 from .conditional_neural_process_model import DeterministicEncoder
 from .conditional_neural_process_model import DeterministicDecoder
 from .conditional_neural_process_model import ConditionalNeuralProcess

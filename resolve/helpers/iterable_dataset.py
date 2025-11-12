@@ -18,8 +18,8 @@ import functools
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
 
-ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y", "theta_cell"))
-QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi", "theta_cell"))
+ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y", "idx"))
+QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi", "idx"))
 
 BatchCollection = collections.namedtuple(
     "BatchCollection",
@@ -32,13 +32,15 @@ class InMemoryIterableData(IterableDataset):
                  normalizer: Optional[Normalizer]=Normalizer(), mode: Optional[str] = "train") -> None:
         super().__init__()
         
-        self.files, self.batch_size, self.shuffle, self.seed = list(files), int(batch_size), shuffle, seed
-
+        self.files, self.shuffle, self.seed = list(files), shuffle, seed
         self.parameter_config, self.dataset_config = (parameter_config or {}), dataset_config
-        
+        self.batch_size_tgt = math.ceil(batch_size*(1.-self.dataset_config.get("context_ratio", 1./3.)))
+        self.batch_size_ctx = batch_size - self.batch_size_tgt
+        self.context_ratio = round(self.batch_size_ctx/batch_size, int(math.log10(batch_size)))
+
         self.mode = mode
         self._normalizer = normalizer
-        self.sampler = Sampler(self.batch_size, positive_condition, shuffle=self.shuffle, seed=self.seed)
+        self.sampler = Sampler(positive_condition, shuffle=self.shuffle, seed=self.seed)
 
         self.state = None
         self.meta = {}
@@ -48,10 +50,9 @@ class InMemoryIterableData(IterableDataset):
         
         self.theta_to_id = self.sampler.get_unique_ids(theta)
 
-        
         self.data = self._set_data(theta, phi, y, fidx)
         
-        if not isinstance(self.dataset_config.get('positive_ratio_train'), list):
+        if not isinstance(self.dataset_config.get('positive_ratio_train'), list) and self.dataset_config.get("positive_ratio_train", None) is not None:
             self.set_batch_schedule(target_pos_frac=self.dataset_config.get("positive_ratio_train", None), max_pos_reuse_per_epoch = self.dataset_config.get("max_positive_reuse",0.), sticky_frac = 0.25, seed=self.dataset_config.get("seed",12345))
         
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
@@ -59,7 +60,7 @@ class InMemoryIterableData(IterableDataset):
 
         pos_mask = self.sampler.get_positive_indices(y)
         positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
-
+        splitter = Splitter(self.shuffle, seed=42)
         if self.mode == "train":
             # apply normalization
             self._normalizer = Normalizer(self.dataset_config.get("use_feature_normalization", None))
@@ -73,39 +74,61 @@ class InMemoryIterableData(IterableDataset):
 
             # split into training, validation and testing data
             val_size = 1 - self.dataset_config.get('train_ratio',0.6)
-            splitter = Splitter(self.shuffle, seed=42)
+            
             if val_size > 0.:
                 theta, theta_val, phi, phi_val, y, y_val, fidx, fidx_val = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=val_size)
                 
                 test_size = self.dataset_config.get('test_ratio',0.2)/val_size
                 if test_size > 0. :
                     theta_val, theta_test, phi_val, phi_test, y_val, y_test, fidx_val, fidx_test = splitter.train_test_split(theta_val, phi_val, y_val, fidx_val, groups=theta_val, test_size=test_size)
-            
+                    theta_test, theta_test_ctx, phi_test, phi_test_ctx, y_test, y_test_ctx, fidx_test, fidx_test_ctx = splitter.train_test_split(theta_val, phi_val, y_val, fidx_val, groups=theta_val, test_size=self.context_ratio)
+                    
+                theta_val, theta_val_ctx, phi_val, phi_val_ctx, y_val, y_val_ctx, fidx_val, fidx_val_ctx = splitter.train_test_split(theta_val, phi_val, y_val, fidx_val, groups=theta_val, test_size=self.context_ratio)
+                
+                
+            # split training data into context and target data
+            theta, theta_ctx, phi, phi_ctx, y, y_ctx, fidx, fidx_ctx = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=self.context_ratio)
+
+            # apply mixup to context data only
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
 
-                theta, phi, y, fidx = self.sampler.mix_by_file_chunks(
-                        theta, phi, y, fidx,self.dataset_config.get('mixup_ratio'),
+                theta_ctx, phi_ctx, y_ctx, fidx_ctx = self.sampler.mix_by_file_chunks(
+                        theta_ctx, phi_ctx, y_ctx, fidx_ctx,self.dataset_config.get('mixup_ratio'),
                         use_beta=self.dataset_config.get('use_beta', None),
                         margin=float(self.dataset_config.get('mixup_margin', 0.0))
                     )
-            batches, self.status, self.meta = self.sampler.build_batches(phi.shape[0])
+                
+            batches, self.status, self.meta, rperm = self.sampler.build_batches(phi.shape[0], batch_size=self.batch_size_tgt)
+            batches_ctx, _, _, _ = self.sampler.build_batches(phi_ctx.shape[0], batch_size=self.batch_size_ctx, randperm=rperm)
             self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
+            
+            batches_val_tgt,_,_,rperm = self.sampler.build_batches(phi_val.shape[0], batch_size=self.batch_size_tgt)
+            batch_size = self.batch_size_ctx if rperm is None else int(math.floor(phi_val_ctx.shape[0] / len(rperm)))
+            batches_val_ctx = self.sampler.build_batches(phi_val_ctx.shape[0], batch_size=batch_size, randperm=rperm)[0]
+            
+            batches_test_tgt,_,_,rperm = self.sampler.build_batches(phi_test.shape[0], batch_size=self.batch_size_tgt)
+            batch_size = self.batch_size_ctx if rperm is None else int(math.ceil(phi_test_ctx.shape[0] / len(rperm)))
+            batches_test_ctx = self.sampler.build_batches(phi_test_ctx.shape[0], batch_size=batch_size, randperm=rperm)[0]
 
             data = {
-                "train": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx, "batches": batches},
-                "test": {"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": self.sampler.build_batches(phi_test.shape[0])[0]},
-                "validate": {"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": self.sampler.build_batches(phi_val.shape[0])[0]}
+                "train": {"theta": [theta_ctx,theta], "phi": [phi_ctx,phi], "y": [y_ctx,y], "file_indices": [fidx_ctx,fidx], "batches": [batches_ctx, batches]},
+                "test": {"theta": [theta_test_ctx,theta_test], "phi": [phi_test_ctx,phi_test], "y": [y_test_ctx,y_test], "file_indices": [fidx_test_ctx,fidx_test], "batches": [batches_test_ctx, batches_test_tgt]},
+                "validate": {"theta": [theta_val_ctx,theta_val], "phi": [phi_val_ctx,phi_val], "y": [y_val_ctx,y_val], "file_indices": [fidx_val_ctx,fidx_val], "batches": [batches_val_ctx, batches_val_tgt]}
             }
 
         else:
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
             phi = self._normalizer.transform(x=phi, feature_grp="phi")
             theta = theta.float().contiguous(); phi = phi.float().contiguous()
-            batches, self.status, self.meta = self.sampler.build_batches(phi.shape[0])
+            
+            theta, theta_ctx, phi, phi_ctx, y, y_ctx, fidx, fidx_ctx = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=self.context_ratio)
+            
+            batches, self.status, self.meta, rperm = self.sampler.build_batches(phi.shape[0],batch_size=self.batch_size_tgt)
+            batches_ctx, _, _, _  = self.sampler.build_batches(phi_ctx.shape[0],batch_size=self.batch_size_ctx, randperm=rperm)
             self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
 
             data = {
-                f"{self.mode}": {"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": batches},
+                f"{self.mode}": {"theta": [theta_ctx.contiguous(), theta.contiguous()], "phi": [phi_ctx.contiguous(),phi.contiguous()], "y": [y_ctx,y], "file_indices": [fidx_ctx, fidx], "batches": [batches_ctx, batches]},
             }
 
         return data
@@ -119,20 +142,25 @@ class InMemoryIterableData(IterableDataset):
 
         # train sets the batch size and needs to be processed first
         if self.mode == "train" and target_pos_frac != None and self.dataset_config.get('mixup_ratio', 0.) == 0.0:
-            
-            self.data["train"]["batches"], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
-                self.data["train"]["file_indices"],
-                self.data["train"]["y"],
+            self.data["train"]["batches"][0], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
+                self.data["train"]["file_indices"][0],
+                self.data["train"]["y"][0],
                 target_pos_frac=target_pos_frac,
+                batch_size=self.batch_size_ctx,
                 max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
                 sticky_frac=sticky_frac,
                 unused_neg_subset=self.state
             )
+            batch_size_tgt = math.ceil(self.data["train"]["phi"][1].shape[0]/self.meta["num_batches"])
 
+            rperm = torch.arange(self.meta["num_batches"]) if self.sampler.shuffle == "batch_wise" else None
+            self.data[self.mode]["batches"][1], _, meta, _ = self.sampler.build_batches(self.data[self.mode]["phi"][1].shape[0], batch_size=batch_size_tgt, randperm=rperm)
+            self.meta["batch_size"] = meta["batch_size"]
             print(self.meta)
         else:
-            self.data[self.mode]["batches"], self.state, self.meta = self.sampler.build_batches(self.data[self.mode]["phi"].shape[0])
-    
+            self.data[self.mode]["batches"][1], self.state, self.meta, rperm = self.sampler.build_batches(self.data[self.mode]["phi"][1].shape[0], batch_size=self.batch_size_tgt)
+            self.data[self.mode]["batches"][0] = self.sampler.build_batches(self.data[self.mode]["phi"][0].shape[0], batch_size=self.batch_size_ctx, randperm=rperm)[0]
+            
 
     @staticmethod
     def _read_in_from_file(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -236,18 +264,30 @@ class InMemoryIterableData(IterableDataset):
         y     = store.get("y")
 
         batches = store.get("batches", None)
-        total_batches = len(batches)
+        total_batches = len(batches[1])
         b_start, b_end = self._compute_worker_slice(total_batches)  # reuse same helper; it just slices a range
         if b_start >= b_end:
             return iter(())
 
         for b in range(b_start, b_end):
-            idx = batches[b]  # 1D LongTensor of indices for this batch
-            phib = phi.index_select(0, idx)
-            thetab = theta.index_select(0, idx) if theta is not None else None
-            yb     = y.index_select(0, idx)     if y     is not None else None
+            idx_tgt = batches[1][b]  # 1D LongTensor of indices for this batch
+            phi_tgt = phi[1].index_select(0, idx_tgt).unsqueeze(0)
+            theta_tgt = theta[1].index_select(0, idx_tgt).unsqueeze(0) if theta[1] is not None else None
+            y_tgt     = y[1].index_select(0, idx_tgt).unsqueeze(0)     if y[1]     is not None else None
 
-            yield self._format_batch(thetab, phib, yb)
+            idx_ctx = batches[0][b]  # 1D LongTensor of indices for this batch
+            phi_ctx = phi[0].index_select(0, idx_ctx).unsqueeze(0)
+            theta_ctx = theta[0].index_select(0, idx_ctx).unsqueeze(0) if theta[0] is not None else None
+            y_ctx     = y[0].index_select(0, idx_ctx).unsqueeze(0)     if y[0]     is not None else None
+
+            batch = BatchCollection(
+                context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous(), idx=idx_ctx),
+                query=QuerySet(theta=theta_tgt.contiguous(), phi=phi_tgt.contiguous(), idx=idx_tgt),
+                target_y=y_tgt.contiguous(),
+            )
+
+
+            yield batch
     
     def __getitem__(self, index):
         """
@@ -259,12 +299,22 @@ class InMemoryIterableData(IterableDataset):
         theta = store.get("theta")
         y     = store.get("y")
 
-        idx = store.get("batches")[index]
+        idx_tgt = store.get("batches")[1][index]
+        idx_ctx = store.get("batches")[0][index]
 
-        theta_batch, phi_batch, y_batch = theta.index_select(0, idx), phi.index_select(0, idx), y.index_select(0, idx)
+        theta_tgt, phi_tgt, y_tgt = theta[1].index_select(0, idx_tgt), phi[1].index_select(0, idx_tgt), y[1].index_select(0, idx_tgt)
+        theta_ctx, phi_ctx, y_ctx = theta[0].index_select(0, idx_ctx), phi[0].index_select(0, idx_ctx), y[0].index_select(0, idx_ctx)
 
-        batch = self._format_batch(theta_batch, phi_batch, y_batch)
-        return batch
+        def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
+        theta_ctx, phi_ctx, y_ctx  = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx))
+        theta_tgt, phi_tgt, y_tgt = map(ensure_3d, (theta_tgt, phi_tgt, y_tgt))
+
+        return BatchCollection(
+            context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous(), idx=idx_ctx),
+            query=QuerySet(theta=theta_tgt.contiguous(), phi=phi_tgt.contiguous(), idx=idx_tgt),
+            target_y=y_tgt.contiguous(),
+        )
+
 
     def _predict_iter(self):
         """Iterator for prediction mode where we process one file at a time from memory."""
@@ -286,30 +336,52 @@ class InMemoryIterableData(IterableDataset):
 
         for file_idx in files_for_worker:
             # Get mask for current file
-            file_mask = (file_indices == file_idx)
+            file_mask_t = (file_indices[1] == file_idx)
+            file_mask_ctx = (file_indices[0] == file_idx)
 
             # Get data for current file
-            file_theta = theta[file_mask]
-            file_phi = phi[file_mask]
-            file_y = y[file_mask]
+            file_theta_t = theta[1][file_mask_t]
+            file_phi_t = phi[1][file_mask_t]
+            file_y_t = y[1][file_mask_t]
+            file_theta_ctx = theta[0][file_mask_ctx]
+            file_phi_ctx = phi[0][file_mask_ctx]
+            file_y_ctx = y[0][file_mask_ctx]
 
             # Process file in batches
-            n = file_phi.shape[0]
-            for start_idx in range(0, n, self.batch_size):
-                end_idx = min(start_idx + self.batch_size, n)
+            n = file_phi_t.shape[0]
+
+            ratio_ctx = self.context_ratio/(1.-self.context_ratio)
+            for start_idx in range(0, n, self.batch_size_tgt):
+                end_idx = min(start_idx + self.batch_size_tgt, n)
+                start_idx_ctx = start_idx*ratio_ctx
+                end_idx_ctx = end_idx*ratio_ctx
                 
                 # Extract batch
-                theta_batch = file_theta[start_idx:end_idx]
-                phi_batch = file_phi[start_idx:end_idx]
-                y_batch = file_y[start_idx:end_idx]
+                theta_t = file_theta_t[start_idx:end_idx]
+                phi_t = file_phi_t[start_idx:end_idx]
+                y_t = file_y_t[start_idx:end_idx]
+                theta_ctx = file_theta_ctx[start_idx_ctx:end_idx_ctx]
+                phi_ctx = file_phi_ctx[start_idx_ctx:end_idx_ctx]
+                y_ctx = file_y_ctx[start_idx_ctx:end_idx_ctx]
 
-                # Format and yield batch
-                batch = self._format_batch(theta_batch, phi_batch, y_batch)
+                def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
+                theta_ctx, phi_ctx, y_ctx  = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx))
+                theta_t, phi_t, y_t = map(ensure_3d, (theta_t, phi_t, y_t))
+
+                ctx_theta_cell = self.sampler.to_cell(theta_ctx,1).to(torch.float32)
+                qry_theta_cell = self.sampler.to_cell(theta_t,1).to(torch.float32)
+        
+                batch = BatchCollection(
+                    context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous(), theta_cell=ctx_theta_cell.contiguous()),
+                    query=QuerySet(theta=theta_t.contiguous(), phi=phi_t.contiguous(), theta_cell=qry_theta_cell.contiguous()),
+                    target_y=y_t.contiguous(),
+                )
+                
                 yield batch, file_idx.item(), end_idx >= n
     
     def _format_batch(self, theta, phi, y):
 
-        n_ctx = int(phi.shape[0] * self.dataset_config.get("context_ratio", 0.33))
+        n_ctx = int(phi.shape[0] * self.context_ratio)
         
         if self.dataset_config.get("context_is_subset", True):
             theta_ctx, phi_ctx, y_ctx = theta[:n_ctx], phi[:n_ctx], y[:n_ctx]
@@ -356,5 +428,5 @@ class InMemoryIterableData(IterableDataset):
     def __len__(self) -> int:
         store = self.data[self.mode]
         if store.get("batches") is not None:
-            return len(store["batches"])
-        return int(math.ceil(store["phi"].shape[0] / self.batch_size))
+            return len(store["batches"][1])
+        return int(math.ceil(store["phi"][1].shape[0] / self.batch_size_tgt))
