@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import math
 
 def l_proj_param(Wk_pos, Wk_neg, Wv_pos, Wv_neg, normalize=True, eps=1e-12):
     # W*: [d_k, d_in] as in nn.Linear(out=d_k, in=d_in).weight
@@ -182,3 +182,53 @@ class CrossAttentionDual(nn.Module):
 
 
         return r_all, r_pos, r_neg, r_diff
+
+
+
+class SimplePoolAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,
+                Q_src: torch.Tensor,      # (B, Nt, D)
+                K_src: torch.Tensor,      # (B, Nc, D)
+                V_src: torch.Tensor | None = None,  # (B, Nc, Dv) or None -> use K
+                mask: torch.Tensor | None = None,   # (B, Nc) bool
+                logit_bias_ctx: torch.Tensor | None = None,  # (B, Nc)
+                beta: float = 1.0):
+        """
+        Q_src: queries (R_t)
+        K_src: keys   (R_ctx)
+        V_src: values (usually same as K_src or another projection)
+        mask:  True for valid context positions
+        logit_bias_ctx: per-context log-bias (e.g. LLR)
+        """
+        B, Nt, D = Q_src.shape
+        _, Nc, Dk = K_src.shape
+        assert D == Dk, "Q and K must have same dim"
+
+        if V_src is None:
+            V_src = K_src
+
+        # 1) similarity scores
+        # scores: (B, Nt, Nc)
+        scores = torch.einsum("bqd,bkd->bqk", Q_src, K_src) / math.sqrt(D)
+
+        # 2) add LLR / density-ratio bias per context, if provided
+        if logit_bias_ctx is not None:
+            # logit_bias_ctx: (B, Nc)
+            scores = scores + beta * logit_bias_ctx.unsqueeze(1)  # -> (B, Nt, Nc)
+
+        # 3) mask invalid contexts, if any
+        if mask is not None:
+            # mask: (B, Nc) -> (B, 1, Nc)
+            scores = scores.masked_fill(~mask.unsqueeze(1), -1e9)
+
+        # 4) softmax over contexts
+        attn = F.softmax(scores, dim=-1)  # (B, Nt, Nc)
+
+        # 5) weighted sum of values
+        # out: (B, Nt, Dv)
+        out = torch.einsum("bqk,bkd->bqd", attn, V_src)
+
+        return out, attn

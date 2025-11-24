@@ -235,10 +235,11 @@ def plot(prediction_y_training, target_y_training, it=None, target_range=[0,1], 
         mask_bkg = ~mask_signal
 
         # Split predictions and targets by signal/background
-        prediction_signal_training = prediction_y_training[mask_signal].reshape(-1, n_outputs)
-        target_signal_training = target_y_training[mask_signal].reshape(-1, n_outputs)
         prediction_bkg_training = prediction_y_training[mask_bkg].reshape(-1, n_outputs)
         target_bkg_training = target_y_training[mask_bkg].reshape(-1, n_outputs)
+        prediction_signal_training = prediction_y_training[mask_signal].reshape(-1, n_outputs)
+        target_signal_training = target_y_training[mask_signal].reshape(-1, n_outputs)
+        
 
         fig, ax = plt.subplots(ncols=n_outputs, figsize=(5 * n_outputs, 4))
 

@@ -238,39 +238,36 @@ class Trainer:
         output = self.model(
             query_theta=query.theta, query_phi=query.phi, query_y=targets,
             context_theta=context.theta, context_phi=context.phi, context_y=context.y,
-            target_y=targets, train=train, step=step
+            target_y=targets, query_idx=query.idx, context_idx=context.idx, train=train, step=step
         )
 
         return output, targets
 
     def _run_epoch(self, loader, optimizer=None, train: bool = True, desc: str = "train") -> Tuple[float, np.ndarray, np.ndarray]:
-        #device = next(self.model.parameters()).device
+
         self.model.train(train)
         running_loss = 0.0
-        y_true_all, y_pred_all = [], []
+        y_true_all, y_pred_all, y_score_all = [], [], []
         accum_steps = math.ceil(loader.dataset.batch_size_tgt/loader.dataset.meta["batch_size"])
-        
+
         if train and self.criterion.base_loss_fn is not skip_loss:
             optimizer.zero_grad(set_to_none=True)
-        
-        autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
 
+        autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
+
         for i, batch in enumerate(pbar):
             with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=autocast_dtype):
                 output, targets = self._forward_batch(batch, self.device, train=train, step=i+self.epoch*len(loader))
-
                 logit = output.get("logits", None)
-
-                #if logit[0].dim() == 3:  # (B,T,M)
-                #    logit = [x.mean(dim=2) for x in logit]
+                score = output.get("scores", torch.tensor([], device=self.device))
 
                 kl_term = output.get("kl_term", 0.0)
                 add_loss = output.get("loss", 0.0)
                 
-                
-                context, query, _ = batch
+                _, query, _ = batch
                 query_x = torch.cat([query.theta, query.phi], dim=2)
+                query_x = _to_dev(query_x, self.device, non_blocking=(self.device.type == "cuda"))
 
                 # Keep loss numerically stable: do loss in fp32 if needed
                 # fp32 is safer with custom losses
@@ -282,7 +279,6 @@ class Trainer:
                     logit32, targets32, qx32 = logit, targets, query_x
 
                 loss = self.criterion(logit32, targets32, targets_x=qx32) + kl_term + add_loss
-                #print(self.criterion([logit32], targets32, targets_x=qx32).item(), add_loss.item(), loss.item())
 
             if train and self.criterion.base_loss_fn is not skip_loss:
                 if self.scaler.is_enabled():  # fp16 path
@@ -297,23 +293,28 @@ class Trainer:
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-            
+            if hasattr(self.model, "memory_bank") and self.model.memory_bank is not None:
+                self.model.memory_bank.ema_update()
+
             running_loss += float(loss.detach().cpu())
             y_true_all.append(targets.reshape(-1))
             
             if self.criterion.base_loss_fn is recon_loss_mse: 
                 y_pred_all.append(self.criterion.p.detach())
             elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
-                y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1))
+                y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1)) 
             else:
                 y_pred_all.append(logit[0].detach().reshape(-1))
-            
+            y_score_all.append(score.detach().reshape(-1))
             pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
 
         y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
         y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
+        y_score = torch.cat(y_score_all).float().cpu().numpy() if y_score_all else np.array([])
+
         avg_loss = running_loss / max(1, len(y_true_all))
-        return avg_loss, y_true, y_pred
+
+        return avg_loss, y_true, y_pred, y_score
 
     def fit(
         self,
@@ -328,19 +329,18 @@ class Trainer:
         os.makedirs(ckpt_dir, exist_ok=True)
         best_ckpt = os.path.join(ckpt_dir, ckpt_name)
 
-        
         # move memory buffers once; do NOT call .to(device) again in the loop
         #self.model.memory.to(device)
 
-        
         if isinstance(self.criterion, torch.nn.Module):
             self.criterion.to(self.device)
         
         # rebuild optimizer after model to device
-        for s in optimizer.state.values():
-            for k, v in s.items():
-                if isinstance(v, torch.Tensor):
-                    s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
+        if self.criterion.base_loss_fn is not skip_loss:
+            for s in optimizer.state.values():
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor):
+                        s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
 
         # Initialize best score based on objective
         if not self.is_binary and monitor.lower() in {"pr_auc", "roc_auc"}:
@@ -352,12 +352,17 @@ class Trainer:
 
         for epoch in range(self.epoch_start, self.epoch_start + self.nepochs):
             # TRAIN
+
             self.epoch = epoch
             dataloader = self.dataset.set_loader("train")
-            if self.model._get_name()== 'IsolationForestWrapper' and self.model._fitted == False:
+
+            if (self.model._get_name()== 'IsolationForestWrapper' or self.model._get_name()== 'XGBoostWrapper') and self.model._fitted == False:
                 self.model.fit(loader=dataloader)
+            if self.model._get_name() == 'TreeConditionedCNP' and self.model.tree._fitted == False:
+                self.model.fit(loader=dataloader)
+                #self.model.tree._out_device = self.device
             
-            train_loss, y_true_tr, y_pred_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.nepochs}")
+            train_loss, y_true_tr, y_pred_tr, y_score_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.nepochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
             m_tr["loss"] = train_loss
             self.metrics["train"] = m_tr
@@ -368,8 +373,13 @@ class Trainer:
 
                 fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=epoch+1)
                 writer.add_figure(f'plot/score_train', fig, global_step=epoch+1)
+                if len(y_score_tr) > 0:
+                    fig = utils.plot(y_score_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=epoch+1)
+                    writer.add_figure(f'plot/score_tree_train', fig, global_step=epoch+1)
+
             
             # Early stopping / checkpointing
+            if "validate" not in self.dataset.set_loader("validate").dataset.data: continue
             score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch+1)
             improved = (score > best_score) if mode == "max" else (score < best_score)
             if improved:
@@ -391,123 +401,6 @@ class Trainer:
         self.metrics["best_model"]={"best_score": float(best_score), "monitor": monitor, "mode": mode, "epochs_ran": epoch - self.epoch_start + 1}
         return self.metrics["best_model"]
 
-    def warm_up(
-        self,
-        target_pos_frac: Union[float, Sequence[float]],
-        optimizer: torch.optim.Optimizer,
-        writer=None,
-        monitor: str = "pr_auc",
-        mode: str = "max",               # 👈 now mandatory input
-        patience: int = 15,
-        min_delta: float = 0.0,
-        save_best: bool = True,
-        num_data_pass_per_phase: Optional[int] = 1,
-    ) -> Dict[str, float]:
-        """
-        Warm-up training with staged positive-fraction schedule.
-
-        Args:
-            target_pos_frac: Single float or list of floats, each a training phase.
-            optimizer: Optimizer instance.
-            writer: TensorBoard writer (optional).
-            monitor: Metric to monitor for improvement ('pr_auc', 'rmse', etc.).
-            mode: 'max' means higher is better, 'min' means lower is better.
-            patience: Early-stopping patience (epochs without improvement).
-            min_delta: Minimum required improvement.
-            save_best: Save and restore best weights.
-            num_data_pass_per_phase: Optional epoch override per phase.
-        """
-
-        self.model.to(self.device)
-        if isinstance(self.criterion, torch.nn.Module):
-            self.criterion.to(self.device)
-        
-        # rebuild optimizer after model to device
-        for s in optimizer.state.values():
-            for k, v in s.items():
-                if isinstance(v, torch.Tensor):
-                    s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
-
-        if mode not in {"max", "min"}:
-            raise ValueError("mode must be 'max' or 'min'.")
-
-        global_epoch = self.epoch_start
-
-        # Normalize schedule
-        schedule = [float(target_pos_frac)] if isinstance(target_pos_frac, (int, float)) else list(target_pos_frac)
-
-        for phase_idx, pos_frac in enumerate(schedule, start=1):
-            dataloader = self.dataset.set_loader("train")
-
-            dataloader.dataset.set_batch_schedule(
-                target_pos_frac=pos_frac,
-                max_pos_reuse_per_epoch=dataloader.dataset.dataset_config.get("max_positive_reuse", 0.0),
-            )
-
-            n_epochs = num_data_pass_per_phase*dataloader.dataset.meta.get("num_epochs", 1) or dataloader.dataset.meta.get("num_epochs", 1)
-
-            best_score = -float("inf") if mode == "max" else float("inf")
-            best_state = None
-            no_improve = 0
-
-            for local_epoch in range(n_epochs):
-                self.epoch = global_epoch
-                global_epoch += 1
-                dataloader = self.dataset.set_loader("train")
-                train_loss, y_true_tr, y_pred_tr = self._run_epoch(
-                    dataloader, optimizer, train=True,
-                    desc=f"Warm-up phase {phase_idx}/{len(schedule)} | epoch {local_epoch+1}/{n_epochs}"
-                )
-
-                m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
-                m_tr["loss"] = float(train_loss)
-                self.metrics["train"] = m_tr
-
-                if writer and (global_epoch % self._report == 0):
-                    for k, v in m_tr.items(): writer.add_scalar(f"train/{k}", v, global_epoch) if np.isscalar(v) else None
-
-                    fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=global_epoch)
-                    writer.add_figure("plot/score_train", fig, global_step=global_epoch)
-
-                val_metrics = self.evaluate(writer=writer, dataset_name="validate", epoch=global_epoch)
-                if isinstance(val_metrics, dict):
-                    self.metrics["validate"] = val_metrics
-
-                current = float(self.metrics["validate"].get(monitor, math.nan))
-                if math.isnan(current):
-                    raise KeyError(f"Monitor key '{monitor}' not found in validation metrics {list(self.metrics['validate'].keys())}")
-
-                improved = (current > best_score + min_delta) if mode == "max" else (current < best_score - min_delta)
-                if improved:
-                    best_score = current
-                    no_improve = 0
-                    if save_best:
-                        best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-                else:
-                    no_improve += 1
-
-                if writer:
-                    writer.add_scalar(f"validate/{monitor}", current, global_epoch)
-                    writer.add_scalar(f"validate/{monitor}_best", best_score, global_epoch)
-
-                if patience > 0 and no_improve >= patience:
-                    break  # stop current phase early
-
-            #if patience > 0 and no_improve >= patience:
-            #    break  # stop all phases early
-
-        if save_best and best_state is not None:
-            self.model.load_state_dict(best_state)
-        self.epoch_start=global_epoch
-        dataloader.dataset.set_batch_schedule(target_pos_frac=None, max_pos_reuse_per_epoch = dataloader.dataset.dataset_config.get("max_positive_reuse",0.))
-        # Memory hygiene
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        return {**self.metrics.get("validate", {}), f"{monitor}_best": best_score}
-
     @torch.inference_mode()
     def evaluate(
         self,
@@ -523,8 +416,10 @@ class Trainer:
             self.criterion.to(self.device)
 
         dataloader = self.dataset.set_loader(dataset_name)
+        if dataset_name not in dataloader.dataset.data: 
+            return
         with torch.inference_mode():
-            loss, y_true_v, y_pred_v = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch}")
+            loss, y_true_v, y_pred_v, y_score_v = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch}")
         m_v = _compute_metrics(y_true_v, y_pred_v, self.is_binary)
         m_v["loss"] = loss
         self.metrics[dataset_name] = m_v
@@ -535,6 +430,9 @@ class Trainer:
                             
             fig = utils.plot(y_pred_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
             writer.add_figure(f'plot/score_{dataset_name}', fig, global_step=epoch)
+            if len(y_score_v) > 0:
+                fig = utils.plot(y_score_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
+                writer.add_figure(f'plot/score_tree_{dataset_name}', fig, global_step=epoch)
             if "precision_recall_curve" in m_v and isinstance(m_v["precision_recall_curve"], list):
                 fig = plt.figure()
                 plt.plot(m_v["precision_recall_curve"][0],m_v["precision_recall_curve"][1])
@@ -747,5 +645,122 @@ class Trainer:
                 torch.mps.empty_cache()
 
             return {"monitor_avg": np.nanmean(self.metrics[dataset_name].get(monitor, float("nan")))}
+
+    def warm_up(
+        self,
+        target_pos_frac: Union[float, Sequence[float]],
+        optimizer: torch.optim.Optimizer,
+        writer=None,
+        monitor: str = "pr_auc",
+        mode: str = "max",               # 👈 now mandatory input
+        patience: int = 15,
+        min_delta: float = 0.0,
+        save_best: bool = True,
+        num_data_pass_per_phase: Optional[int] = 1,
+    ) -> Dict[str, float]:
+        """
+        Warm-up training with staged positive-fraction schedule.
+
+        Args:
+            target_pos_frac: Single float or list of floats, each a training phase.
+            optimizer: Optimizer instance.
+            writer: TensorBoard writer (optional).
+            monitor: Metric to monitor for improvement ('pr_auc', 'rmse', etc.).
+            mode: 'max' means higher is better, 'min' means lower is better.
+            patience: Early-stopping patience (epochs without improvement).
+            min_delta: Minimum required improvement.
+            save_best: Save and restore best weights.
+            num_data_pass_per_phase: Optional epoch override per phase.
+        """
+
+        self.model.to(self.device)
+        if isinstance(self.criterion, torch.nn.Module):
+            self.criterion.to(self.device)
+        
+        # rebuild optimizer after model to device
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
+
+        if mode not in {"max", "min"}:
+            raise ValueError("mode must be 'max' or 'min'.")
+
+        global_epoch = self.epoch_start
+
+        # Normalize schedule
+        schedule = [float(target_pos_frac)] if isinstance(target_pos_frac, (int, float)) else list(target_pos_frac)
+
+        for phase_idx, pos_frac in enumerate(schedule, start=1):
+            dataloader = self.dataset.set_loader("train")
+
+            dataloader.dataset.set_batch_schedule(
+                target_pos_frac=pos_frac,
+                max_pos_reuse_per_epoch=dataloader.dataset.dataset_config.get("max_positive_reuse", 0.0),
+            )
+
+            n_epochs = num_data_pass_per_phase*dataloader.dataset.meta.get("num_epochs", 1) or dataloader.dataset.meta.get("num_epochs", 1)
+
+            best_score = -float("inf") if mode == "max" else float("inf")
+            best_state = None
+            no_improve = 0
+
+            for local_epoch in range(n_epochs):
+                self.epoch = global_epoch
+                global_epoch += 1
+                dataloader = self.dataset.set_loader("train")
+                train_loss, y_true_tr, y_pred_tr = self._run_epoch(
+                    dataloader, optimizer, train=True,
+                    desc=f"Warm-up phase {phase_idx}/{len(schedule)} | epoch {local_epoch+1}/{n_epochs}"
+                )
+
+                m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
+                m_tr["loss"] = float(train_loss)
+                self.metrics["train"] = m_tr
+
+                if writer and (global_epoch % self._report == 0):
+                    for k, v in m_tr.items(): writer.add_scalar(f"train/{k}", v, global_epoch) if np.isscalar(v) else None
+
+                    fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=global_epoch)
+                    writer.add_figure("plot/score_train", fig, global_step=global_epoch)
+
+                val_metrics = self.evaluate(writer=writer, dataset_name="validate", epoch=global_epoch)
+                if isinstance(val_metrics, dict):
+                    self.metrics["validate"] = val_metrics
+
+                current = float(self.metrics["validate"].get(monitor, math.nan))
+                if math.isnan(current):
+                    raise KeyError(f"Monitor key '{monitor}' not found in validation metrics {list(self.metrics['validate'].keys())}")
+
+                improved = (current > best_score + min_delta) if mode == "max" else (current < best_score - min_delta)
+                if improved:
+                    best_score = current
+                    no_improve = 0
+                    if save_best:
+                        best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                else:
+                    no_improve += 1
+
+                if writer:
+                    writer.add_scalar(f"validate/{monitor}", current, global_epoch)
+                    writer.add_scalar(f"validate/{monitor}_best", best_score, global_epoch)
+
+                if patience > 0 and no_improve >= patience:
+                    break  # stop current phase early
+
+            #if patience > 0 and no_improve >= patience:
+            #    break  # stop all phases early
+
+        if save_best and best_state is not None:
+            self.model.load_state_dict(best_state)
+        self.epoch_start=global_epoch
+        dataloader.dataset.set_batch_schedule(target_pos_frac=None, max_pos_reuse_per_epoch = dataloader.dataset.dataset_config.get("max_positive_reuse",0.))
+        # Memory hygiene
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        return {**self.metrics.get("validate", {}), f"{monitor}_best": best_score}
 
     

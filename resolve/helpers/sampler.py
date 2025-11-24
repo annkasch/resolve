@@ -32,18 +32,18 @@ class Sampler():
     def _epoch_seed(self) -> int:
         if not hasattr(self, '_epoch_counter'): self._epoch_counter = 0
         s = self.seed + self._epoch_counter; self._epoch_counter += 1; return s
-    
+
     @staticmethod
     def get_unique_ids(x):
         if x.ndim == 1:
-            unique_x, inverse = torch.unique(x, return_inverse=True)
+            unique_x = torch.unique(x)
         else:
-            unique_x, inverse = torch.unique(x, dim=0, return_inverse=True)
+            unique_x = torch.unique(x, dim=0)
 
         x_to_id = {tuple(t.tolist()): i for i, t in enumerate(unique_x)}
 
         return x_to_id
-    
+
     def to_cell(self, x_norm, num_bins):
 
         t = x_norm.clamp(0.0, 1.0)
@@ -170,8 +170,6 @@ class Sampler():
                 inv_unused = inverse[unused_neg_subset]
                 unused_neg_g = unused_neg_subset[inv_unused == gi]
 
-            
-
             nP_max = min(pos_g.numel()*reuse, n) if target_pos_frac > 0. else 0
             nP_tot += nP_max
 
@@ -185,6 +183,7 @@ class Sampler():
             )
 
             selected = torch.cat([pos_pool, neg_plan])
+            
             # don’t sort—preserve randomness, save time
             b_size = min(n+nN_min, batch_size)
             batches.extend(selected.split(b_size))

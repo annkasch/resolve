@@ -114,7 +114,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
             return list(logits)
         return [logits]
 
-    def forward(self, logits: torch.Tensor, targets_y: torch.Tensor, targets_x: Optional[torch.Tensor] ) -> torch.Tensor:
+    def forward(self, logits: torch.Tensor, targets_y: torch.Tensor, **kwarg) -> torch.Tensor:
         """
         logits:  (N,) or (N,1) raw scores
         targets_y: (N,) or (N,1) with values in {0,1}
@@ -125,7 +125,7 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         y= targets_y
 
         # Base per-sample loss (N,)
-        base_loss, self.p = self.base_loss_fn(z_list, targets_y, x=targets_x)
+        base_loss, self.p = self.base_loss_fn(z_list, targets_y, x=kwarg.get("targets_x",None))
         
         # Masks (allow slightly fuzzy labels; >=0.5 -> positive)
         y = targets_y.view(-1).float()
@@ -145,16 +145,22 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         
         # False-positive penalty on negatives
         if self.lambda_fp > 0.0:
-            #overshoot_fp = torch.relu(self.p[neg_mask] - self.tau_fp)
-            #loss[neg_mask] = loss[neg_mask] + self.lambda_fp * (overshoot_fp ** 2)
-            overshoot_fp = torch.relu(self.p - self.tau_fp)
-            penalty_fp = overshoot_fp ** 2 * (1.0 - targets_y)
-            loss = loss + self.lambda_fp * penalty_fp
+            overshoot_fp = torch.relu(self.p[neg_mask] - self.tau_fp)
+            #print("before", loss[neg_mask].mean())
+            loss[neg_mask] = loss[neg_mask] + self.lambda_fp * (overshoot_fp ** 2)
+            #print("after", loss[neg_mask].mean(),(self.lambda_fp * (overshoot_fp ** 2)).mean())
+            #overshoot_fp = torch.relu(self.p - self.tau_fp)
+            
+            #penalty_fp = overshoot_fp ** 2 * (1.0 - targets_y)
+
+            #loss = loss + self.lambda_fp * penalty_fp
 
         # True-positive reward on positives
         if self.lambda_tp > 0.0:
-            overshoot_tp = torch.relu(self.tau_t-self.p[pos_mask])
-            loss[pos_mask] = loss[pos_mask] + self.lambda_tp * (overshoot_tp ** 2)
+            overshoot_tp = torch.relu(self.p[pos_mask]+self.tau_tp)
+            print("before", loss[pos_mask].mean())
+            loss[pos_mask] = loss[pos_mask] - self.lambda_tp * (overshoot_tp ** 2)
+            #print("after", loss[pos_mask].mean(),(self.lambda_tp * (overshoot_tp ** 2)).mean())
             #overshoot_tp = (self.p - self.tau_tp).relu()
             #reward_tp = overshoot_tp.square() * y
             #loss = loss - (self.lambda_tp * reward_tp)

@@ -87,21 +87,21 @@ class FeatureTokenizer(nn.Module):
         return self.drop(tok)
 
 
-class ContextTransformerEncoder(nn.Module):
+class TransformerEncoder(nn.Module):
     """
-    Encodes (context_theta, context_phi, context_y) into per-context embeddings using a feature-token transformer.
+    Encodes (theta, phi, y) into per-context embeddings using a feature-token transformer.
     Shapes:
-      context_theta: (B, Nc, d_theta)
-      context_phi:   (B, Nc, d_phi)
-      context_y:     (B, Nc, d_y)
+      theta: (B, Nc, d_theta)
+      phi:   (B, Nc, d_phi)
+      y:     (B, Nc, d_y)
     Returns:
-      R_c: (B, Nc, D)
+      R_t: (B, Nc, D)
     """
     def __init__(
         self,
         theta_dim: int,
         phi_dim: int,
-        y_dim: int,
+        y_dim: int | None = None,
         embed_dim: int = 256,
         depth: int = 4,
         num_heads: int = 8,
@@ -112,7 +112,8 @@ class ContextTransformerEncoder(nn.Module):
     ):
         super().__init__()
         self.use_cls = use_cls_token
-        self.F_total = theta_dim + phi_dim + y_dim
+        self.F_total = theta_dim + phi_dim 
+        self.F_total += y_dim if (y_dim is not None) else 0
         self.embed_dim = embed_dim
 
         self.tokenizer = FeatureTokenizer(self.F_total, embed_dim, bias=True, dropout=dropout)
@@ -135,10 +136,11 @@ class ContextTransformerEncoder(nn.Module):
             return x[:, 0, :]
         return x.mean(dim=1)
 
-    def forward(self, theta, phi, y):
+    def forward(self, theta, phi, y=None):
         B, Nc, _ = phi.shape
         # Concatenate features per context point: (B, Nc, F_total)
-        feats = torch.cat([theta, phi, y], dim=-1).reshape(B * Nc, self.F_total)
+        feats = torch.cat([theta, phi, y], dim=-1) if y is not None else torch.cat([theta, phi], dim=-1)
+        feats = feats.reshape(B * Nc, self.F_total)
 
         # Feature tokens (L = #features)
         tokens = self.tokenizer(feats)  # (B*Nc, L, D)

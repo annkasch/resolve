@@ -59,14 +59,18 @@ def main(path_to_settings):
     os.system(f'rm {path_out}/model_{version}_tensorboard_logs/events*')
     writer = SummaryWriter(log_dir=f'{path_out}/model_{version}_tensorboard_logs')
 
-    optimizer = None if model.__class__.__name__ == "IsolationForestWrapper" else optim.Adam(model.parameters(), lr=config_file["model_settings"]["train"]["learning_rate"])
+    optimizer = None if (model.__class__.__name__ == "IsolationForestWrapper" or model.__class__.__name__ == "XGBoostWrapper") else optim.Adam(model.parameters(), lr=config_file["model_settings"]["train"]["learning_rate"])
+
 
     # Instantiate the training wrapper for the first phase
     trainer = Trainer(model, dataset_train)
 
-    model.memory_bank.build(dataset_train.dataset.data["train"]["theta"][0],dataset_train.dataset.data["train"]["phi"][0])
+    if hasattr(model, "memory_bank") and model.memory_bank is not None:
+        model.memory_bank.attach_dataset(dataset_train.dataset.data["train"]["target"])
+        model.memory_bank.build()
+        model.memory_bank.train_density_ratio_head(epochs=7, writer=writer, batch_size=256, lr=1e-3)
 
-    print("memory build end")
+
     trainer.nepochs = config_file["model_settings"]["train"]["training_epochs"]
 
     if isinstance(utils.get_nested(config_file, ["model_settings","train","dataset","positive_ratio_train"], False), list):
@@ -118,7 +122,7 @@ def main(path_to_settings):
     summary_train = trainer.fit(optimizer=optimizer, patience = config_file["model_settings"]["train"]["patience"], writer=writer, ckpt_dir=f"{path_out}/checkpoints", ckpt_name=f"model_{version}_best.pt",
             monitor="pr_auc", mode="max")
 
-    _ = trainer.evaluate(writer=writer, dataset_name="test")
+    if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test")
 
     normalizer_train = dataset_train.dataset._normalizer
 
@@ -155,5 +159,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--settings", type=str, required=True)
     args = parser.parse_args()
-    mp.set_start_method("spawn", force=True)  # critical on macOS
     main(args.settings)
