@@ -60,87 +60,90 @@ class InMemoryIterableData(IterableDataset):
     
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
         data = {}
-
         pos_mask = self.sampler.get_positive_indices(y)
         positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
         splitter = Splitter(self.shuffle, seed=42)
+        idx =  torch.arange(phi.shape[0])
         if self.mode == "train":
             # apply normalization
             self._normalizer = Normalizer(self.dataset_config.get("use_feature_normalization", None))
             theta, phi = self._normalizer.fit_transform_as_f32(theta=theta, phi=phi)
 
-            data = {}
+            data = {"data": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx}}
+
             # split into training, validation and testing data
             val_size = self.dataset_config.get('val_ratio',0.2)
             if val_size > 0.:
-                theta, theta_val, phi, phi_val, y, y_val, fidx, fidx_val = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=val_size)
+                idx, idx_val = splitter.train_test_split(idx, groups=theta[idx], test_size=val_size)
                 if self.context_ratio >0. :
-                    theta_val, theta_val_ctx, phi_val, phi_val_ctx, y_val, y_val_ctx, fidx_val, fidx_val_ctx = splitter.train_test_split(theta_val, phi_val, y_val, fidx_val, groups=theta_val, test_size=self.context_ratio)
+                    idx_val, idx_val_ctx = splitter.train_test_split(idx_val, groups=theta[idx_val], test_size=self.context_ratio)
                 
-                batches_val,_,_,rperm_val = self.sampler.build_batches(phi_val.shape[0], batch_size=self.batch_size_tgt)
-                data.update({"validate": {"target":{"theta": theta_val, "phi": phi_val, "y": y_val, "file_indices": fidx_val, "batches": batches_val}}})
+                batches_val,_,_,rperm_val = self.sampler.build_batches(idx_val, batch_size=self.batch_size_tgt)
+                data.update({"validate": {"target": {"indice": idx_val, "batches": batches_val}}})
                 
             test_size = self.dataset_config.get('test_ratio',0.2)/ (1.-val_size)
             if test_size > 0. :
-                theta, theta_test, phi, phi_test, y, y_test, fidx, fidx_test = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=test_size)
+                idx, idx_test = splitter.train_test_split(idx, groups=theta[idx], test_size=test_size)
+
                 if self.context_ratio >0.:
-                    theta_test, theta_test_ctx, phi_test, phi_test_ctx, y_test, y_test_ctx, fidx_test, fidx_test_ctx = splitter.train_test_split(theta_test, phi_test, y_test, fidx_test, groups=theta_test, test_size=self.context_ratio)
-                batches_test,_,_,rperm_test = self.sampler.build_batches(phi_test.shape[0], batch_size=self.batch_size_tgt)
-                data.update({"test": {"target":{"theta": theta_test, "phi": phi_test, "y": y_test, "file_indices": fidx_test, "batches": batches_test}}})
+                    idx_test, idx_test_ctx = splitter.train_test_split(idx_test, groups=theta[idx_test], test_size=self.context_ratio)
+
+                batches_test,_,_,rperm_test = self.sampler.build_batches(idx_test, batch_size=self.batch_size_tgt)
+                data.update({"test": {"target":{"indices": idx_test, "batches": batches_test}}})
                 
             # split training data into context and target data
             if self.context_ratio >0. :
-                theta, theta_ctx, phi, phi_ctx, y, y_ctx, fidx, fidx_ctx = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=self.context_ratio)
+                idx, idx_ctx = splitter.train_test_split(idx, groups=theta[idx], test_size=self.context_ratio)
 
             # apply mixup to context data only
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
 
                 if self.context_ratio >0.:
-                    theta_ctx, phi_ctx, y_ctx, fidx_ctx = self.sampler.mix_by_file_chunks(
-                            theta_ctx, phi_ctx, y_ctx, fidx_ctx,self.dataset_config.get('mixup_ratio'),
+                    theta[idx_ctx], phi[idx_ctx], y[idx_ctx], fidx[idx_ctx] = self.sampler.mix_by_file_chunks(
+                            theta[idx_ctx], phi[idx_ctx], y[idx_ctx], fidx[idx_ctx], self.dataset_config.get('mixup_ratio'),
                             use_beta=self.dataset_config.get('use_beta', None),
                             margin=float(self.dataset_config.get('mixup_margin', 0.0))
                         )
                 else:
-                    theta, phi, y, fidx = self.sampler.mix_by_file_chunks(
-                            theta, phi, y, fidx,self.dataset_config.get('mixup_ratio'),
+                    theta[idx], phi[idx], y[idx], fidx[idx] = self.sampler.mix_by_file_chunks(
+                            theta[idx], phi[idx], y[idx], fidx[idx],self.dataset_config.get('mixup_ratio'),
                             use_beta=self.dataset_config.get('use_beta', None),
                             margin=float(self.dataset_config.get('mixup_margin', 0.0))
                         )
 
-            batches, self.status, self.meta, rperm = self.sampler.build_batches(phi.shape[0], batch_size=self.batch_size_tgt)
+            batches, self.status, self.meta, rperm = self.sampler.build_batches(idx, batch_size=self.batch_size_tgt)
             self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
-            data.update({"train": {"target":{"theta": theta, "phi": phi, "y": y, "file_indices": fidx, "batches": batches}}})
+            data.update({"train": {"target":{"indices": idx, "batches": batches}}})
 
             if self.context_ratio > 0.:
-                batches_ctx, _, _, _ = self.sampler.build_batches(phi_ctx.shape[0], batch_size=self.batch_size_ctx, randperm=rperm)
-                data["train"].update({"context": {"theta": theta_ctx, "phi": phi_ctx, "y": y_ctx, "file_indices": fidx_ctx, "batches": batches_ctx}})
+                batches_ctx, _, _, _ = self.sampler.build_batches(idx_ctx, batch_size=self.batch_size_ctx, randperm=rperm)
+                data["train"].update({"context": {"indices": idx_ctx, "batches": batches_ctx}})
                 if val_size > 0.:
-                    batch_size = self.batch_size_ctx if rperm_val is None else int(math.floor(phi_val_ctx.shape[0] / len(rperm)))
-                    batches_val_ctx = self.sampler.build_batches(phi_val_ctx.shape[0], batch_size=batch_size, randperm=rperm_val)[0]
-                    data["validate"].update({"context":{"theta": theta_val_ctx, "phi": phi_val_ctx, "y": y_val_ctx, "file_indices": fidx_val_ctx, "batches": batches_val_ctx}})
+                    batch_size = self.batch_size_ctx if rperm_val is None else int(math.floor(idx_val_ctx.shape[0] / len(rperm)))
+                    batches_val_ctx = self.sampler.build_batches(idx_val_ctx, batch_size=batch_size, randperm=rperm_val)[0]
+                    data["validate"].update({"context":{"indices": idx_val_ctx, "batches": batches_val_ctx}})
                 if test_size > 0.:
-                    batch_size = self.batch_size_ctx if rperm_test is None else int(math.ceil(phi_test_ctx.shape[0] / len(rperm_test)))
-                    batches_test_ctx = self.sampler.build_batches(phi_test_ctx.shape[0], batch_size=batch_size, randperm=rperm_test)[0]
-                    data["test"].update({"context":{"theta": theta_test_ctx, "phi": phi_test_ctx, "y": y_test_ctx, "file_indices": fidx_test_ctx, "batches": batches_test_ctx}})
-
+                    batch_size = self.batch_size_ctx if rperm_test is None else int(math.ceil(idx_test_ctx.shape[0] / len(rperm_test)))
+                    batches_test_ctx = self.sampler.build_batches(idx_test_ctx, batch_size=batch_size, randperm=rperm_test)[0]
+                    data["test"].update({"context":{"indices": idx_test_ctx, "batches": batches_test_ctx}})
         else:
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
             phi = self._normalizer.transform(x=phi, feature_grp="phi")
             theta = theta.float().contiguous(); phi = phi.float().contiguous()
+            data = {"data": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx}}
             
             if self.context_ratio >0.:
-                theta, theta_ctx, phi, phi_ctx, y, y_ctx, fidx, fidx_ctx = splitter.train_test_split(theta, phi, y, fidx, groups=theta, test_size=self.context_ratio)
+                idx, idx_ctx = splitter.train_test_split(idx, groups=theta[idx], test_size=self.context_ratio)
             
-            batches, self.status, self.meta, rperm = self.sampler.build_batches(phi.shape[0],batch_size=self.batch_size_tgt)
+            
+            batches, self.status, self.meta, rperm = self.sampler.build_batches(idx,batch_size=self.batch_size_tgt)
             self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
 
-            data = {f"{self.mode}":{"target":{"theta": theta.contiguous(), "phi": phi.contiguous(), "y": y, "file_indices": fidx, "batches": batches}}}
+            data.update({f"{self.mode}":{"target":{"indices": idx, "batches": batches}}})
             if self.context_ratio > 0.:
-                batches_ctx, _, _, _  = self.sampler.build_batches(phi_ctx.shape[0],batch_size=self.batch_size_ctx, randperm=rperm)
-                data[f"{self.mode}"].update({"context":{"theta": theta_ctx.contiguous(), "phi": phi_ctx.contiguous(), "y": y, "file_indices": fidx_ctx, "batches": batches_ctx}})
+                batches_ctx, _, _, _  = self.sampler.build_batches(idx_ctx,batch_size=self.batch_size_ctx, randperm=rperm)
+                data[f"{self.mode}"].update({"context":{"indices": idx_ctx, "batches": batches_ctx}})
             
-
         return data
     
     def set_batch_schedule(self,
@@ -150,28 +153,33 @@ class InMemoryIterableData(IterableDataset):
         seed: int | None = None,          # reproducible positive order
     ):
 
+        idx_ctx = self.data[self.mode]["context"]["indices"] if "context" in self.data[self.mode].keys() else None
+        idx_tgt = self.data[self.mode]["target"]["indices"]
         # train sets the batch size and needs to be processed first
         if self.mode == "train" and target_pos_frac != None and self.dataset_config.get('mixup_ratio', 0.) == 0.0:
-            if "context" in self.data["train"].keys():
-                self.data["train"]["context"]["batches"], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
-                    self.data["train"]["context"]["file_indices"],
-                    self.data["train"]["context"]["y"],
+            if idx_ctx is not None:
+                self.data[self.mode]["context"]["batches"], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
+                    self.data["data"]["file_indices"][idx_ctx],
+                    self.data["data"]["y"][idx_ctx],
+                    idx_ctx,
+                    self.data["data"]["y"],
                     target_pos_frac=target_pos_frac,
                     batch_size=self.batch_size_ctx,
                     max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
                     sticky_frac=sticky_frac,
                     unused_neg_subset=self.state
                 )
-                batch_size_tgt = math.ceil(self.data["train"]["target"]["phi"].shape[0]/self.meta["num_batches"])
+                batch_size_tgt = math.ceil(self.data[self.mode]["target"]["indices"].shape[0]/self.meta["num_batches"])
 
                 rperm = torch.arange(self.meta["num_batches"]) if self.sampler.shuffle == "batch_wise" else None
-                self.data[self.mode]["target"]["batches"], _, meta, _ = self.sampler.build_batches(self.data[self.mode]["target"]["phi"].shape[0], batch_size=batch_size_tgt, randperm=rperm)
+                self.data[self.mode]["target"]["batches"], _, meta, _ = self.sampler.build_batches(self.data[self.mode]["target"]["indices"], batch_size=batch_size_tgt, randperm=rperm)
                 self.meta["batch_size"] = meta["batch_size"]
                 print(self.meta)
             else:
-                self.data["train"]["target"]["batches"], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
-                    self.data["train"]["target"]["file_indices"],
-                    self.data["train"]["target"]["y"],
+                self.data[self.mode]["target"]["batches"], self.state, self.meta = self.sampler.build_batches_with_posneg_ratio_groupaware(
+                    self.data["data"]["file_indices"][idx_tgt],
+                    self.data["data"]["y"][idx_tgt],
+                    idx_tgt,
                     target_pos_frac=target_pos_frac,
                     batch_size=self.batch_size_tgt,
                     max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,   # cap reuse; set 0 for no reuse
@@ -181,8 +189,8 @@ class InMemoryIterableData(IterableDataset):
                 print(self.meta)
             
         else:
-            self.data[self.mode]["target"]["batches"], self.state, self.meta, rperm = self.sampler.build_batches(self.data[self.mode]["target"]["phi"].shape[0], batch_size=self.batch_size_tgt)
-            if "context" in self.data[self.mode].keys(): self.data[self.mode]["context"]["batches"] = self.sampler.build_batches(self.data[self.mode]["context"]["phi"].shape[0], batch_size=self.batch_size_ctx, randperm=rperm)[0]
+            self.data[self.mode]["target"]["batches"], self.state, self.meta, rperm = self.sampler.build_batches(idx_tgt, batch_size=self.batch_size_tgt)
+            if idx_ctx is not None: self.data[self.mode]["context"]["batches"] = self.sampler.build_batches(idx_ctx, batch_size=self.batch_size_ctx, randperm=rperm)[0]
             
 
     @staticmethod
@@ -285,18 +293,21 @@ class InMemoryIterableData(IterableDataset):
         b_start, b_end = self._compute_worker_slice(total_batches)  # reuse same helper; it just slices a range
         if b_start >= b_end:
             return iter(())
+        theta = self.data["data"]["theta"]
+        phi   = self.data["data"]["phi"]
+        y     = self.data["data"]["y"]
 
         for b in range(b_start, b_end):
             idx_tgt = self.data[self.mode]["target"]["batches"][b]
-            b_phi_tgt = self.data[self.mode]["target"]["phi"].index_select(0, idx_tgt).unsqueeze(0)
-            b_theta_tgt = self.data[self.mode]["target"]["theta"].index_select(0, idx_tgt).unsqueeze(0) if self.data[self.mode]["target"].get("theta",None) is not None else None
-            b_y_tgt     = self.data[self.mode]["target"]["y"].index_select(0, idx_tgt).unsqueeze(0)     if self.data[self.mode]["target"].get("y",None)     is not None else None
+            b_phi_tgt = phi.index_select(0, idx_tgt).unsqueeze(0)
+            b_theta_tgt = theta.index_select(0, idx_tgt).unsqueeze(0)
+            b_y_tgt     = y.index_select(0, idx_tgt).unsqueeze(0)
 
             if self.context_ratio > 0.:
                 idx_ctx = self.data[self.mode]["context"]["batches"][b]
-                b_phi_ctx = self.data[self.mode]["context"]["phi"].index_select(0, idx_ctx).unsqueeze(0)
-                b_theta_ctx = self.data[self.mode]["context"]["theta"].index_select(0, idx_ctx).unsqueeze(0) if self.data[self.mode]["context"].get("theta",None) is not None else None
-                b_y_ctx     = self.data[self.mode]["context"]["y"].index_select(0, idx_ctx).unsqueeze(0)     if self.data[self.mode]["context"].get("y",None)     is not None else None
+                b_phi_ctx = phi.index_select(0, idx_ctx).unsqueeze(0)
+                b_theta_ctx = theta.index_select(0, idx_ctx).unsqueeze(0)
+                b_y_ctx     = y.index_select(0, idx_ctx).unsqueeze(0)
             else:
                 b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0),torch.empty(0) 
 
@@ -314,17 +325,17 @@ class InMemoryIterableData(IterableDataset):
         Return the i-th yielded batch.
         """
         idx_tgt = self.data[self.mode]["target"]["batches"][index]
-        b_phi_tgt = self.data[self.mode]["target"]["phi"].index_select(0, idx_tgt).unsqueeze(0)
-        b_theta_tgt = self.data[self.mode]["target"]["theta"].index_select(0, idx_tgt).unsqueeze(0) if self.data[self.mode]["target"].get("theta",None) is not None else None
-        b_y_tgt     = self.data[self.mode]["target"]["y"].index_select(0, idx_tgt).unsqueeze(0)     if self.data[self.mode]["target"].get("y",None)     is not None else None
+        b_phi_tgt = self.data["data"]["phi"].index_select(0, idx_tgt).unsqueeze(0)
+        b_theta_tgt = self.data["data"]["theta"].index_select(0, idx_tgt).unsqueeze(0) if self.data[self.mode]["target"].get("theta",None) is not None else None
+        b_y_tgt     = self.data["data"]["y"].index_select(0, idx_tgt).unsqueeze(0)     if self.data[self.mode]["target"].get("y",None)     is not None else None
 
         if self.context_ratio > 0.:
             idx_ctx = self.data[self.mode]["context"]["batches"][index]
-            b_phi_ctx = self.data[self.mode]["context"]["phi"].index_select(0, idx_ctx).unsqueeze(0)
-            b_theta_ctx = self.data[self.mode]["context"]["theta"].index_select(0, idx_ctx).unsqueeze(0) if self.data[self.mode]["context"].get("theta",None) is not None else None
-            b_y_ctx     = self.data[self.mode]["context"]["y"].index_select(0, idx_ctx).unsqueeze(0)     if self.data[self.mode]["context"].get("y",None)     is not None else None
+            b_phi_ctx = self.data["data"]["phi"].index_select(0, idx_ctx).unsqueeze(0)
+            b_theta_ctx = self.data["data"]["theta"].index_select(0, idx_ctx).unsqueeze(0) if self.data[self.mode]["context"].get("theta",None) is not None else None
+            b_y_ctx     = self.data["data"]["y"].index_select(0, idx_ctx).unsqueeze(0)     if self.data[self.mode]["context"].get("y",None)     is not None else None
         else:
-            b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx = self.make_empty_like(b_theta_tgt, b_phi_tgt, b_y_tgt, idx_tgt)
+            b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0),torch.empty(0) 
 
 
         batch = BatchCollection(
@@ -446,8 +457,8 @@ class InMemoryIterableData(IterableDataset):
         self.files = None
 
     def __len__(self) -> int:
-        store = self.data[self.mode]
+        store = self.data[self.mode]["target"]
 
         if store.get("batches") is not None:
-            return len(store["target"]["batches"])
-        return int(math.ceil(store["target"]["phi"].shape[0] / self.batch_size_tgt))
+            return len(store["batches"])
+        return int(math.ceil(self.data["data"]["phi"][store["indices"]].shape[0] / self.batch_size_tgt))

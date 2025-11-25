@@ -12,15 +12,18 @@ class Sampler():
         self.positive_fn = self.positive_function(positive_condition) if positive_condition else None
         self.seed = seed
     
-    def build_batches(self, n_samples: int, batch_size: int, randperm = None):
+    def build_batches(self, idx_array, batch_size: int, randperm = None):
+        n_samples = idx_array.shape[0]
         rperm = randperm
         if self.shuffle == "global":
-            perm = torch.randperm(n_samples, generator=torch.Generator().manual_seed(self._epoch_seed()))
+            perm_idx = torch.randperm(n_samples, generator=torch.Generator().manual_seed(self._epoch_seed()))
         elif self.shuffle == "batch_wise":
             rperm = torch.randperm((n_samples + batch_size - 1) // batch_size, generator=torch.Generator().manual_seed(self._epoch_seed())) if rperm is None else rperm
-            perm = torch.cat([torch.arange(i * batch_size, min((i + 1) * batch_size, n_samples)) for i in rperm])
+            perm_idx = torch.cat([torch.arange(i * batch_size, min((i + 1) * batch_size, n_samples)) for i in rperm])
         else:
-            perm = torch.arange(n_samples)
+            perm_idx = torch.arange(n_samples)
+
+        perm = idx_array[perm_idx]
 
         batches = torch.split(perm, split_size_or_sections=batch_size)
         
@@ -127,6 +130,8 @@ class Sampler():
         self,
         theta: torch.Tensor,                     # shape [N] or [N, d]
         y: torch.Tensor,  
+        idx: torch.Tensor,
+        y_all:torch.Tensor,
         target_pos_frac: float,
         batch_size: int,
         max_pos_reuse_per_epoch: int = 0,
@@ -173,7 +178,7 @@ class Sampler():
             nP_max = min(pos_g.numel()*reuse, n) if target_pos_frac > 0. else 0
             nP_tot += nP_max
 
-            pos_pool, neg_plan, rem = self.sample_positives_negatives(
+            pos_pool_idx, neg_plan_idx, rem_idx = self.sample_positives_negatives(
                 pos_idx=pos_g, neg_idx=neg_g,
                 n=n+nN_min, nP_tot=nP_max,
                 max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,
@@ -181,7 +186,10 @@ class Sampler():
                 unused_neg_subset=unused_neg_g,
                 seed=gseed,
             )
-
+            pos_pool = idx[pos_pool_idx]
+            neg_plan = idx[neg_plan_idx]
+            rem = idx[rem_idx]
+            
             selected = torch.cat([pos_pool, neg_plan])
             
             # don’t sort—preserve randomness, save time

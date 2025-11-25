@@ -183,5 +183,8 @@ class ConditionalNeuralProcess(nn.Module):
         }
         
         return output
+    
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')
 
 

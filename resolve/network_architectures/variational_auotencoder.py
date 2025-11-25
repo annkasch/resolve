@@ -81,3 +81,6 @@ class VariationalAutoencoder(nn.Module):
     @torch.no_grad()
     def reconstruct(self, query_theta, query_phi):
         return self.forward(query_theta, query_phi)
+    
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')

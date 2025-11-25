@@ -55,6 +55,10 @@ class XGBoostWrapper(nn.Module):
         self.leaf_embed_dim = use_leaf_embeddings                   # embedding size per tree leaf
         self.leaf_embeddings = None               # created after fitting
 
+        self.memory_bank = None
+        self.memory_filled = None
+        self.use_memory_bank = True
+
     # ---------------------- utilities: input & conversion ----------------------
 
     @staticmethod
@@ -306,14 +310,14 @@ class XGBoostWrapper(nn.Module):
         if self.leaf_embed_dim:
 
             if self.use_memory_bank:
-                if idx is None:
+                if query_idx is None:
                     raise ValueError("To use the memory bank, batch must include sample indices `idx`.")
 
                 # idx from (B,T) → flatten to (B*T,)
-                if idx.dim() == 2:
-                    idx_flat = idx.reshape(-1)
+                if query_idx.dim() == 2:
+                    idx_flat = query_idx.reshape(-1)
                 else:
-                    idx_flat = idx
+                    idx_flat = query_idx
 
                 # Lazily fill + read memory bank
                 leaf_emb_flat = self._fill_memory_bank(X, idx_flat)
@@ -356,18 +360,18 @@ class XGBoostWrapper(nn.Module):
 
         # Save booster
         booster = self.model.get_booster()
-        booster.save_model(path + ".json")
+        booster.save_model(path + "booster.json")
 
-        torch.save(self.state_dict(), path+"_embeddings.pt")
-        print(f"Saved XGBClassifier to {path}.pkl and booster to {path}.json")
+        torch.save(self.state_dict(), path+"embeddings.pt")
+        print(f"Saved XGBClassifier to {path}xgb.pkl and booster to {path}booster.json")
 
     def load(self, path):
-        with open(path + ".pkl", "rb") as f:
+        with open(path + "xgb.pkl", "rb") as f:
             self.model = pickle.load(f)
         self.booster = self.model.get_booster()
-        state = torch.load(path+"_embeddings.pt", map_location="cpu")
+        state = torch.load(path+"embeddings.pt", map_location="cpu")
         self.load_state_dict(state)
-        print(f"Loaded XGBClassifier from {path}.pkl")
+        print(f"Loaded XGBClassifier from {path}xgb.pkl")
 
     def init_memory_bank(self, num_samples: int, device: torch.device = torch.device("cpu")):
         self.memory_bank = torch.zeros(num_samples, self.leaf_embed_dim, dtype=torch.float32, device=device)
@@ -393,9 +397,9 @@ class XGBoostWrapper(nn.Module):
         if need_compute.any():
             # Only compute XGB embeddings for unseen samples
             X_np = X[need_compute].detach().cpu().numpy()
-
+            emb_device = next(self.leaf_embeddings[0].parameters()).device
             leaf_arr = self.model.apply(X_np)          # (Nm, n_trees)
-            leaf_ids = torch.from_numpy(leaf_arr.astype("int64"))
+            leaf_ids = torch.from_numpy(leaf_arr.astype("int64")).to(emb_device)
 
             embeds = []
             for t, emb_layer in enumerate(self.leaf_embeddings):

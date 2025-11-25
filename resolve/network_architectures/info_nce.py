@@ -92,4 +92,6 @@ class InfoNCE(nn.Module):
 
         return {"logits": [logits], "loss": supcon}
 
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')
 

@@ -111,7 +111,7 @@ class TreeConditionedCNP(nn.Module):
         R_ctx  = self.ctx_enc(context_theta, phi_cnp_ctx, y=context_y)  # (B,Nc,D)
         # target query (x_t) → R_t
         with torch.no_grad():
-            out = self.tree(query_theta=query_theta, query_phi=query_phi)
+            out = self.tree(query_theta=query_theta, query_phi=query_phi, query_idx=query_idx)
         score_tgt = out["logits"][0]            # (B,T,1)
         leaf_emb = out["leaf_embeddings"]   # (B,T,embed_dim)
 
@@ -133,4 +133,7 @@ class TreeConditionedCNP(nn.Module):
 
         return {"logits": logits, "scores": score_tgt}
 
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')
+        self.tree.save(path)
 

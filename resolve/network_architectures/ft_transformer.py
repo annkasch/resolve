@@ -57,3 +57,6 @@ class FTTransformer(nn.Module):
         out = {"logits": [logit]}
 
         return out
+    
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')

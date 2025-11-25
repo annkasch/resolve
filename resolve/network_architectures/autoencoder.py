@@ -45,3 +45,6 @@ class Autoencoder(nn.Module):
     @torch.no_grad()
     def reconstruct(self, x):
         return self.forward(x)
+    
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')

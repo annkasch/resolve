@@ -223,3 +223,6 @@ class AttnLNP(nn.Module):
             return torch.cat([R_t_mod, rC, z_exp], dim=-1)
         else:
             return torch.cat([R_t_mod, rC], dim=-1)
+    
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')

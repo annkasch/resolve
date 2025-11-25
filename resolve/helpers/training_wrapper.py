@@ -293,8 +293,8 @@ class Trainer:
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-            if hasattr(self.model, "memory_bank") and self.model.memory_bank is not None:
-                self.model.memory_bank.ema_update()
+            #if hasattr(self.model, "memory_bank") and self.model.memory_bank is not None:
+            #    self.model.memory_bank.ema_update()
 
             running_loss += float(loss.detach().cpu())
             y_true_all.append(targets.reshape(-1))
@@ -358,9 +358,10 @@ class Trainer:
 
             if (self.model._get_name()== 'IsolationForestWrapper' or self.model._get_name()== 'XGBoostWrapper') and self.model._fitted == False:
                 self.model.fit(loader=dataloader)
+                self.model.init_memory_bank(dataloader.dataset.data["data"]["phi"].shape[-2], device=self.device)
             if self.model._get_name() == 'TreeConditionedCNP' and self.model.tree._fitted == False:
                 self.model.fit(loader=dataloader)
-                #self.model.tree._out_device = self.device
+                self.model.tree.init_memory_bank(dataloader.dataset.data["data"]["phi"].shape[-2], device=self.device)
             
             train_loss, y_true_tr, y_pred_tr, y_score_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.nepochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)

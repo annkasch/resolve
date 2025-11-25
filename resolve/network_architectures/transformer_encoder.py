@@ -167,3 +167,6 @@ class TransformerEncoder(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+    
+    def save(self, path):
+        torch.save(self.state_dict(), path+'_model.pth')

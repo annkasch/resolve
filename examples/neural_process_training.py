@@ -142,7 +142,9 @@ def main(path_to_settings):
     tester.metrics['test_2'] = tester.metrics.pop('test')
     trainer.metrics |= tester.metrics
 
-    torch.save(model.state_dict(), f'{path_out}/model_{version}_model.pth')
+    model.save(f'{path_out}/model_{version}_')
+    
+    
     with open(f'{path_out}/model_{version}_settings.yaml', "w") as f:
         yaml.safe_dump(dataset_train.config_file, f)
 
