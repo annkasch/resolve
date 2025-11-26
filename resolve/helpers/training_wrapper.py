@@ -108,9 +108,6 @@ def _to_dev(obj, device, *, non_blocking=False):
             # Leave other types as-is
             return obj
 
-def _safe_detach_numpy(x: torch.Tensor) -> np.ndarray:
-    return x.detach().cpu().numpy()
-
 def _is_binary_range(target_range: Tuple[float, float]) -> bool:
     lo, hi = target_range
     return lo >= 0.0 and hi <= 1.0
@@ -248,7 +245,7 @@ class Trainer:
         self.model.train(train)
         running_loss = 0.0
         y_true_all, y_pred_all, y_score_all = [], [], []
-        accum_steps = math.ceil(loader.dataset.batch_size_tgt/loader.dataset.meta["batch_size"])
+        accum_steps = math.ceil(loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]/ loader.dataset.batch_size_tgt) if train==True else 1.
 
         if train and self.criterion.base_loss_fn is not skip_loss:
             optimizer.zero_grad(set_to_none=True)
@@ -354,14 +351,14 @@ class Trainer:
             # TRAIN
 
             self.epoch = epoch
-            dataloader = self.dataset.set_loader("train")
+            dataloader = self.dataset.set_loader(epoch, "train")
 
             if (self.model._get_name()== 'IsolationForestWrapper' or self.model._get_name()== 'XGBoostWrapper') and self.model._fitted == False:
                 self.model.fit(loader=dataloader)
-                self.model.init_memory_bank(dataloader.dataset.data["data"]["phi"].shape[-2], device=self.device)
+
             if self.model._get_name() == 'TreeConditionedCNP' and self.model.tree._fitted == False:
                 self.model.fit(loader=dataloader)
-                self.model.tree.init_memory_bank(dataloader.dataset.data["data"]["phi"].shape[-2], device=self.device)
+                self.model.tree.enable_leaf_cache(dataloader.dataset.num_samples())
             
             train_loss, y_true_tr, y_pred_tr, y_score_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.nepochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
@@ -380,7 +377,7 @@ class Trainer:
 
             
             # Early stopping / checkpointing
-            if "validate" not in self.dataset.set_loader("validate").dataset.data: continue
+            if "validate" not in self.dataset.set_loader(epoch, "validate").dataset.data: continue
             score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch+1)
             improved = (score > best_score) if mode == "max" else (score < best_score)
             if improved:
@@ -416,7 +413,7 @@ class Trainer:
         if isinstance(self.criterion, torch.nn.Module):
             self.criterion.to(self.device)
 
-        dataloader = self.dataset.set_loader(dataset_name)
+        dataloader = self.dataset.set_loader(epoch, dataset_name)
         if dataset_name not in dataloader.dataset.data: 
             return
         with torch.inference_mode():
@@ -484,7 +481,7 @@ class Trainer:
             }
             metrics_col =  np.empty((0, 4))
             
-            dataloader = self.dataset.set_loader(mode="predict")
+            dataloader = self.dataset.set_loader(0, mode="predict")
             with tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file" , disable=in_slurm) as pbar:
                 for batch, file_idx, file_completed in dataloader:
                     _, query, _ = batch
@@ -693,14 +690,14 @@ class Trainer:
         schedule = [float(target_pos_frac)] if isinstance(target_pos_frac, (int, float)) else list(target_pos_frac)
 
         for phase_idx, pos_frac in enumerate(schedule, start=1):
-            dataloader = self.dataset.set_loader("train")
+            dataloader = self.dataset.set_loader(0, "train")
 
             dataloader.dataset.set_batch_schedule(
                 target_pos_frac=pos_frac,
                 max_pos_reuse_per_epoch=dataloader.dataset.dataset_config.get("max_positive_reuse", 0.0),
             )
 
-            n_epochs = num_data_pass_per_phase*dataloader.dataset.meta.get("num_epochs", 1) or dataloader.dataset.meta.get("num_epochs", 1)
+            n_epochs = num_data_pass_per_phase*dataloader.dataset.data["train"]["meta"].get("num_epochs", 1) or dataloader.dataset.data["train"]["meta"].get("num_epochs", 1)
 
             best_score = -float("inf") if mode == "max" else float("inf")
             best_state = None
@@ -709,7 +706,7 @@ class Trainer:
             for local_epoch in range(n_epochs):
                 self.epoch = global_epoch
                 global_epoch += 1
-                dataloader = self.dataset.set_loader("train")
+                dataloader = self.dataset.set_loader(local_epoch, "train")
                 train_loss, y_true_tr, y_pred_tr = self._run_epoch(
                     dataloader, optimizer, train=True,
                     desc=f"Warm-up phase {phase_idx}/{len(schedule)} | epoch {local_epoch+1}/{n_epochs}"

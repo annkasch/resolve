@@ -46,7 +46,7 @@ def main(path_to_settings):
                                     config_file=config_file
                                     )
 
-    dataset_train.set_dataset(shuffle=config_file["model_settings"]["train"]["dataset"]["shuffle_dataset"])
+    dataset_train.set_dataset()
 
     if config_file["model_settings"]["train"]["dataset"]["use_feature_normalization"] == "zscore":
         print("theta mean: ", dataset_train.dataset._normalizer._get_scaler("theta").mean_)
@@ -64,12 +64,6 @@ def main(path_to_settings):
 
     # Instantiate the training wrapper for the first phase
     trainer = Trainer(model, dataset_train)
-
-    if hasattr(model, "memory_bank") and model.memory_bank is not None:
-        model.memory_bank.attach_dataset(dataset_train.dataset.data["train"]["target"])
-        model.memory_bank.build()
-        model.memory_bank.train_density_ratio_head(epochs=7, writer=writer, batch_size=256, lr=1e-3)
-
 
     trainer.nepochs = config_file["model_settings"]["train"]["training_epochs"]
 
@@ -124,26 +118,26 @@ def main(path_to_settings):
 
     if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test")
 
+    model.save(f'{path_out}/model_{version}_')
     normalizer_train = dataset_train.dataset._normalizer
 
     # load data:
     dataset_test = DataLoaderManager(mode = "test", 
                                     config_file=config_file
                                     )
-    dataset_test.set_dataset(normalizer=normalizer_train, shuffle=config_file["model_settings"]["train"]["dataset"]["shuffle_dataset"])
+    dataset_test.set_dataset(normalizer=normalizer_train)
+    if model._get_name() == 'TreeConditionedCNP':
+        model.tree.enable_leaf_cache(dataset_test.dataset.num_samples())
 
     tester = Trainer(model, dataset_test, epochs=1)
     tester._report = 1
     tester.criterion = trainer.criterion
-
-    # Train the model
+    
+    # Evaluate the model
     summary_test = tester.evaluate(dataset_name="test", epoch=1, monitor="pr_auc",writer=writer)
 
     tester.metrics['test_2'] = tester.metrics.pop('test')
     trainer.metrics |= tester.metrics
-
-    model.save(f'{path_out}/model_{version}_')
-    
     
     with open(f'{path_out}/model_{version}_settings.yaml', "w") as f:
         yaml.safe_dump(dataset_train.config_file, f)

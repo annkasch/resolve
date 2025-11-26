@@ -8,6 +8,7 @@ from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import make_scorer, precision_score
 import pandas as pd
 import pickle
+from resolve.network_architectures.leaf_cache import LeafCache
 
 class XGBoostWrapper(nn.Module):
     """
@@ -19,7 +20,6 @@ class XGBoostWrapper(nn.Module):
           where query has .theta, .phi and target is a tensor or has .y
         * X, y tensors directly
         * query_theta/query_phi + y/target tensors
-
     """
 
     def __init__(
@@ -50,16 +50,12 @@ class XGBoostWrapper(nn.Module):
         # device handling: XGBoost stays on CPU; we only control output device for tensors
 
         self.cpu_only = True  # hint for trainers
-        # ---- XGBoost leaf embedding support ----
+        # XGBoost leaf embedding support
 
         self.leaf_embed_dim = use_leaf_embeddings                   # embedding size per tree leaf
         self.leaf_embeddings = None               # created after fitting
 
-        self.memory_bank = None
-        self.memory_filled = None
-        self.use_memory_bank = True
-
-    # ---------------------- utilities: input & conversion ----------------------
+    # utilities: input & conversion
 
     @staticmethod
     def _concat_inputs(query_theta: torch.Tensor | None,
@@ -286,71 +282,64 @@ class XGBoostWrapper(nn.Module):
         preds_t = self._from_2d_numpy(preds, original_shape)  
         return preds_t.to(X_torch.device)
 
-    def forward(self, query_theta, query_phi, query_idx=None, **kwargs):
+    
+    # encoding
+    @torch.no_grad()
+    def encode(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Returns:
-        {
-            "logits": [preds_tensor],
-            "leaf_embeddings": leaf_emb_tensor
-        }
-        """
+        Core function used by memory bank (or anyone else).
 
+        X: (N,D) or (B,T,D) tensor on any device
+        Returns:
+            scores:   (N, out_dim)
+            leaf_emb: (N, leaf_embed_dim)
+        """
         if not self._fitted:
             raise RuntimeError("XGBoostWrapper not fitted. Call fit() first.")
 
-        B,T,_ = query_theta.shape
+        X_np, original_shape = self._to_2d_numpy(X)
+
+        # XGB scores
+        scores_np = self.booster.inplace_predict(X_np).astype("float32")
+        scores_t = torch.from_numpy(scores_np)
+
+        if scores_t.ndim == 1:
+            scores_t = scores_t.unsqueeze(-1)        # (N,1)
+
+        scores_t = scores_t.to(X.device)
+
+        # leaf embeddings
+        if self.leaf_embeddings is None:
+            leaf_emb = torch.empty(scores_t.shape[0], 0, device=X.device)
+        else:
+            emb_device = next(self.leaf_embeddings[0].parameters()).device
+            leaf_arr = self.model.apply(X_np).astype("int64")          # (N, n_trees)
+            leaf_ids = torch.from_numpy(leaf_arr).to(emb_device)       # (N, n_trees)
+
+            embeds = []
+            for t, emb_layer in enumerate(self.leaf_embeddings):
+                ids_t = leaf_ids[:, t]          # (N,)
+                embeds.append(emb_layer(ids_t)) # (N, leaf_embed_dim)
+
+            leaf_emb = torch.stack(embeds, dim=1).sum(dim=1)           # (N, leaf_embed_dim)
+            leaf_emb = leaf_emb.to(X.device)
+
+        return scores_t, leaf_emb
+
+    def forward(self, query_theta, query_phi, **kwargs):
+        """
+        Simple, stateless forward. No memory, no indices.
+        """
         X = self._concat_inputs(query_theta, query_phi)
-        X = X.squeeze(0)
+        scores, leaf_emb = self.encode(X)
+        B, T, _ = query_theta.shape
+        scores = scores.view(B, T, -1)
+        leaf_emb = leaf_emb.view(B, T, -1) if leaf_emb.numel() > 0 else leaf_emb
 
-        # Predictions
-        preds = self.predict(X).unsqueeze(0)
-        out={"logits": [preds]}
-        
-        # --- Leaf embeddings (via memory bank)
-        if self.leaf_embed_dim:
-
-            if self.use_memory_bank:
-                if query_idx is None:
-                    raise ValueError("To use the memory bank, batch must include sample indices `idx`.")
-
-                # idx from (B,T) → flatten to (B*T,)
-                if query_idx.dim() == 2:
-                    idx_flat = query_idx.reshape(-1)
-                else:
-                    idx_flat = query_idx
-
-                # Lazily fill + read memory bank
-                leaf_emb_flat = self._fill_memory_bank(X, idx_flat)
-
-            else:
-                # Fallback: recompute every time
-                leaf_emb_flat = self._leaf_embeddings(X)
-
-            # Reshape to (B,T,embed_dim)
-            leaf_emb = leaf_emb_flat.reshape(B, T, self.leaf_embed_dim)
-            out["leaf_embeddings"] = leaf_emb
-        
-        return out
-    
-    def _leaf_embeddings(self, X: torch.Tensor) -> torch.Tensor:
-        """
-        Input:  leaf_arr_np of shape (N, n_trees) from model.apply()
-        Output: (N, leaf_embed_dim) aggregated embedding tensor
-        """
-        X_np,_ = self._to_2d_numpy(X)
-        # Leaf embeddings
-        emb_device = next(self.leaf_embeddings[0].parameters()).device
-        leaf_arr = self.model.apply(X_np)            # shape (N, n_trees)
-        leaf_ids = torch.from_numpy(leaf_arr.astype(np.int64)).to(emb_device)
-
-        embeds = []
-        for t, emb_layer in enumerate(self.leaf_embeddings):
-            ids = leaf_ids[:, t]       # (N,)
-            embeds.append(emb_layer(ids))    # (N, leaf_embed_dim)
-
-        # Sum or concat; sum is more stable
-        leaf_emb = torch.stack(embeds, dim=1).sum(dim=1)  # (N, embed_dim)
-        return leaf_emb
+        return {
+            "logits": [scores],
+            "leaf_embeddings": leaf_emb,
+        }
     
     def save(self, path):
         # Save sklearn model
@@ -373,47 +362,112 @@ class XGBoostWrapper(nn.Module):
         self.load_state_dict(state)
         print(f"Loaded XGBClassifier from {path}xgb.pkl")
 
-    def init_memory_bank(self, num_samples: int, device: torch.device = torch.device("cpu")):
-        self.memory_bank = torch.zeros(num_samples, self.leaf_embed_dim, dtype=torch.float32, device=device)
-        self.memory_filled = torch.zeros(num_samples, dtype=torch.bool, device=device)
+class XGBWithLeafCache(XGBoostWrapper):
+    """
+    XGBoostWrapper + optional LeafCache.
 
-    @torch.no_grad()
-    def _fill_memory_bank(self, X, idx):
+    Behaves exactly like XGBoostWrapper if:
+      - no LeafCache is attached, or
+      - forward() is called without query_idx.
+
+    Uses LeafCache when:
+      - leaf_cache is not None, AND
+      - query_idx is provided.
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        task: str = "regression",
+        out_dim: int = 1,
+        use_parameter_search: bool = False,
+        use_leaf_embeddings: int | bool = False,
+        num_samples: int | None = None,
+        device: torch.device = torch.device("cpu"),
+        **extra_params,
+    ):
+        super().__init__(
+            config=config,
+            task=task,
+            out_dim=out_dim,
+            use_parameter_search=use_parameter_search,
+            use_leaf_embeddings=use_leaf_embeddings,
+            **extra_params,
+        )
+        self.device = device
+        self.out_dim = out_dim
+        self.leaf_cache = None
+
+        if num_samples is not None and self.leaf_embed_dim:
+            self.leaf_cache = LeafCache(
+                num_samples=num_samples,
+                out_dim=self.out_dim,
+                leaf_embed_dim=self.leaf_embed_dim,
+                device=self.device,
+            )
+
+    def enable_leaf_cache(self, num_samples: int, device: torch.device | None = None):
         """
-        X:  (N, D) torch tensor (already the concatenated theta+phi)
-        idx: (N,) long tensor – global indices from dataset
-
-        Fills the memory bank entries for samples that aren't cached yet.
-        Returns a tensor (N, leaf_embed_dim) with all embeddings.
+        Lazily attach / reattach a LeafCache after init.
         """
 
-        # Flatten batch (your code already gives X as shape (N, D))
-        idx = idx.reshape(-1)
+        if device is None:
+            device = next(self.parameters()).device
+        if not self.leaf_embed_dim:
+            raise ValueError("leaf_embed_dim is 0/False, cannot create LeafCache.")
 
-        # Determine which entries need computation
-        cached = self.memory_filled[idx]               # (N,)
-        need_compute = ~cached
+        self.leaf_cache = LeafCache(
+            num_samples=num_samples,
+            out_dim=self.out_dim,
+            leaf_embed_dim=self.leaf_embed_dim,
+            device=device,
+        )
 
-        if need_compute.any():
-            # Only compute XGB embeddings for unseen samples
-            X_np = X[need_compute].detach().cpu().numpy()
-            emb_device = next(self.leaf_embeddings[0].parameters()).device
-            leaf_arr = self.model.apply(X_np)          # (Nm, n_trees)
-            leaf_ids = torch.from_numpy(leaf_arr.astype("int64")).to(emb_device)
+    def forward(self, query_theta, query_phi, query_idx=None, **kwargs):
+        """
+        If query_idx and leaf_cache present → use memory.
+        Else → fall back to parent (stateless) forward.
+        """
+        # no cache or no indices: behave like plain XGBoostWrapper
+        if self.leaf_cache is None or query_idx is None:
+            return super().forward(query_theta, query_phi, **kwargs)
 
-            embeds = []
-            for t, emb_layer in enumerate(self.leaf_embeddings):
-                ids_t = leaf_ids[:, t]
-                embeds.append(emb_layer(ids_t))
+        # with cache
+        X = self._concat_inputs(query_theta, query_phi)  # (B,T,D)
+        B, T, _ = X.shape
 
-            leaf_emb_missing = torch.stack(embeds, dim=1).sum(dim=1)   # (Nm, embed_dim)
+        idx_flat = query_idx.view(-1)
+        scores_flat, leaf_flat = self.leaf_cache.query(self.encode, X, idx_flat)
 
-            # Save to memory bank
-            idx_missing = idx[need_compute]
-            self.memory_bank[idx_missing] = leaf_emb_missing.to(self.memory_bank.device)
-            self.memory_filled[idx_missing] = True
+        preds = scores_flat.view(B, T, -1)
+        leaf_emb = leaf_flat.view(B, T, -1)
 
-        # Return ALL embeddings for the batch
-        leaf_emb = self.memory_bank[idx]
-        return leaf_emb
+        return {
+            "logits": [preds],
+            "leaf_embeddings": leaf_emb,
+        }
+    
+    def save(self, path: str):
+        with open(path + "xgb.pkl", "wb") as f:
+            pickle.dump(self.model, f)
 
+        booster = self.model.get_booster()
+        booster.save_model(path + "booster.json")
+
+        state = self.state_dict()
+        # drop all leaf_cache.* entries from the state dict
+        state = {k: v for k, v in state.items() if not k.startswith("leaf_cache.")}
+        torch.save(state, path + "embeddings.pt")
+
+        self.leaf_cache.save_cache(path + "leaf_cache.pt")
+
+    def load(self, path: str):
+        with open(path + "xgb.pkl", "rb") as f:
+            self.model = pickle.load(f)
+        self.booster = self.model.get_booster()
+
+        state = torch.load(path + "embeddings.pt", map_location="cpu")
+        self.load_state_dict(state)
+
+        if self.leaf_cache is not None:
+            self.leaf_cache.load_cache(path + "leaf_cache.pt")

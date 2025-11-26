@@ -6,4 +6,5 @@ from .supervised_contrastive import SupervisedContrastive
 from .info_nce import InfoNCE
 from .ft_transformer import FTTransformer
 from .transformer_encoder import TransformerEncoder
-from .xgboost import XGBoostWrapper
+from .xgboost import XGBoostWrapper, XGBWithLeafCache
+from .leaf_cache import LeafCache

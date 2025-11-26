@@ -11,8 +11,10 @@ class Sampler():
         self.shuffle = shuffle
         self.positive_fn = self.positive_function(positive_condition) if positive_condition else None
         self.seed = seed
+        self._epoch_counter = 0
     
-    def build_batches(self, idx_array, batch_size: int, randperm = None):
+    def build_batches(self, idx_array, batch_size: int, randperm = None, epoch=0):
+        
         n_samples = idx_array.shape[0]
         rperm = randperm
         if self.shuffle == "global":
@@ -34,7 +36,8 @@ class Sampler():
 
     def _epoch_seed(self) -> int:
         if not hasattr(self, '_epoch_counter'): self._epoch_counter = 0
-        s = self.seed + self._epoch_counter; self._epoch_counter += 1; return s
+        s = self.seed + self._epoch_counter; 
+        return s
 
     @staticmethod
     def get_unique_ids(x):

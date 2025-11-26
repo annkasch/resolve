@@ -45,41 +45,31 @@ class DataLoaderManager:
 
         self.positive_condition  = self.config_file["simulation_settings"]["signal_condition"]
 
-        #self.positive_condition_function = np.full(len(positive_cond), None) 
-        #for i, cond_str in enumerate(positive_cond):
-        #        self.positive_condition_function[i] = utils.parse_condition(cond_str) 
-
         self.dataset = None
     # ------------- helpers -------------
     def _get_hdf5_files(self, path_to_files):
         return sorted(str(p) for p in path_to_files.glob(f"*.{self.config_file['simulation_settings']['file_format']}"))
 
-    def set_dataset(self, normalizer=Normalizer(), shuffle = "global"):
+    def set_dataset(self, normalizer=Normalizer()):
         dataset_config = self.config_file["model_settings"]["train"]["dataset"]
 
         self.dataset = InMemoryIterableData(
                 files=self.files,
                 batch_size=self.config_file["model_settings"]["train"]["batch_size"],
                 parameter_config=self.parameters,
-                shuffle=shuffle,   # reshuffles every epoch
-                seed=42,
                 dataset_config=dataset_config,
                 positive_condition=self.positive_condition,
                 normalizer=normalizer,
                 mode=self.mode
             )
 
-    def set_loader(self, mode="train", shuffle=None):
+    def set_loader(self, epoch, mode="train", shuffle=True):
         if self.dataset is None:
-            # Pass shuffle only if explicitly provided
-            if shuffle is not None:
-                self.set_dataset(shuffle=shuffle)
-            else:
-                self.set_dataset()
+            self.set_dataset()
         else:
-            # Only change shuffle if provided
-            if shuffle is not None:
-                self.dataset.shuffle = shuffle
+            # shuffle if provided
+            if shuffle is True:
+                self.dataset.build_batches(epoch)
             
         self.dataset.set_mode(mode)
         self.dataloader = DataLoader(

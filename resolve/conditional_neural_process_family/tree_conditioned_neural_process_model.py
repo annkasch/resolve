@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from resolve.conditional_neural_process_family.class_attention import SimplePoolAttention
 from resolve.conditional_neural_process_family.feature_encoder import FeatureEncoder, MLP
-from resolve.network_architectures.xgboost import XGBoostWrapper
+from resolve.network_architectures.xgboost import XGBoostWrapper, XGBWithLeafCache
 
     
 class DecoderHead(nn.Module):
@@ -36,7 +36,13 @@ class TreeConditionedCNP(nn.Module):
         self.d_phi   = d_phi
         self.d_y     = d_y
 
-        self.tree = XGBoostWrapper(config=tree_config["config"], task=tree_config.get("task","binary"), use_parameter_search=tree_config.get("use_parameter_search", False), use_leaf_embeddings=tree_config.get("use_leaf_embeddings", False))
+        self.tree = XGBWithLeafCache(config=tree_config["config"], 
+                                   task=tree_config.get("task","binary"), 
+                                   out_dim=d_y,
+                                   num_samples=tree_config.get("num_samples", None),
+                                   use_parameter_search=tree_config.get("use_parameter_search", False), 
+                                   use_leaf_embeddings=tree_config.get("use_leaf_embeddings", False))
+        
     
         d_phi = d_phi + d_y + self.tree.leaf_embed_dim
         # Simpler & consistent with qry/tgt encoders:

@@ -27,12 +27,12 @@ BatchCollection = collections.namedtuple(
 )
 
 class InMemoryIterableData(IterableDataset):
-    def __init__(self, files: Sequence[str], batch_size: int = 1000, shuffle: bool = "global",
-                 seed: int = 42, parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
+    def __init__(self, files: Sequence[str], batch_size: int = 1000,
+                 parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
                  normalizer: Optional[Normalizer]=Normalizer(), mode: Optional[str] = "train") -> None:
         super().__init__()
         
-        self.files, self.shuffle, self.seed = list(files), shuffle, seed
+        self.files, self.shuffle, self.seed = list(files), dataset_config["shuffle_dataset"], dataset_config["seed"]
         self.parameter_config, self.dataset_config = (parameter_config or {}), dataset_config
         self.batch_size_tgt = math.ceil(batch_size*(1.-self.dataset_config.get("context_ratio", 1./3.)))
         self.batch_size_ctx = batch_size - self.batch_size_tgt
@@ -41,6 +41,7 @@ class InMemoryIterableData(IterableDataset):
         self.mode = mode
         self._normalizer = normalizer
         self.sampler = Sampler(positive_condition, shuffle=self.shuffle, seed=self.seed)
+        self.sampler._epoch_counter = -1
 
         self.state = None
         self.meta = {}
@@ -51,6 +52,7 @@ class InMemoryIterableData(IterableDataset):
         self.theta_to_id = self.sampler.get_unique_ids(theta)
 
         self.data = self._set_data(theta, phi, y, fidx)
+        self.build_batches(0)
         
         if not isinstance(self.dataset_config.get('positive_ratio_train'), list) and self.dataset_config.get("positive_ratio_train", None) is not None:
             self.set_batch_schedule(target_pos_frac=self.dataset_config.get("positive_ratio_train", None), max_pos_reuse_per_epoch = self.dataset_config.get("max_positive_reuse",0.), sticky_frac = 0.25, seed=self.dataset_config.get("seed",12345))
@@ -77,19 +79,14 @@ class InMemoryIterableData(IterableDataset):
                 idx, idx_val = splitter.train_test_split(idx, groups=theta[idx], test_size=val_size)
                 if self.context_ratio >0. :
                     idx_val, idx_val_ctx = splitter.train_test_split(idx_val, groups=theta[idx_val], test_size=self.context_ratio)
-                
-                batches_val,_,_,rperm_val = self.sampler.build_batches(idx_val, batch_size=self.batch_size_tgt)
-                data.update({"validate": {"target": {"indice": idx_val, "batches": batches_val}}})
+                data.update({"validate": {"target": {"indices": idx_val, "batch_size": self.batch_size_tgt}}})
                 
             test_size = self.dataset_config.get('test_ratio',0.2)/ (1.-val_size)
             if test_size > 0. :
                 idx, idx_test = splitter.train_test_split(idx, groups=theta[idx], test_size=test_size)
-
                 if self.context_ratio >0.:
                     idx_test, idx_test_ctx = splitter.train_test_split(idx_test, groups=theta[idx_test], test_size=self.context_ratio)
-
-                batches_test,_,_,rperm_test = self.sampler.build_batches(idx_test, batch_size=self.batch_size_tgt)
-                data.update({"test": {"target":{"indices": idx_test, "batches": batches_test}}})
+                data.update({"test": {"target":{"indices": idx_test, "batch_size": self.batch_size_tgt}}})
                 
             # split training data into context and target data
             if self.context_ratio >0. :
@@ -111,21 +108,14 @@ class InMemoryIterableData(IterableDataset):
                             margin=float(self.dataset_config.get('mixup_margin', 0.0))
                         )
 
-            batches, self.status, self.meta, rperm = self.sampler.build_batches(idx, batch_size=self.batch_size_tgt)
-            self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
-            data.update({"train": {"target":{"indices": idx, "batches": batches}}})
+            data.update({"train": {"target":{"indices": idx, "batch_size": self.batch_size_tgt}}})
 
             if self.context_ratio > 0.:
-                batches_ctx, _, _, _ = self.sampler.build_batches(idx_ctx, batch_size=self.batch_size_ctx, randperm=rperm)
-                data["train"].update({"context": {"indices": idx_ctx, "batches": batches_ctx}})
+                data["train"].update({"context": {"indices": idx_ctx, "batch_size": self.batch_size_ctx}})
                 if val_size > 0.:
-                    batch_size = self.batch_size_ctx if rperm_val is None else int(math.floor(idx_val_ctx.shape[0] / len(rperm)))
-                    batches_val_ctx = self.sampler.build_batches(idx_val_ctx, batch_size=batch_size, randperm=rperm_val)[0]
-                    data["validate"].update({"context":{"indices": idx_val_ctx, "batches": batches_val_ctx}})
+                    data["validate"].update({"context":{"indices": idx_val_ctx, "batch_size": self.batch_size_ctx}})
                 if test_size > 0.:
-                    batch_size = self.batch_size_ctx if rperm_test is None else int(math.ceil(idx_test_ctx.shape[0] / len(rperm_test)))
-                    batches_test_ctx = self.sampler.build_batches(idx_test_ctx, batch_size=batch_size, randperm=rperm_test)[0]
-                    data["test"].update({"context":{"indices": idx_test_ctx, "batches": batches_test_ctx}})
+                    data["test"].update({"context":{"indices": idx_test_ctx, "batch_size": self.batch_size_ctx}})
         else:
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
             phi = self._normalizer.transform(x=phi, feature_grp="phi")
@@ -134,23 +124,25 @@ class InMemoryIterableData(IterableDataset):
             
             if self.context_ratio >0.:
                 idx, idx_ctx = splitter.train_test_split(idx, groups=theta[idx], test_size=self.context_ratio)
-            
-            
-            batches, self.status, self.meta, rperm = self.sampler.build_batches(idx,batch_size=self.batch_size_tgt)
-            self.meta["pos_frac"] = positive_ratio_data.detach().cpu().numpy()
-
-            data.update({f"{self.mode}":{"target":{"indices": idx, "batches": batches}}})
-            if self.context_ratio > 0.:
-                batches_ctx, _, _, _  = self.sampler.build_batches(idx_ctx,batch_size=self.batch_size_ctx, randperm=rperm)
-                data[f"{self.mode}"].update({"context":{"indices": idx_ctx, "batches": batches_ctx}})
+                data.update({f"{self.mode}":{"context":{"indices": idx_ctx, "batch_size": self.batch_size_ctx}}})
+            data[f"{self.mode}"].update({"target":{"indices": idx, "batch_size": self.batch_size_tgt}})
             
         return data
     
+    def build_batches(self, epoch):
+        if self.sampler._epoch_counter == epoch: return
+        for k in self.data.keys():
+            if k == "data": 
+                continue
+            perm = None
+            for t in self.data[k].keys():
+                self.data[k][t]["batches"], _, self.data[k][t]["meta"], perm = self.sampler.build_batches(self.data[k][t]["indices"], batch_size=self.data[k][t]["batch_size"], randperm=perm)
+        self.sampler._epoch_counter = epoch
+
     def set_batch_schedule(self,
         target_pos_frac: float,
         max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
         sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
-        seed: int | None = None,          # reproducible positive order
     ):
 
         idx_ctx = self.data[self.mode]["context"]["indices"] if "context" in self.data[self.mode].keys() else None
@@ -191,7 +183,7 @@ class InMemoryIterableData(IterableDataset):
         else:
             self.data[self.mode]["target"]["batches"], self.state, self.meta, rperm = self.sampler.build_batches(idx_tgt, batch_size=self.batch_size_tgt)
             if idx_ctx is not None: self.data[self.mode]["context"]["batches"] = self.sampler.build_batches(idx_ctx, batch_size=self.batch_size_ctx, randperm=rperm)[0]
-            
+        self.sampler._epoch_counter += 1 
 
     @staticmethod
     def _read_in_from_file(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -461,4 +453,7 @@ class InMemoryIterableData(IterableDataset):
 
         if store.get("batches") is not None:
             return len(store["batches"])
-        return int(math.ceil(self.data["data"]["phi"][store["indices"]].shape[0] / self.batch_size_tgt))
+        return int(math.ceil(self.data["data"]["phi"][store["indices"]].shape[-2] / self.batch_size_tgt))
+    
+    def num_samples(self) -> int:
+        return self.data["data"]["phi"].shape[-2]
