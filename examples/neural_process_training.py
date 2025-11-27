@@ -5,7 +5,7 @@ import os
 from resolve.utilities import utilities as utils
 from resolve.helpers import DataLoaderManager
 from resolve.helpers import Trainer, ModelsManager
-from resolve.helpers import AsymmetricFocalWithFPPenalty, log_prob, recon_loss_mse, skip_loss, bce_with_logits, brier
+from resolve.helpers import AsymmetricFocalWithFPPenalty, gaussian_nll, recon_loss_mse, skip_loss, bce_with_logits, brier, logit_normal_bernoulli_nll
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import json

@@ -18,7 +18,7 @@ class ModelsManager():
             "InfoNCE": lambda cfg: InfoNCE(d_theta=cfg["d_theta"],d_phi=cfg["d_phi"], d_y=cfg["d_y"], d_model=cfg.get("representation_size", 32), encoder_hidden=cfg.get("encoder_sizes", [128, 128]), decoder_hidden=cfg.get("decoder_sizes", [128, 128]), d_proj=cfg.get("projection_size", 64), lambda_contrast=cfg.get("lambda_contrast", 0.01), mode=cfg.get("mode", "concat"), theta_embed_dim=cfg.get("theta_embed_dim", None)),
             "FTTransformer": lambda cfg: FTTransformer(d_theta=cfg["d_theta"],d_phi=cfg["d_phi"], d_y=cfg["d_y"], d_model=cfg.get("representation_size", 64),  depth=cfg.get("depth", 1), n_heads=cfg.get("n_heads", 4), use_cls_token=cfg.get("use_cls_token", True)),
             "XGBoost": lambda cfg: XGBoostWrapper(config=cfg["config"], task=cfg.get("task","binary"), out_dim=cfg["d_y"], use_parameter_search=cfg.get("use_parameter_search",False), use_leaf_embeddings=cfg.get("use_leaf_embeddings",False)),
-            "TreeConditionedCNP": lambda cfg: TreeConditionedCNP(d_theta=cfg["d_theta"], d_phi=cfg["d_phi"], d_y=cfg["d_y"], tree_config=cfg["tree_config"], d_model=cfg.get("representation_size", 32), encoder_hidden=cfg.get("encoder_sizes", [128, 128]), mode=cfg.get("mode", "concat"), theta_embed_dim=cfg.get("theta_embed_dim", None), n_heads=cfg.get("n_heads", 4))
+            "TreeConditionedCNP": lambda cfg: TreeConditionedCNP(d_theta=cfg["d_theta"], d_phi=cfg["d_phi"], d_y=cfg["d_y"], out_dim=cfg.get("out_dim",1), tree_config=cfg["tree_config"], d_model=cfg.get("representation_size", 32), encoder_hidden=cfg.get("encoder_sizes", [128, 128]), mode=cfg.get("mode", "concat"), theta_embed_dim=cfg.get("theta_embed_dim", None), n_heads=cfg.get("n_heads", 4))
         }
 
     def get_network(self, model_name):

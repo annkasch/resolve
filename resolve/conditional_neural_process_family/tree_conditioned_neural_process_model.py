@@ -1,27 +1,31 @@
 import torch
 import torch.nn as nn
-from resolve.conditional_neural_process_family.class_attention import SimplePoolAttention
+from resolve.conditional_neural_process_family.class_attention import SimplePoolAttention, CrossAttention, CrossAttentionWithMoE
 from resolve.conditional_neural_process_family.feature_encoder import FeatureEncoder, MLP
 from resolve.network_architectures.xgboost import XGBoostWrapper, XGBWithLeafCache
+from resolve.network_architectures.transformer_encoder import TransformerEncoder
+import torch.nn.functional as F
 
-    
 class DecoderHead(nn.Module):
     """Maps z_t -> logit."""
     def __init__(self, in_dim, hidden=[256, 256], out_dim=1):
         super().__init__()
+        self.out_dim = out_dim
         self.net = MLP([in_dim] + hidden + [out_dim])
-        #self.net = MLP([in_dim] + hidden + [out_dim*2])
 
     def forward(self, z_t):
         hidden = self.net(z_t)
-        #mu, rho = torch.split(hidden, hidden.size(-1) // 2, dim=-1)
-        #sigma = F.softplus(rho) + 1e-6
-        return hidden
+        out = torch.split(hidden, hidden.size(-1) // self.out_dim, dim=-1)
+        if self.out_dim == 2:
+            out = list(out)
+            out[1] = F.softplus(out[1]) + 1e-6
 
+        return out
 
 class TreeConditionedCNP(nn.Module):
     def __init__(self,
                  d_theta, d_phi, d_y,
+                 out_dim,
                  tree_config,
                  d_model=32,
                  encoder_hidden=[128,128],
@@ -43,31 +47,45 @@ class TreeConditionedCNP(nn.Module):
                                    use_parameter_search=tree_config.get("use_parameter_search", False), 
                                    use_leaf_embeddings=tree_config.get("use_leaf_embeddings", False))
         
-    
-        d_phi = d_phi + d_y + self.tree.leaf_embed_dim
+        d_phi_ctx = d_phi + d_y + self.tree.leaf_embed_dim
+        """
         # Simpler & consistent with qry/tgt encoders:
         self.ctx_enc = FeatureEncoder(
-            phi_dim=d_phi, y_dim=d_y, theta_in_dim=d_theta,
+            phi_dim=d_phi_ctx, y_dim=d_y, theta_in_dim=d_theta,
             hidden=encoder_hidden, out_dim=d_model,
             mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
         )
+        """
+        self.ctx_enc = TransformerEncoder(theta_dim=d_theta,
+            phi_dim=d_phi_ctx,
+            y_dim=d_y,
+            embed_dim= d_model,
+            depth= 1,
+            num_heads= n_heads,
+            mlp_ratio= 4.0,
+            dropout= 0.0,
+            proj_out_dim= None,  # if set, final linear to this dim
+            use_cls_token= False,      # set False: mean over feature tokens
+            use_tokenizer= False,
+        )
+        
         # encoders
         # Target query encoder: x_t = (theta,phi)  → R_t (no y_t)
+        d_phi_tgt = d_phi + self.tree.leaf_embed_dim
         self.qry_enc = FeatureEncoder(
-            phi_dim=d_phi, y_dim=None, theta_in_dim=d_theta,
+            phi_dim=d_phi_tgt, y_dim=None, theta_in_dim=d_theta,
             hidden=encoder_hidden, out_dim=d_model,
             mode=mode, theta_embed_dim=theta_embed_dim, use_layernorm=True
         )
 
-        self.attn = SimplePoolAttention()
+        #self.attn = CrossAttention(d_model, n_heads=n_heads)
+        self.attn = CrossAttentionWithMoE(dim=d_model, num_heads=n_heads)
 
         # Norms
-        self.norm_q  = nn.LayerNorm(d_model)
-        self.norm_kv = nn.LayerNorm(d_model)
         self.norm_r  = nn.LayerNorm(d_model)
 
         in_dim = 2*d_model
-        self.base_decoder  = DecoderHead(in_dim, out_dim=1)  # logits
+        self.base_decoder  = DecoderHead(in_dim, out_dim=out_dim)  # logits
 
     def fit(self,X: torch.Tensor | None = None,
         y: torch.Tensor | None = None,
@@ -115,27 +133,22 @@ class TreeConditionedCNP(nn.Module):
         phi_cnp_ctx = torch.cat([context_phi, score_ctx.to(device), leaf_emb.to(device)], dim=-1)
         # context encodings (x_c,y_c) → R_ctx
         R_ctx  = self.ctx_enc(context_theta, phi_cnp_ctx, y=context_y)  # (B,Nc,D)
+        wS_ctx = (context_y.squeeze(-1) > 0.5).float()  
         # target query (x_t) → R_t
         with torch.no_grad():
             out = self.tree(query_theta=query_theta, query_phi=query_phi, query_idx=query_idx)
         score_tgt = out["logits"][0]            # (B,T,1)
         leaf_emb = out["leaf_embeddings"]   # (B,T,embed_dim)
 
-        phi_cnp_tgt = torch.cat([query_phi, score_tgt.to(device), leaf_emb.to(device)], dim=-1)
+        phi_cnp_tgt = torch.cat([query_phi, leaf_emb.to(device)], dim=-1)
         # context encodings (x_c,y_c) → R_ctx
         R_t = self.qry_enc(theta=query_theta, phi=phi_cnp_tgt)                  # (B,Nt,D)
 
-        r_all, _ = self.attn(
-            Q_src=R_t,                     # (B, Nt, D)
-            K_src=self.norm_kv(R_ctx),     # (B, Nc, D)
-            mask=mask_c,                   # (B, Nc)
-            logit_bias_ctx=None,        # (B, Nc) or None
-            beta=1.0             # scalar hyperparam, e.g. 1.0
-        )
+        h_t = R_t
+        for _ in range(2):
+            h_t = self.attn(q_tokens=h_t, kv_tokens=R_ctx, key_mask=wS_ctx)
 
-        rC = r_all.mean(dim=1, keepdim=True).expand(-1, R_t.shape[1], -1)     # (B,Nt,D)
-
-        logits = self.base_decoder(torch.cat([R_t, rC], dim=-1))                                     # (B,Nt,1)
+        logits = self.base_decoder(torch.cat([R_t, h_t], dim=-1))  
 
         return {"logits": logits, "scores": score_tgt}
 

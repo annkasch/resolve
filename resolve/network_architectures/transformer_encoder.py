@@ -21,6 +21,7 @@ class MLP(nn.Module):
         x = self.drop(x)
         x = self.fc2(x)
         x = self.drop(x)
+
         return x
 
 
@@ -108,6 +109,7 @@ class TransformerEncoder(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         proj_out_dim: int | None = None,  # if set, final linear to this dim
+        use_tokenizer: bool = False,
         use_cls_token: bool = False       # set False: mean over feature tokens
     ):
         super().__init__()
@@ -116,8 +118,9 @@ class TransformerEncoder(nn.Module):
         self.F_total += y_dim if (y_dim is not None) else 0
         self.embed_dim = embed_dim
 
-        self.tokenizer = FeatureTokenizer(self.F_total, embed_dim, bias=True, dropout=dropout)
-
+        self.tokenizer = FeatureTokenizer(self.F_total, embed_dim, bias=True, dropout=dropout) if use_tokenizer else MLP(in_features=self.F_total,out_features=embed_dim)
+        self.use_tokenizer = use_tokenizer
+        
         if self.use_cls:
             self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
             nn.init.trunc_normal_(self.cls_token, std=0.02)
@@ -140,10 +143,10 @@ class TransformerEncoder(nn.Module):
         B, Nc, _ = phi.shape
         # Concatenate features per context point: (B, Nc, F_total)
         feats = torch.cat([theta, phi, y], dim=-1) if y is not None else torch.cat([theta, phi], dim=-1)
-        feats = feats.reshape(B * Nc, self.F_total)
-
+        
         # Feature tokens (L = #features)
-        tokens = self.tokenizer(feats)  # (B*Nc, L, D)
+        if self.use_tokenizer: feats = feats.reshape(B * Nc, self.F_total)
+        tokens = self.tokenizer(feats)
 
         if self.use_cls:
             cls = self.cls_token.expand(tokens.shape[0], 1, self.embed_dim)
@@ -155,7 +158,8 @@ class TransformerEncoder(nn.Module):
         tokens = self.norm(tokens)
 
         # Aggregate tokens -> per-context embedding
-        h = self._aggregate(tokens)               # (B*Nc, D)
+        h = tokens
+        if self.use_tokenizer: h = self._aggregate(h)               # (B*Nc, D)
         h = self.proj(h).view(B, Nc, -1)          # (B, Nc, D_out)
         return h
     

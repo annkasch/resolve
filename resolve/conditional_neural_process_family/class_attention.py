@@ -55,7 +55,7 @@ class CrossAttention(nn.Module):
         B, N, D = x.shape
         return x.view(B, N, self.n_heads, self.d_k).transpose(1, 2)  # (B,H,N,d_k)
 
-    def attention(self, Q_src, K_src, V_src=None, value_weights=None, mask=None):
+    def forward(self, Q_src, K_src, V_src=None, value_weights=None, mask=None):
         
         #Q_src: (B, Nt, D)  - from targets (R^{(t)})
         #K_src: (B, Nc, D)  - from context
@@ -83,14 +83,91 @@ class CrossAttention(nn.Module):
 
         B, H, Nt, d_k = context.shape
         context = context.transpose(1, 2).contiguous().view(B, Nt, H*d_k)
-        return self.out(context), Wk, Wv                 # (B,Nt,D)
-    
-    def forward(self, Q_src, K_src_pos, K_src_neg, V_src_pos=None, value_weights_pos=None, V_src_neg=None, value_weights_neg=None ):
-        r_pos, Wk_pos, Wv_pos = self.attention(Q_src, K_src_pos, V_src=V_src_pos, value_weights=value_weights_pos)
-        r_neg, Wk_neg, Wv_neg = self.attention(Q_src, K_src_neg, V_src=V_src_neg, value_weights=value_weights_neg)
+        return self.out(context)
 
-        loss = l_proj_param(Wk_pos[0], Wk_neg[0], Wv_pos[0], Wv_neg[0], normalize=True, eps=1e-12)
-        return r_pos, r_neg, loss
+class CrossAttentionWithMoE(nn.Module):
+    """Cross-attention: Q from target tokens, K/V from encoder representation."""
+    def __init__(self, dim, num_heads=8, qkv_bias=True, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.gate = torch.nn.Linear(dim // self.num_heads, 1)  # dim == D
+
+    def forward(self, q_tokens, kv_tokens, key_mask, return_keys: bool=False, return_queries: bool=False):
+        """
+        q_tokens: (B, Nq, D)  - target tokens (queries)
+        kv_tokens: (B, Nk, D) - encoder representation (keys/values)
+        key_mask: (B, Nk) in {0,1}; 1 => POSITIVE key, 0 => NEGATIVE key
+        """
+        B, Nq, D = q_tokens.shape
+        _, Nk, _ = kv_tokens.shape
+        H = self.num_heads
+        dh = D // H
+        p_drop = self.attn_drop.p if self.training else 0.0
+
+        # Project & split heads
+        q = self.q(q_tokens).reshape(B, Nq, H, dh).permute(0, 2, 1, 3)  # (B,H,Nq,dh)
+        k = self.k(kv_tokens).reshape(B, Nk, H, dh).permute(0, 2, 1, 3)  # (B,H,Nk,dh)
+        v = self.v(kv_tokens).reshape(B, Nk, H, dh).permute(0, 2, 1, 3)  # (B,H,Nk,dh)
+
+        # Build boolean keep masks per channel
+        # keep_*: (B,1,1,Nk) -> broadcast to (B,H,Nq,Nk) for attn_mask
+        keep_pos = (key_mask > 0)[:, None, None, :]         # True where POS
+        keep_neg = ~keep_pos                                 # True where NEG
+
+        # PyTorch SDPA: attn_mask=True means "mask out". So invert keep->mask.
+        attn_mask_pos = ~keep_pos.expand(B, H, Nq, Nk)      # True = block
+        attn_mask_neg = ~keep_neg.expand(B, H, Nq, Nk)
+
+        # Handle edge cases: if a channel has no valid keys, skip SDPA to avoid NaNs
+        has_pos = keep_pos.any(dim=-1).any(dim=-2)  # (B,1,1) -> per batch flag
+        has_neg = keep_neg.any(dim=-1).any(dim=-2)
+
+        # Pos channel
+        if has_pos.any():
+            x_pos = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask_pos, dropout_p=p_drop, is_causal=False
+            )  # (B,H,Nq,dh)
+        else:
+            x_pos = torch.zeros((B, H, Nq, dh), device=q.device, dtype=q.dtype)
+
+        # Neg channel
+        if has_neg.any():
+            x_neg = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask_neg, dropout_p=p_drop, is_causal=False
+            )  # (B,H,Nq,dh)
+        else:
+            x_neg = torch.zeros((B, H, Nq, dh), device=q.device, dtype=q.dtype)
+
+        # Learned gate lambda(q): sigmoid(linear per head/query over q)
+        lam = torch.sigmoid(self.gate(q))  # (B,H,Nq,1)
+
+        # Mix channels
+        x_mix = lam * x_pos + (1.0 - lam) * x_neg  # (B,H,Nq,dh)
+
+        # Merge heads and project out
+        x = x_mix.transpose(1, 2).reshape(B, Nq, D)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+
+        if return_keys or return_queries:
+            out = [x]
+            if return_keys:
+                # (B, Nk, D), labels per key from key_mask: 1=pos,0=neg
+                out += [k.detach(), key_mask.detach().long()]
+            if return_queries:
+                # (B, Nq, D) — attach query labels if you have them
+                out += [q.detach()]
+            return tuple(out)
+
+        return x
 
 class CrossAttentionDual(nn.Module):
     """

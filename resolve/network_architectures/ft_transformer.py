@@ -30,7 +30,8 @@ class FTTransformer(nn.Module):
             mlp_ratio= 4.0,
             dropout= 0.0,
             proj_out_dim= None,  # if set, final linear to this dim
-            use_cls_token= use_cls_token      # set False: mean over feature tokens
+            use_cls_token= use_cls_token,      # set False: mean over feature tokens
+            use_tokenizer= True,
         )
         
         # Bernoulli decoder

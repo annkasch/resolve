@@ -94,13 +94,14 @@ model_settings:
         representation_size: 64
         encoder_sizes: [128,128]
         theta_embed_dim: 32
+        out_dim: 2
         n_heads: 4 
         mode: concat  # concat # film
         use_mem_bank: false
         tree_config:
           task: binary          # "regression" or "binary"
           use_parameter_search: False
-          use_leaf_embeddings: 8 # False or int
+          use_leaf_embeddings: 32 # False or int
           config:
             objective: binary:logistic
             device: cuda
@@ -139,23 +140,23 @@ model_settings:
       max_positive_reuse: 5
       num_data_pass_per_phase: 2
     batch_size: 1000
-    training_epochs: 200
+    training_epochs: 25
     patience: 200
     learning_rate: 0.001
     report_frequency: 100
     loss:
-      base_loss_fn: bce_with_logits    # Supported: 'bce_with_logits', 'log_prob' (NLL for Gaussian), 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest), 'brier' Brier Loss
+      base_loss_fn: logit_normal_bernoulli_nll    # Supported: 'bce_with_logits', 'gaussian_nll' (Gaussian NLL),'logit_normal_bernoulli_nll' (Bernoulli NLL) 'recon_loss_mse' (Mean Squared Error), 'skip_loss' (Isolation Forest), 'brier' Brier Loss
       prior_pos: false    # Whether to apply logit adjustment based on prior class probability (signal rate). 
                           # Helps correct imbalance if true; set false for standard loss.
-      alpha_pos:  0.99     # Weight for the positive (signal) class. 
+      alpha_pos:  1.0     # Weight for the positive (signal) class. 
                           # Lower (<1) downweights positives, higher (>1) emphasizes them. 
                           # Common range: 0.1–0.5. Set to 1 for no reweighting.
-      alpha_neg:  null     # Optional explicit weight for the negative (background) class. 
+      alpha_neg:  1.0     # Optional explicit weight for the negative (background) class. 
                           # If None (null), uses (1 - alpha_pos). Set to 1 for no reweighting.
-      gamma_pos:  1.     # Focusing parameter (Focal Loss) for positives. 
+      gamma_pos:  0.     # Focusing parameter (Focal Loss) for positives. 
                           # Increases focus on hard-to-classify positives. Typical values: 1–2. 
                           # Set to 0 to disable focusing.
-      gamma_neg:  1.     # Focusing parameter (Focal Loss) for negatives. 
+      gamma_neg:  0.     # Focusing parameter (Focal Loss) for negatives. 
                           # Higher values (>2) penalize hard negatives more strongly. 
                           # Set to 0 to disable focusing.
       lambda_fp:  0.     # Penalty weight for false positives. 

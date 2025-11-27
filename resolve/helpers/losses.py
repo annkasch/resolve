@@ -6,6 +6,78 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+
+def logit_normal_bernoulli_nll(
+    z: torch.Tensor,
+    y: torch.Tensor,
+    num_points: int = 5,
+    eps: float = 1e-12,
+    **kward
+) -> torch.Tensor:
+    """
+    Logit-Normal Bernoulli negative log-likelihood.
+
+    We assume a latent logit ℓ ~ N(mu, sigma^2), probability p = sigmoid(ℓ),
+    and label y ~ Bernoulli(p). This function computes:
+
+        NLL = -log ∫ Bernoulli(y | sigmoid(ℓ)) N(ℓ | mu, sigma^2) dℓ
+
+    using Gauss–Hermite quadrature.
+
+    Args
+    ----
+    mu      : (...,)   mean of the logit distribution
+    sigma   : (...,)   std of the logit distribution (must be > 0)
+    y       : (...,)   binary labels in {0,1}
+    num_points : int   number of GH quadrature points (5 or 10 supported)
+    reduction  : str   "mean", "sum", or "none"
+    eps     : float    numerical stability epsilon
+
+    Returns
+    -------
+    nll : scalar tensor if reduction != "none", else same shape as mu/y
+    """
+    if num_points not in _GH_TABLE:
+        raise ValueError(f"num_points={num_points} not supported; use 5 or 10.")
+
+    mu = z[0]
+    sigma = z[1]
+    # Ensure shapes are compatible
+    if y.shape != mu.shape:
+        y = y.expand_as(mu)
+
+    # Clamp sigma to avoid degenerate cases
+    sigma = sigma.clamp_min(1e-8)
+
+    # Get GH nodes/weights on correct device/dtype
+    gh = _GH_TABLE[num_points]
+    x = gh["x"].to(mu.device, mu.dtype)   # (M,)
+    w = gh["w"].to(mu.device, mu.dtype)   # (M,)
+
+    # Expand mu, sigma, y with a quadrature dimension M at the end
+    # mu, sigma, y: (...,) -> (..., 1)
+    mu_e    = mu.unsqueeze(-1)
+    sigma_e = sigma.unsqueeze(-1)
+    y_e     = y.unsqueeze(-1)
+
+    # Sample logits at GH nodes: ℓ_i = mu + sqrt(2)*sigma*x_i
+    # Result shape: (..., M)
+    L = mu_e + math.sqrt(2.0) * sigma_e * x
+
+    # Bernoulli probability at each sample: p_i = sigmoid(ℓ_i)
+    P = torch.sigmoid(L)  # (..., M)
+
+    # Likelihood at each sample: p_i^y * (1-p_i)^(1-y)
+    lik = P * y_e + (1.0 - P) * (1.0 - y_e)  # (..., M)
+
+    # Integrate over GH weights: ∑_i w_i * lik_i
+    integral = (lik * w).sum(dim=-1)  # (...,)
+
+    # Negative log-likelihood
+    nll = -torch.log(integral.clamp_min(eps))  # (...,)
+
+    return nll, P
+
 def bce_with_logits(z, y, **kward):
     # z can be list/tuple or tensor
     z0 = z[0] if isinstance(z, (list, tuple)) else z
@@ -13,7 +85,7 @@ def bce_with_logits(z, y, **kward):
     y  = y.reshape(-1)
     return F.binary_cross_entropy_with_logits(z0, y, reduction="none"), torch.sigmoid(z0)
 
-def log_prob(z, y, **kward):
+def gaussian_nll(z, y, **kward):
 
     z0 = z[0] if isinstance(z, (list, tuple)) else z
     z1 = z[1] if (isinstance(z, (list, tuple)) and len(z) > 1) else None
@@ -127,43 +199,33 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
         # Base per-sample loss (N,)
         base_loss, self.p = self.base_loss_fn(z_list, targets_y, x=kwarg.get("targets_x",None))
         
-        # Masks (allow slightly fuzzy labels; >=0.5 -> positive)
-        y = targets_y.view(-1).float()
+        if self.base_loss_fn != logit_normal_bernoulli_nll:
+            # Masks (allow slightly fuzzy labels; >=0.5 -> positive)
+            y = targets_y.view(-1).float()
         
-        # Masks (>= tau_tp is positive)
-        pos_mask = (y >= self.tau_tp)
-        neg_mask = ~pos_mask
+            # Masks (>= tau_tp is positive)
+            pos_mask = (y >= self.tau_tp)
+            neg_mask = ~pos_mask
 
-        # Asymmetric focal weights
-        one_minus_p = 1.0 - self.p
-        w_pos = self.alpha_pos * torch.pow(one_minus_p, self.gamma_pos)
-        w_neg = self.alpha_neg * torch.pow(self.p,           self.gamma_neg)
-        weight = torch.where(pos_mask, w_pos, w_neg)
+            # Asymmetric focal weights
+            one_minus_p = 1.0 - self.p
+            w_pos = self.alpha_pos * torch.pow(one_minus_p, self.gamma_pos)
+            w_neg = self.alpha_neg * torch.pow(self.p,self.gamma_neg)
+            weight = torch.where(pos_mask, w_pos, w_neg)
 
-        # Focal term
-        loss = weight * base_loss  # (N,)
-        
-        # False-positive penalty on negatives
-        if self.lambda_fp > 0.0:
-            overshoot_fp = torch.relu(self.p[neg_mask] - self.tau_fp)
-            #print("before", loss[neg_mask].mean())
-            loss[neg_mask] = loss[neg_mask] + self.lambda_fp * (overshoot_fp ** 2)
-            #print("after", loss[neg_mask].mean(),(self.lambda_fp * (overshoot_fp ** 2)).mean())
-            #overshoot_fp = torch.relu(self.p - self.tau_fp)
+            # Focal term
+            loss = weight * base_loss  # (N,)
             
-            #penalty_fp = overshoot_fp ** 2 * (1.0 - targets_y)
+            # False-positive penalty on negatives
+            if self.lambda_fp > 0.0:
+                overshoot_fp = torch.relu(self.p[neg_mask] - self.tau_fp)
+                loss[neg_mask] = loss[neg_mask] + self.lambda_fp * (overshoot_fp ** 2)
 
-            #loss = loss + self.lambda_fp * penalty_fp
-
-        # True-positive reward on positives
-        if self.lambda_tp > 0.0:
-            overshoot_tp = torch.relu(self.p[pos_mask]+self.tau_tp)
-            print("before", loss[pos_mask].mean())
-            loss[pos_mask] = loss[pos_mask] - self.lambda_tp * (overshoot_tp ** 2)
-            #print("after", loss[pos_mask].mean(),(self.lambda_tp * (overshoot_tp ** 2)).mean())
-            #overshoot_tp = (self.p - self.tau_tp).relu()
-            #reward_tp = overshoot_tp.square() * y
-            #loss = loss - (self.lambda_tp * reward_tp)
+            # True-positive reward on positives
+            if self.lambda_tp > 0.0:
+                overshoot_tp = torch.relu(self.p[pos_mask]+self.tau_tp)
+                loss[pos_mask] = loss[pos_mask] - self.lambda_tp * (overshoot_tp ** 2)
+        else: loss = base_loss
 
         if self.reduction == "mean":
             return loss.mean()
@@ -171,3 +233,96 @@ class AsymmetricFocalWithFPPenalty(nn.Module):
             return loss.sum()
         else:
             return loss
+
+# Precomputed Gauss–Hermite nodes and weights for 5 and 10 points
+# These are standard values; you can extend if you want more accuracy.
+_GH_TABLE = {
+    5: {
+        "x": torch.tensor([
+            -2.0201828704560856,
+            -0.9585724646138185,
+             0.0000000000000000,
+             0.9585724646138185,
+             2.0201828704560856
+        ]),
+        "w": torch.tensor([
+            0.0199532420590459,
+            0.3936193231522412,
+            0.9453087204829419,
+            0.3936193231522412,
+            0.0199532420590459
+        ]),
+    },
+    10: {
+        "x": torch.tensor([
+            -3.4361591188377376,
+            -2.5327316742327897,
+            -1.7566836492998819,
+            -1.0366108297895137,
+            -0.3429013272237046,
+             0.3429013272237046,
+             1.0366108297895137,
+             1.7566836492998819,
+             2.5327316742327897,
+             3.4361591188377376
+        ]),
+        "w": torch.tensor([
+            0.0004825731850073,
+            0.0128803115355099,
+            0.0931265981708253,
+            0.3368363231280011,
+            0.7246295952243925,
+            0.7246295952243925,
+            0.3368363231280011,
+            0.0931265981708253,
+            0.0128803115355099,
+            0.0004825731850073
+        ]),
+    },
+    "20": {
+        "x": torch.tensor([
+            -5.38748089001123286,
+            -4.60368244955074427,
+            -3.94476404011562521,
+            -3.34785456738321613,
+            -2.78880605842813072,
+            -2.25497400208927588,
+            -1.73853771211658621,
+            -1.23407621539532301,
+            -0.73747372854539443,
+            -0.24534070830090125,
+            0.24534070830090125,
+            0.73747372854539443,
+            1.23407621539532301,
+            1.73853771211658621,
+            2.25497400208927588,
+            2.78880605842813072,
+            3.34785456738321613,
+            3.94476404011562521,
+            4.60368244955074427,
+            5.38748089001123286
+        ]),
+        "w": torch.tensor([
+            2.22939364553415215e-13,
+            4.39934099227318055e-10,
+            1.08606937076928170e-07,
+            7.80255647853206469e-06,
+            0.00022833863601635396,
+            0.00324377334223786183,
+            0.024810520887463670,
+            0.10901720602002332,
+            0.28667550536283413,
+            0.46224366960061009,
+            0.46224366960061009,
+            0.28667550536283413,
+            0.10901720602002332,
+            0.024810520887463670,
+            0.00324377334223786183,
+            0.00022833863601635396,
+            7.80255647853206469e-06,
+            1.08606937076928170e-07,
+            4.39934099227318055e-10,
+            2.22939364553415215e-13
+        ])
+    }
+}
