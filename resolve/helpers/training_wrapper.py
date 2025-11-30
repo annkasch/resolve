@@ -29,11 +29,9 @@ import matplotlib.pyplot as plt
 import dataclasses
 from ..utilities import utilities as utils
 from collections.abc import Mapping, Sequence
-from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss
+from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss, logit_normal_bernoulli_nll
 
 import time, torch
-
-
 
 try:
     from .data_generator import BatchFormatter
@@ -245,7 +243,7 @@ class Trainer:
         self.model.train(train)
         running_loss = 0.0
         y_true_all, y_pred_all, y_score_all = [], [], []
-        accum_steps = math.ceil(loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]/ loader.dataset.batch_size_tgt) if train==True else 1.
+        accum_steps = math.ceil(500./loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]) if train==True else 1.
 
         if train and self.criterion.base_loss_fn is not skip_loss:
             optimizer.zero_grad(set_to_none=True)
@@ -254,6 +252,7 @@ class Trainer:
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
 
         for i, batch in enumerate(pbar):
+
             with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=autocast_dtype):
                 output, targets = self._forward_batch(batch, self.device, train=train, step=i+self.epoch*len(loader))
                 logit = output.get("logits", None)
@@ -298,12 +297,13 @@ class Trainer:
             
             if self.criterion.base_loss_fn is recon_loss_mse: 
                 y_pred_all.append(self.criterion.p.detach())
-            elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
+            elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is logit_normal_bernoulli_nll or self.criterion.base_loss_fn is brier:
                 y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1)) 
             else:
                 y_pred_all.append(logit[0].detach().reshape(-1))
             y_score_all.append(score.detach().reshape(-1))
             pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
+            
 
         y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
         y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
@@ -347,20 +347,16 @@ class Trainer:
         best_score = -float("inf") if mode == "max" else float("inf")
         no_improve = 0
 
-        for epoch in range(self.epoch_start, self.epoch_start + self.nepochs):
-            # TRAIN
+        num_epochs = int(self.nepochs*self.dataset.set_loader(0, "train").dataset.data["train"]["meta"]["num_epochs"])
 
+        for epoch in range(self.epoch_start, self.epoch_start + num_epochs):
+            # TRAIN
             self.epoch = epoch
             dataloader = self.dataset.set_loader(epoch, "train")
 
-            if (self.model._get_name()== 'IsolationForestWrapper' or self.model._get_name()== 'XGBoostWrapper') and self.model._fitted == False:
-                self.model.fit(loader=dataloader)
-
-            if self.model._get_name() == 'TreeConditionedCNP' and self.model.tree._fitted == False:
-                self.model.fit(loader=dataloader)
-                self.model.tree.enable_leaf_cache(dataloader.dataset.num_samples())
-            
-            train_loss, y_true_tr, y_pred_tr, y_score_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + self.nepochs}")
+            getattr(self.model, "fit", lambda *args, **kwargs: None)(loader=dataloader)
+                
+            train_loss, y_true_tr, y_pred_tr, y_score_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + num_epochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
             m_tr["loss"] = train_loss
             self.metrics["train"] = m_tr
@@ -377,8 +373,8 @@ class Trainer:
 
             
             # Early stopping / checkpointing
-            if "validate" not in self.dataset.set_loader(epoch, "validate").dataset.data: continue
-            score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch+1)
+            if "validate" not in dataloader.dataset.data: continue
+            score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch)
             improved = (score > best_score) if mode == "max" else (score < best_score)
             if improved:
                 best_score = score
@@ -399,13 +395,13 @@ class Trainer:
         self.metrics["best_model"]={"best_score": float(best_score), "monitor": monitor, "mode": mode, "epochs_ran": epoch - self.epoch_start + 1}
         return self.metrics["best_model"]
 
-    @torch.inference_mode()
     def evaluate(
         self,
         writer=None,
         dataset_name="validate",
         monitor: str = "pr_auc",  # for binary; for regression we'll silently map to 'rmse'
         epoch: int = 0,
+        fit_temperature: bool = False,
     ) -> Dict[str, float]:
         
         self.epoch = epoch
@@ -417,32 +413,97 @@ class Trainer:
         if dataset_name not in dataloader.dataset.data: 
             return
         with torch.inference_mode():
-            loss, y_true_v, y_pred_v, y_score_v = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch}")
+            loss, y_true_v, y_pred_v, y_score_v = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch+1}")
+        
+        # Optionally FIT TEMPERATURE on validation set
+        T_used = None
+        if self.is_binary:
+            # Decide what temperature to use / fit
+
+            if fit_temperature:
+                # Reconstruct logits from probabilities
+                eps = 1e-6
+                probs = torch.as_tensor(y_pred_v, device=self.device, dtype=torch.float32)
+                probs = probs.clamp(eps, 1.0 - eps)
+                logits = torch.logit(probs, eps=eps)
+                targets = torch.as_tensor(y_true_v, device=self.device, dtype=torch.float32)
+
+                # Scalar log_T parameter (T > 0 via exp)
+                log_T = torch.zeros(1, device=self.device, requires_grad=True)
+                optimizer_T = torch.optim.LBFGS([log_T], lr=0.1, max_iter=50)
+
+                def closure():
+                    optimizer_T.zero_grad()
+                    T = torch.exp(log_T)
+                    logits_T = logits / T
+                    # plain BCE for calibration, regardless of training loss
+                    calib_loss = F.binary_cross_entropy_with_logits(logits_T, targets)
+                    calib_loss.backward()
+                    return calib_loss.detach()
+
+                # Enable grads just for this fit
+                with torch.enable_grad():
+                    optimizer_T.step(closure)
+
+                T_used = torch.exp(log_T).item()
+                # Store on the object for later
+                self.model.temperature.data.fill_(T_used)
+                
+            else:
+                # If we already have a learned temperature, use it
+                if hasattr(self.model, "temperature"):
+                    T_used = float(self.model.temperature.item())
+                else:
+                    T_used = None
+            
+            # Apply temperature (if any) and convert to probabilities
+            if T_used is not None:
+                eps = 1e-6
+                probs = torch.as_tensor(y_pred_v, device=self.device, dtype=torch.float32)
+                probs = probs.clamp(eps, 1 - eps)
+                logits = torch.log(probs / (1.0 - probs))  # logit(p)
+                logits_T = logits / T_used
+                probs = torch.sigmoid(logits_T).float().cpu().numpy()        # calibrated probs
+            else:
+                probs = y_pred_v                       # original probs
+        else:
+            # Non-binary mode: keep predictions as-is
+            probs = y_pred_v
+        
+        # Compute metrics using calibrated probabilities
         m_v = _compute_metrics(y_true_v, y_pred_v, self.is_binary)
         m_v["loss"] = loss
         self.metrics[dataset_name] = m_v
 
-        # Log
-        if writer and epoch % self._report == 0.:
-            for k, v in m_v.items(): writer.add_scalar(f"{dataset_name}/{k}", v, epoch) if np.isscalar(v) else None
-                            
-            fig = utils.plot(y_pred_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
-            writer.add_figure(f'plot/score_{dataset_name}', fig, global_step=epoch)
+        # Logging / plots
+        if writer and epoch % self._report == 0:
+            for k, v in m_v.items():
+                if np.isscalar(v):
+                    writer.add_scalar(f"{dataset_name}/{k}", v, epoch)
+
+            # Main score plot: use calibrated probs
+            fig = utils.plot(probs.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch+1)
+            writer.add_figure(f'plot/score_{dataset_name}', fig, global_step=epoch+1)
+
+            # Tree score plot
             if len(y_score_v) > 0:
-                fig = utils.plot(y_score_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch)
-                writer.add_figure(f'plot/score_tree_{dataset_name}', fig, global_step=epoch)
+                fig = utils.plot(y_score_v.reshape(-1, 1), y_true_v.reshape(-1, 1), it=epoch+1)
+                writer.add_figure(f'plot/score_tree_{dataset_name}', fig, global_step=epoch+1)
+
             if "precision_recall_curve" in m_v and isinstance(m_v["precision_recall_curve"], list):
                 fig = plt.figure()
-                plt.plot(m_v["precision_recall_curve"][0],m_v["precision_recall_curve"][1])
+                plt.plot(m_v["precision_recall_curve"][0], m_v["precision_recall_curve"][1])
                 plt.xlabel("Signal Efficiency (Recall)")
                 plt.ylabel("Precision")
-                writer.add_figure(f'plot/prec_recall_{dataset_name}', fig, global_step=epoch)
+                writer.add_figure(f'plot/prec_recall_{dataset_name}', fig, global_step=epoch+1)
+
             if "roc_curve" in m_v and isinstance(m_v["roc_curve"], list):
                 fig = plt.figure()
-                plt.plot(m_v["roc_curve"][1],1-m_v["roc_curve"][0])
+                plt.plot(m_v["roc_curve"][1], 1 - m_v["roc_curve"][0])
                 plt.xlabel("Signal Efficiency")
                 plt.ylabel("Background Efficiency")
-                writer.add_figure(f'plot/roc_curve_{dataset_name}', fig, global_step=epoch)
+                writer.add_figure(f'plot/roc_curve_{dataset_name}', fig, global_step=epoch+1)
+
 
         score = m_v.get(monitor.lower(), m_v.get(monitor, float("nan")))
 
@@ -652,113 +713,36 @@ class Trainer:
         monitor: str = "pr_auc",
         mode: str = "max",               # 👈 now mandatory input
         patience: int = 15,
-        min_delta: float = 0.0,
-        save_best: bool = True,
+        ckpt_dir: str = "./checkpoints",
+        ckpt_name: str = "best.pt",
         num_data_pass_per_phase: Optional[int] = 1,
     ) -> Dict[str, float]:
         """
         Warm-up training with staged positive-fraction schedule.
-
-        Args:
-            target_pos_frac: Single float or list of floats, each a training phase.
-            optimizer: Optimizer instance.
-            writer: TensorBoard writer (optional).
-            monitor: Metric to monitor for improvement ('pr_auc', 'rmse', etc.).
-            mode: 'max' means higher is better, 'min' means lower is better.
-            patience: Early-stopping patience (epochs without improvement).
-            min_delta: Minimum required improvement.
-            save_best: Save and restore best weights.
-            num_data_pass_per_phase: Optional epoch override per phase.
         """
+        num_epochs = self.nepochs 
+        self.nepochs = num_data_pass_per_phase
+        dataloader = self.dataset.set_loader(0, "train")
 
-        self.model.to(self.device)
-        if isinstance(self.criterion, torch.nn.Module):
-            self.criterion.to(self.device)
+        if self.model._get_name() == 'TreeConditionedCNP' and self.model.tree._fitted == False:
+                self.model.fit(loader=dataloader)
+                self.model.tree.enable_leaf_cache(dataloader.dataset.num_samples())
+        self.dataset.dataset = None
+        counter = 0 
+        for ratio in target_pos_frac:
+            
+            self.dataset.config_file["model_settings"]["train"]["dataset"]["positive_ratio_train"]=ratio
+            self.dataset.set_dataset()
+            print(f"----- Initializing warm-up phase — positives set to {self.dataset.dataset.data["train"]["meta"]["pos_frac"]:.2f} of the batch.----")
+            self.fit(optimizer=optimizer, patience = patience, writer=writer, ckpt_dir=ckpt_dir, ckpt_name=ckpt_name,
+            monitor=monitor, mode=mode)
+            self.epoch_start = self.nepochs
         
-        # rebuild optimizer after model to device
-        for s in optimizer.state.values():
-            for k, v in s.items():
-                if isinstance(v, torch.Tensor):
-                    s[k] = v.to(self.device, non_blocking=(self.device.type=="cuda"))
+        self.dataset.config_file["model_settings"]["train"]["dataset"]["positive_ratio_train"] = None
+        self.dataset.dataset = None
+        self.epoch_start = counter
+        self.nepochs = num_epochs
+        print(f"----- End of warm up -----")
 
-        if mode not in {"max", "min"}:
-            raise ValueError("mode must be 'max' or 'min'.")
-
-        global_epoch = self.epoch_start
-
-        # Normalize schedule
-        schedule = [float(target_pos_frac)] if isinstance(target_pos_frac, (int, float)) else list(target_pos_frac)
-
-        for phase_idx, pos_frac in enumerate(schedule, start=1):
-            dataloader = self.dataset.set_loader(0, "train")
-
-            dataloader.dataset.set_batch_schedule(
-                target_pos_frac=pos_frac,
-                max_pos_reuse_per_epoch=dataloader.dataset.dataset_config.get("max_positive_reuse", 0.0),
-            )
-
-            n_epochs = num_data_pass_per_phase*dataloader.dataset.data["train"]["meta"].get("num_epochs", 1) or dataloader.dataset.data["train"]["meta"].get("num_epochs", 1)
-
-            best_score = -float("inf") if mode == "max" else float("inf")
-            best_state = None
-            no_improve = 0
-
-            for local_epoch in range(n_epochs):
-                self.epoch = global_epoch
-                global_epoch += 1
-                dataloader = self.dataset.set_loader(local_epoch, "train")
-                train_loss, y_true_tr, y_pred_tr = self._run_epoch(
-                    dataloader, optimizer, train=True,
-                    desc=f"Warm-up phase {phase_idx}/{len(schedule)} | epoch {local_epoch+1}/{n_epochs}"
-                )
-
-                m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
-                m_tr["loss"] = float(train_loss)
-                self.metrics["train"] = m_tr
-
-                if writer and (global_epoch % self._report == 0):
-                    for k, v in m_tr.items(): writer.add_scalar(f"train/{k}", v, global_epoch) if np.isscalar(v) else None
-
-                    fig = utils.plot(y_pred_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=global_epoch)
-                    writer.add_figure("plot/score_train", fig, global_step=global_epoch)
-
-                val_metrics = self.evaluate(writer=writer, dataset_name="validate", epoch=global_epoch)
-                if isinstance(val_metrics, dict):
-                    self.metrics["validate"] = val_metrics
-
-                current = float(self.metrics["validate"].get(monitor, math.nan))
-                if math.isnan(current):
-                    raise KeyError(f"Monitor key '{monitor}' not found in validation metrics {list(self.metrics['validate'].keys())}")
-
-                improved = (current > best_score + min_delta) if mode == "max" else (current < best_score - min_delta)
-                if improved:
-                    best_score = current
-                    no_improve = 0
-                    if save_best:
-                        best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
-                else:
-                    no_improve += 1
-
-                if writer:
-                    writer.add_scalar(f"validate/{monitor}", current, global_epoch)
-                    writer.add_scalar(f"validate/{monitor}_best", best_score, global_epoch)
-
-                if patience > 0 and no_improve >= patience:
-                    break  # stop current phase early
-
-            #if patience > 0 and no_improve >= patience:
-            #    break  # stop all phases early
-
-        if save_best and best_state is not None:
-            self.model.load_state_dict(best_state)
-        self.epoch_start=global_epoch
-        dataloader.dataset.set_batch_schedule(target_pos_frac=None, max_pos_reuse_per_epoch = dataloader.dataset.dataset_config.get("max_positive_reuse",0.))
-        # Memory hygiene
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        elif torch.backends.mps.is_available():
-            torch.mps.empty_cache()
-        return {**self.metrics.get("validate", {}), f"{monitor}_best": best_score}
 
     

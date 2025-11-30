@@ -10,7 +10,6 @@ from torch.utils.tensorboard import SummaryWriter
 import yaml
 import json
 import argparse
-import multiprocessing as mp
 
 def main(path_to_settings):
     # Set the path to the yaml settings file here
@@ -28,7 +27,7 @@ def main(path_to_settings):
     network_config["d_theta"]  = len(config_file["simulation_settings"]["theta_labels"])
     network_config["d_phi"] = len(config_file["simulation_settings"]["phi_labels"])
 
-    manager = ModelsManager(network_config)
+    manager = ModelsManager(network_config, feature_name = config_file["simulation_settings"]["theta_labels"] + config_file["simulation_settings"]["phi_labels"])
     model = manager.get_network(config_file["model_settings"]["network"]["model_used"])
 
     # Total number of parameters
@@ -59,8 +58,7 @@ def main(path_to_settings):
     os.system(f'rm {path_out}/model_{version}_tensorboard_logs/events*')
     writer = SummaryWriter(log_dir=f'{path_out}/model_{version}_tensorboard_logs')
 
-    optimizer = None if (model.__class__.__name__ == "IsolationForestWrapper" or model.__class__.__name__ == "XGBoostWrapper") else optim.Adam(model.parameters(), lr=config_file["model_settings"]["train"]["learning_rate"])
-
+    optimizer = None if config_file["model_settings"]["train"]["loss"].get("base_loss_fn", "bce_with_logits") == "skip_loss" else optim.Adam(model.parameters(), lr=config_file["model_settings"]["train"]["learning_rate"])
 
     # Instantiate the training wrapper for the first phase
     trainer = Trainer(model, dataset_train)
@@ -71,11 +69,11 @@ def main(path_to_settings):
             trainer.criterion = AsymmetricFocalWithFPPenalty(
                             alpha_pos=1.,
                             alpha_neg=1.,
-                            gamma_pos=0.,
-                            gamma_neg=0.,
+                            gamma_pos=1.,
+                            gamma_neg=2.,
                             lambda_fp=0.,
                             tau_fp=0.5,
-                            lambda_tp= 5.,
+                            lambda_tp= 0.,
                             tau_tp=0.5,
                             reduction=utils.get_nested(config_file, ["model_settings","train","loss","reduction"], "mean"),
                             base_loss_fn=globals()[utils.get_nested(config_file, ["model_settings","train","loss","base_loss_fn"], "bce_with_logits")],
@@ -91,8 +89,8 @@ def main(path_to_settings):
                             writer=writer,
                             monitor = "pr_auc",
                             mode = "max",
-                            save_best = True,
                             patience = 20,
+                            ckpt_dir=f"{path_out}/checkpoints",
                             num_data_pass_per_phase = utils.get_nested(config_file, ["model_settings","train","dataset","num_data_pass_per_phase"], 1.)
                     )
 
@@ -116,7 +114,7 @@ def main(path_to_settings):
     summary_train = trainer.fit(optimizer=optimizer, patience = config_file["model_settings"]["train"]["patience"], writer=writer, ckpt_dir=f"{path_out}/checkpoints", ckpt_name=f"model_{version}_best.pt",
             monitor="pr_auc", mode="max")
 
-    if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test")
+    if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test", fit_temperature=(trainer.criterion.base_loss_fn == bce_with_logits))
 
     model.save(f'{path_out}/model_{version}_')
     normalizer_train = dataset_train.dataset._normalizer

@@ -1,6 +1,7 @@
 import torch
 from typing import List, Optional, Sequence, Tuple, Dict, Union, Any
 import operator
+from sklearn.model_selection import train_test_split
 import functools
 import numpy as np
 import math
@@ -28,11 +29,8 @@ class Sampler():
         perm = idx_array[perm_idx]
 
         batches = torch.split(perm, split_size_or_sections=batch_size)
-        
-        meta = {"batch_size": batch_size, "num_batches": len(batches),
-                "pos_frac": None, "num_epochs": 1}
 
-        return batches, None, meta, rperm
+        return batches, len(batches), rperm
 
     def _epoch_seed(self) -> int:
         if not hasattr(self, '_epoch_counter'): self._epoch_counter = 0
@@ -75,7 +73,7 @@ class Sampler():
         # positives: build pool with reuse cap, then shuffle with seed
         pos_pool = torch.empty(0, dtype=torch.long)
         if nP_tot > 0:
-            pos_pool = (pos_idx.repeat_interleave(pos_idx.numel()*max_pos_reuse_per_epoch) if max_pos_reuse_per_epoch > 0 else pos_idx)
+            pos_pool = pos_idx.repeat_interleave(max_pos_reuse_per_epoch) if max_pos_reuse_per_epoch > 1 else pos_idx
             pos_pool = pos_pool[:nP_tot]
             if pos_pool.numel() > 1:
                 g = torch.Generator().manual_seed(seed)
@@ -84,10 +82,13 @@ class Sampler():
 
         unused_mask = torch.isin(neg_idx, unused_neg_subset) if unused_neg_subset != None else torch.ones_like(neg_idx, dtype=torch.bool)
         last_neg_subset = neg_idx[~unused_mask]
+
         
         Nneed = n - nP_tot
+        
         keep = int(sticky_frac * Nneed) if last_neg_subset.numel() > 0 else 0
-
+        
+        take_new = 0
         new_block = torch.empty(0, dtype=torch.long)
         if Nneed > keep:
             take_new = Nneed - keep
@@ -102,7 +103,7 @@ class Sampler():
                 perm = torch.randperm(base.numel(), generator=g)
                 base = base[perm]
             new_block = base[:take_new] 
-            keep = Nneed - take_new + keep
+            keep = Nneed - new_block.shape[0]
 
         g = torch.Generator()
         g.manual_seed(seed + 2)
@@ -122,6 +123,7 @@ class Sampler():
         not_used_mask = ~used_mask
         remaining_negatives = neg_idx[not_used_mask]
 
+        #print("3",pos_pool.numel(), neg_plan.numel(), neg_idx.numel(), remaining_negatives.numel())
         return pos_pool, neg_plan, remaining_negatives
 
     @staticmethod
@@ -129,21 +131,18 @@ class Sampler():
         """Turn a 1D/ND row tensor into a Python hashable key."""
         return tuple(t.tolist()) if t.ndim > 0 else (t.item(),)
 
-    def build_batches_with_posneg_ratio_groupaware(
+    def groupaware_pos_sampling(
         self,
         theta: torch.Tensor,                     # shape [N] or [N, d]
         y: torch.Tensor,  
         idx: torch.Tensor,
-        y_all:torch.Tensor,
         target_pos_frac: float,
-        batch_size: int,
         max_pos_reuse_per_epoch: int = 0,
         sticky_frac: float = 0.25,
-        unused_neg_subset: Dict[Any, torch.Tensor] | None = None,  # keyed by group key
-        seed = None
+        unused_neg_subset: torch.Tensor | None = None,
+        seed = None,
     ):
         
-
         # precompute inverse once
         if theta.ndim == 1:
             _, inverse = torch.unique(theta, return_inverse=True)
@@ -162,14 +161,21 @@ class Sampler():
         reuse = max(1, max_pos_reuse_per_epoch)
         n_tmp = pos_idx.numel()*reuse/target_pos_frac if target_pos_frac > 0. else neg_idx.numel()
         n = int(round(n_tmp/num_groups))
-        nN_min = max(2, min(4, int(0.05 * n)))
+        nN_min = max(2, min(4, int(0.05 * n))) 
+        group_size = n+nN_min
 
-        batches, unused = [], []
+        all_indices = []
+        unused = []
+
         nP_tot = 0
+        nN_tot = 0
+        num_pos = 0
+        num_neg =0 
+        n_unused_tot =0 
         for gi in range(num_groups):
             pos_g = pos_idx[pos_gid == gi]
             neg_g = neg_idx[neg_gid == gi]
-            
+
             gseed = seed if seed is not None else self.seed + gi
 
             unused_neg_g = None
@@ -177,13 +183,15 @@ class Sampler():
                 # if you must, precompute its inverse too
                 inv_unused = inverse[unused_neg_subset]
                 unused_neg_g = unused_neg_subset[inv_unused == gi]
+                n_unused_tot += unused_neg_g.numel()
+                group_size = pos_g.numel() + neg_g.numel() - unused_neg_g.numel()
 
             nP_max = min(pos_g.numel()*reuse, n) if target_pos_frac > 0. else 0
             nP_tot += nP_max
 
             pos_pool_idx, neg_plan_idx, rem_idx = self.sample_positives_negatives(
                 pos_idx=pos_g, neg_idx=neg_g,
-                n=n+nN_min, nP_tot=nP_max,
+                n=group_size, nP_tot=nP_max,
                 max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,
                 sticky_frac=sticky_frac,
                 unused_neg_subset=unused_neg_g,
@@ -191,42 +199,32 @@ class Sampler():
             )
             pos_pool = idx[pos_pool_idx]
             neg_plan = idx[neg_plan_idx]
+            nN_tot += neg_plan.numel()
+
             rem = idx[rem_idx]
+            num_pos += pos_pool.shape[0]
+            num_neg += neg_plan.shape[0]
             
             selected = torch.cat([pos_pool, neg_plan])
-            
-            # don’t sort—preserve randomness, save time
-            b_size = min(n+nN_min, batch_size)
-            batches.extend(selected.split(b_size))
+
+            # Shuffle
+            perm = torch.randperm(selected.size(0))
+            selected = selected[perm]
+
             unused.append(rem)
 
-        # global shuffle across all items, then re-split to fixed b_size
-        if self.shuffle == "global":
-            if len(batches) == 0:
-                flat = selected.new_empty(0)
-            else:
-                flat = torch.cat(batches, dim=0)                    # preserves device/dtype
+            all_indices.extend(selected)
 
-            perm = flat[torch.randperm(flat.numel(), device=flat.device)]
-            # keep or drop the last short batch:
-            # drop_last = True  -> drop it; False -> keep it
-            drop_last = False
-            if drop_last:
-                L = (perm.numel() // batch_size) * batch_size
-                perm = perm[:L]
-
-            batches = list(perm.split(batch_size))                      # list[Tensor]
-            b_size = batch_size
-
+        all_indices = torch.stack(all_indices)
+        pos_frac = nP_tot / all_indices.shape[0]
+        
         unused = torch.cat(unused) if unused else neg_idx.new_empty((0,), dtype=torch.long)
-        nepochs = self.epochs_until_full_coverage(neg_idx.numel(), int((n+nN_min)*(1-target_pos_frac))*len(batches), sticky_frac)
-        meta = {"batch_size": b_size, "num_batches": len(batches),
-                "pos_frac": (nP_tot / max(1, (b_size * len(batches)))), "num_epochs": nepochs}
-
-        return batches, unused, meta
+        nepochs = self.epochs_until_full_coverage(unused.shape[0], all_indices.shape[0]*(1.-pos_frac), sticky_frac)
+        meta = {"num_epochs": nepochs, "pos_frac": pos_frac, "num_batches": {}}
+        return all_indices, group_size, unused, meta
     
     @staticmethod
-    def epochs_until_full_coverage(n_neg_total: int,
+    def epochs_until_full_coverage(n_unused: int,
                                 n_neg_per_epoch: int,
                                 sticky_frac: float = 0.25) -> int:
         """
@@ -240,6 +238,8 @@ class Sampler():
         Returns:
             int: Estimated number of epochs until all negatives have been seen at least once.
         """
+        if n_unused == 0 or n_unused == None: return 1
+        n_neg_total = n_unused + n_neg_per_epoch
         if n_neg_per_epoch <= 0:
             raise ValueError("n_neg_per_epoch must be > 0")
         if not (0.0 <= sticky_frac < 1.0):
@@ -252,7 +252,7 @@ class Sampler():
         # Derived from coverage formula:
         # E >= 1 + (N_total / N_per_epoch - 1) / (1 - sticky)
         epochs = 1 + (n_neg_total / n_neg_per_epoch - 1) / (1.0 - sticky_frac)
-        return math.ceil(epochs)
+        return math.ceil(epochs)+1
 
     def build_batches_with_posneg_ratio(self,
         y: torch.Tensor,

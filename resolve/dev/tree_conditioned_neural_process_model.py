@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from resolve.conditional_neural_process_family.class_attention import SimplePoolAttention, CrossAttention, CrossAttentionWithMoE
 from resolve.conditional_neural_process_family.feature_encoder import FeatureEncoder, MLP
-from resolve.network_architectures.xgboost import XGBoostWrapper, XGBWithLeafCache
+from resolve.network_architectures.lightgbm import LGBMWithLeafCache
 from resolve.network_architectures.transformer_encoder import TransformerEncoder
-import torch.nn.functional as F
+
 
 class DecoderHead(nn.Module):
     """Maps z_t -> logit."""
@@ -15,12 +16,7 @@ class DecoderHead(nn.Module):
 
     def forward(self, z_t):
         hidden = self.net(z_t)
-        out = torch.split(hidden, hidden.size(-1) // self.out_dim, dim=-1)
-        if self.out_dim == 2:
-            out = list(out)
-            out[1] = F.softplus(out[1]) + 1e-6
-
-        return out
+        return hidden
 
 class TreeConditionedCNP(nn.Module):
     def __init__(self,
@@ -40,7 +36,7 @@ class TreeConditionedCNP(nn.Module):
         self.d_phi   = d_phi
         self.d_y     = d_y
 
-        self.tree = XGBWithLeafCache(config=tree_config["config"], 
+        self.tree = LGBMWithLeafCache(config=tree_config["config"], 
                                    task=tree_config.get("task","binary"), 
                                    out_dim=d_y,
                                    num_samples=tree_config.get("num_samples", None),
@@ -87,13 +83,18 @@ class TreeConditionedCNP(nn.Module):
         in_dim = 2*d_model
         self.base_decoder  = DecoderHead(in_dim, out_dim=out_dim)  # logits
 
+        self.register_buffer("temperature", torch.ones(1))
+
     def fit(self,X: torch.Tensor | None = None,
         y: torch.Tensor | None = None,
         query_theta: torch.Tensor | None = None,
         query_phi: torch.Tensor | None = None,
         target: torch.Tensor | None = None,
         loader=None,):
-        self.tree.fit(X, y, query_theta, query_phi, target, loader)
+        if self.tree._fitted == False:
+            self.tree.fit(X, y, query_theta, query_phi, target, loader)
+            nsamples = query_phi.shape[-2] if loader is None else loader.dataset.num_samples()
+            self.tree.enable_leaf_cache(nsamples)
 
     def forward(
         self,
@@ -145,12 +146,21 @@ class TreeConditionedCNP(nn.Module):
         R_t = self.qry_enc(theta=query_theta, phi=phi_cnp_tgt)                  # (B,Nt,D)
 
         h_t = R_t
-        for _ in range(2):
+        for _ in range(1):
             h_t = self.attn(q_tokens=h_t, kv_tokens=R_ctx, key_mask=wS_ctx)
 
+        out = {"scores": score_tgt}
         logits = self.base_decoder(torch.cat([R_t, h_t], dim=-1))  
-
-        return {"logits": logits, "scores": score_tgt}
+        mu = logits[...,0]
+        if self.base_decoder.out_dim == 2:
+            sigma = logits[...,1]
+            sigma = sigma.clamp(min=-4.0, max=-0.5)  # σ in [~0.018, ~2.7]
+            sigma = sigma.exp()
+            out.update({"logits": [mu,sigma]})
+        else:
+            out.update({"logits": [mu]})
+        
+        return out
 
     def save(self, path):
         torch.save(self.state_dict(), path+'_model.pth')

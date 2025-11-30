@@ -5,4 +5,3 @@ from .conditional_neural_process_model import DeterministicDecoder
 from .conditional_neural_process_model import ConditionalNeuralProcess
 from .class_attention import CrossAttention, CrossAttentionDual, SimplePoolAttention
 from .feature_encoder import FeatureEncoder, MLPEncoder, MLP
-from .tree_conditioned_neural_process_model import TreeConditionedCNP

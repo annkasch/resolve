@@ -7,4 +7,5 @@ from .info_nce import InfoNCE
 from .ft_transformer import FTTransformer
 from .transformer_encoder import TransformerEncoder
 from .xgboost import XGBoostWrapper, XGBWithLeafCache
+from .lightgbm import LightGBMWrapper, LGBMWithLeafCache
 from .leaf_cache import LeafCache

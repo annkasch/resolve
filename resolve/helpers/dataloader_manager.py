@@ -1,12 +1,13 @@
 import numpy as np
 from pathlib import Path
-from resolve.utilities import utilities as utils
-from torch.utils.data import DataLoader
 import collections
+import torch
+from torch.utils.data import DataLoader
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
+from resolve.utilities import utilities as utils
 utils.set_random_seed(42)
-import torch
+
 
 ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
 QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi"))
@@ -66,12 +67,13 @@ class DataLoaderManager:
     def set_loader(self, epoch, mode="train", shuffle=True):
         if self.dataset is None:
             self.set_dataset()
+            self.dataset.set_mode(mode)
         else:
             # shuffle if provided
+            self.dataset.set_mode(mode)
             if shuffle is True:
                 self.dataset.build_batches(epoch)
-            
-        self.dataset.set_mode(mode)
+        
         self.dataloader = DataLoader(
             self.dataset,
             batch_size=None,  # required for IterableDataset

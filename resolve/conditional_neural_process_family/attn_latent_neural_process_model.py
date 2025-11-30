@@ -174,7 +174,6 @@ class AttnLNP(nn.Module):
         for _ in range(num_z):
             z = mu + std * torch.randn_like(mu)                                     # (B,z_dim)
 
-            # (a) OPTIONAL: FiLM(z) on target features to force usage of z
             if hasattr(self, "z_to_gamma") and hasattr(self, "z_to_beta"):
                 gamma = self.z_to_gamma(z).unsqueeze(1)                              # (B,1,D)
                 beta_z = self.z_to_beta(z).unsqueeze(1)                              # (B,1,D)
@@ -182,7 +181,7 @@ class AttnLNP(nn.Module):
             else:
                 R_t_mod = R_t
 
-            # (b) Append latent token into context K/V with a base-rate weight
+            # Append latent token into context K/V with a base-rate weight
             token, s_base = self.latent_proj(z)                                      # (B,D),(B,1)
             token  = token.unsqueeze(1)                                              # (B,1,D)
             s_base = s_base.squeeze(-1)                                              # (B,)
@@ -190,7 +189,7 @@ class AttnLNP(nn.Module):
             R_ctx_aug = torch.cat([R_ctx, token], dim=1)                             # (B,Nc+1,D)
             mask_aug  = torch.cat([mask_c, torch.ones(B,1, dtype=torch.bool, device=device)], dim=1)
 
-            # (c) Attention pooling
+            # Attention pooling
             r_all, _ = self.attn(
                 Q_src=R_t_mod,                     # (B, Nt, D)
                 K_src=self.norm_kv(R_ctx_aug),     # (B, Nc, D)
@@ -199,7 +198,7 @@ class AttnLNP(nn.Module):
                 beta=1.0             # scalar hyperparam, e.g. 1.0
             )
 
-            # (d) Decoder input includes z (ANP-style)
+            # Decoder input includes z (ANP-style)
             rC = r_all.mean(dim=1, keepdim=True).expand(-1, R_t.shape[1], -1)        # (B,Nt,D)
             z_exp = z.unsqueeze(1).expand(-1, R_t.shape[1], -1)                      # (B,Nt,z)
             base_in = self._dec_in(R_t_mod, rC, z)                        # (B,Nt,2D+z)

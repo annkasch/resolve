@@ -10,7 +10,7 @@ import numpy as np
 def logit_normal_bernoulli_nll(
     z: torch.Tensor,
     y: torch.Tensor,
-    num_points: int = 5,
+    num_points: int = 20,
     eps: float = 1e-12,
     **kward
 ) -> torch.Tensor:
@@ -42,41 +42,43 @@ def logit_normal_bernoulli_nll(
 
     mu = z[0]
     sigma = z[1]
-    # Ensure shapes are compatible
+    # Split params on LAST dim
+    #mu, log_sigma = z.unbind(dim=-1)   # both (...,)
+
+    # Squeeze trailing singleton if present (B,N,1) -> (B,N)
+    if y.dim() == mu.dim() + 1 and y.size(-1) == 1:
+        y = y.squeeze(-1)
+
+    # Now broadcast y to mu if needed
     if y.shape != mu.shape:
         y = y.expand_as(mu)
 
-    # Clamp sigma to avoid degenerate cases
-    sigma = sigma.clamp_min(1e-8)
 
-    # Get GH nodes/weights on correct device/dtype
+    # GH nodes/weights
     gh = _GH_TABLE[num_points]
     x = gh["x"].to(mu.device, mu.dtype)   # (M,)
     w = gh["w"].to(mu.device, mu.dtype)   # (M,)
 
-    # Expand mu, sigma, y with a quadrature dimension M at the end
-    # mu, sigma, y: (...,) -> (..., 1)
-    mu_e    = mu.unsqueeze(-1)
-    sigma_e = sigma.unsqueeze(-1)
-    y_e     = y.unsqueeze(-1)
+    # Add quadrature dim
+    mu_e    = mu.unsqueeze(-1)           # (...,1)
+    sigma_e = sigma.unsqueeze(-1)        # (...,1)
+    y_e     = y.unsqueeze(-1)            # (...,1)
 
-    # Sample logits at GH nodes: ℓ_i = mu + sqrt(2)*sigma*x_i
-    # Result shape: (..., M)
-    L = mu_e + math.sqrt(2.0) * sigma_e * x
+    # Sample logits
+    L = mu_e + math.sqrt(2.0) * sigma_e * x  # (..., M)
 
-    # Bernoulli probability at each sample: p_i = sigmoid(ℓ_i)
-    P = torch.sigmoid(L)  # (..., M)
+    # Bernoulli probs
+    P = torch.sigmoid(L)                     # (..., M)
 
-    # Likelihood at each sample: p_i^y * (1-p_i)^(1-y)
+    # Likelihood p(y|L)
     lik = P * y_e + (1.0 - P) * (1.0 - y_e)  # (..., M)
 
-    # Integrate over GH weights: ∑_i w_i * lik_i
-    integral = (lik * w).sum(dim=-1)  # (...,)
+    # Integrate under N(μ,σ²)
+    integral = (lik * w).sum(dim=-1) / math.sqrt(math.pi)  # (...,)
 
-    # Negative log-likelihood
-    nll = -torch.log(integral.clamp_min(eps))  # (...,)
+    nll = -torch.log(integral.clamp_min(eps))              # (...,)
 
-    return nll, P
+    return nll, torch.sigmoid(mu)
 
 def bce_with_logits(z, y, **kward):
     # z can be list/tuple or tensor
@@ -279,7 +281,7 @@ _GH_TABLE = {
             0.0004825731850073
         ]),
     },
-    "20": {
+    20: {
         "x": torch.tensor([
             -5.38748089001123286,
             -4.60368244955074427,

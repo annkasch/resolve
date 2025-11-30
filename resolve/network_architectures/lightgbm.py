@@ -1,18 +1,18 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import xgboost as xgb
-from sklearn.metrics import classification_report
-from sklearn.model_selection import cross_val_score
+import lightgbm as lgb
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.metrics import make_scorer, precision_score
 import pandas as pd
 import pickle
 from resolve.network_architectures.leaf_cache import LeafCache
 
-class XGBoostWrapper(nn.Module):
+
+
+class LightGBMWrapper(nn.Module):
     """
-    PyTorch-friendly wrapper around xgboost with an AE-like API.
+    PyTorch-friendly wrapper around LightGBM (replacing LightGBM) with an AE-like API.
 
     - forward(query_theta, query_phi, **kwargs) -> {"logits": [preds]}
     - fit(...) can take:
@@ -25,10 +25,11 @@ class XGBoostWrapper(nn.Module):
     def __init__(
         self,
         config: dict,
-        out_dim: int = 1,
         task: str = "regression",        # "regression" or "binary"
+        out_dim: int = 1,
         use_parameter_search: bool = False,
         use_leaf_embeddings: int | bool = False,
+        feature_name: list[str] | str = 'auto',
         **extra_params,
     ):
         super().__init__()
@@ -38,23 +39,28 @@ class XGBoostWrapper(nn.Module):
 
         self.task = task
 
+        # allow extra_params to override/update config
+        config = dict(config)  # avoid mutating external dict
+        self.feature_name = feature_name
         config.update(extra_params)
 
         if self.task == "regression":
-            self.model = xgb.XGBRegressor(**config)
+            # LightGBM regressor
+            self.model = lgb.LGBMRegressor(**config)
         else:  # binary classification
-            self.model = xgb.XGBClassifier(**config)
+            # LightGBM classifier
+            self.model = lgb.LGBMClassifier(**config)
 
         self.use_parameter_search = use_parameter_search
         self._fitted = False
-        self.booster = None
-        # device handling: XGBoost stays on CPU; we only control output device for tensors
+        self.booster = None  # LightGBM Booster is self.model.booster_ after fit
 
+        # device handling: LightGBM stays on CPU; we only control output device for tensors
         self.cpu_only = True  # hint for trainers
-        # XGBoost leaf embedding support
 
-        self.leaf_embed_dim = use_leaf_embeddings                   # embedding size per tree leaf
-        self.leaf_embeddings = None               # created after fitting
+        # leaf embedding support
+        self.leaf_embed_dim = use_leaf_embeddings   # embedding size per tree leaf
+        self.leaf_embeddings = None                 # created after fitting
 
     # utilities: input & conversion
 
@@ -82,7 +88,7 @@ class XGBoostWrapper(nn.Module):
         loader=None,
     ):
         """
-        Fit the XGBoost model.
+        Fit the LightGBM model.
 
         Args:
             loader: DataLoader/IterableDataset yielding:
@@ -110,7 +116,7 @@ class XGBoostWrapper(nn.Module):
 
                 X_tgt = self._concat_inputs(query.theta, query.phi)
                 X_ctx = self._concat_inputs(context.theta, context.phi)
-                X_batch = torch.cat([X_tgt,X_ctx],dim=-2)
+                X_batch = torch.cat([X_tgt, X_ctx], dim=-2)
 
                 X_parts.append(X_batch)
                 y_tensor = torch.cat([target_b, context.y], -2)
@@ -134,98 +140,115 @@ class XGBoostWrapper(nn.Module):
                 y = target
 
             if y is None:
-                raise ValueError("Supervised XGBoost requires targets 'y' (or 'target').")
+                raise ValueError("Supervised LightGBM requires targets 'y' (or 'target').")
 
         # Convert X and y to numpy
+        # NOTE: this assumes batch dimension at 0; squeeze(0) keeps behavior identical to your original
         X_np = X.squeeze(0).detach().cpu().numpy()
         y_np = y.squeeze(0).detach().cpu().numpy()
+
+        # simple train/val split (for classification, stratify; for regression this may need adjustment)
+        if self.task == "binary":
+            X_np, X_val, y_np, y_val = train_test_split(
+                X_np, y_np, test_size=0.2, random_state=42, stratify=y_np
+            )
+        else:
+            X_np, X_val, y_np, y_val = train_test_split(
+                X_np, y_np, test_size=0.2, random_state=42
         
-        X_np, X_val, y_np, y_val = train_test_split(X_np, y_np, test_size=0.2, random_state=42, stratify=y_np)
+        )
 
         if X.shape[0] != y.shape[0]:
             raise ValueError(
                 f"X and y must have same number of samples, got {X.shape[0]} and {y.shape[0]}"
             )
-
-        if self.use_parameter_search == False:
+        
+        feature_names = [f'feature_{i}' for i in range(X_np.shape[1])]
+        # --- plain fit ---
+        if not self.use_parameter_search:
             self.model.fit(
-                X_np, y_np,
+                X_np,
+                y_np,
                 eval_set=[(X_val, y_val)],
-                verbose=False
+                feature_name=feature_names,
             )
+
+        # --- hyperparameter search ---
         else:
-            xgb_base = xgb.XGBClassifier(
-                objective="binary:logistic",
-                tree_method="hist",       # GPU-accelerated histogram algorithm
-                device="cuda",
-                n_estimators=2000,            # rely on early stopping if you add eval_set
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                reg_lambda=1.0,
-                eval_metric="logloss",
-            )
-            # Define random search parameter space
+            if self.task != "binary":
+                raise NotImplementedError(
+                    "use_parameter_search is currently implemented for binary classification only."
+                )
+
+            lgb_base = self.model
+
+            # Random search parameter space (LightGBM-style)
             param_distributions = {
-                "max_depth": [3, 4, 5, 6, 8, 10],
-                "min_child_weight": [1, 2, 3, 5, 7, 10],
-                "gamma": [0, 0.5, 1.0, 2.0, 5.0],
-                "subsample": [0.6, 0.7, 0.8, 0.9, 1.0],
-                "colsample_bytree": [0.6, 0.7, 0.8, 0.9, 1.0],
-                "reg_lambda": [0.5, 1.0, 2.0, 5.0, 10.0],
+                "n_estimators": [100, 200, 500, 1000, 2000],
+                "num_leaves": [31, 63],
+                "max_depth": [4, 6],
+                "min_child_samples": [50, 100],
+                "learning_rate": [0.03, 0.05, 0.1],
+                "subsample": [0.7, 0.9],
+                "colsample_bytree": [0.7, 1.0],
+                "reg_lambda": [0.0, 1.0, 5.0],
+                'min_data_in_leaf': [10, 20, 30, 40, 50],
+                'feature_fraction': [0.7, 0.8, 0.9, 1.0],
             }
 
             precision_scorer = make_scorer(precision_score, average="binary")
 
-            # RandomizedSearchCV setup
-            # n_jobs=1 is safest with GPU
             gsearch = RandomizedSearchCV(
-                estimator=xgb_base,
+                estimator=lgb_base,
                 param_distributions=param_distributions,
-                n_iter=30,                 # number of random hyperparam configs to try
-                scoring=precision_scorer,  # or 'roc_auc', 'neg_log_loss', etc.
-                cv=2,                      # 2-fold CV per config
+                n_iter=5,
+                scoring=precision_scorer,   # or 'roc_auc', etc.
+                cv=2,
                 verbose=3,
-                n_jobs=1,                  # GPU + multiple processes can fight; keep 1
+                n_jobs=1,
                 random_state=42,
             )
 
-            # Fit
-            gsearch.fit(X_np, y_np, 
-                        eval_set=[(X_val, y_val)],
-                        verbose=False)
+            gsearch.fit(
+                X_np,
+                y_np,
+                eval_set=[(X_val, y_val)],
+                feature_name=feature_names
+            )
 
             print("Best params:", gsearch.best_params_)
             print("Best CV score:", gsearch.best_score_)
 
             cv_results = gsearch.cv_results_
             scores_df = pd.DataFrame(cv_results).sort_values(by="rank_test_score")
-
-            scores_df.to_csv("./xgb_random_search_results.csv", index=False)
+            scores_df.to_csv("./lgbm_random_search_results.csv", index=False)
 
             self.model = gsearch.best_estimator_
 
+        print("LightGBM training complete.")
         self._fitted = True
-        self.booster = self.model.get_booster()
+        self.booster = getattr(self.model, "booster_", None)
 
-        # Build embedding tables for leaves of each tree
+        # Build embedding tables for leaves of each tree WITHOUT data prediction
         if self.leaf_embed_dim:
+            print("Initializing leaf embeddings from model metadata...")
 
-            df = self.booster.trees_to_dataframe()  # no data needed, pure model metadata
-
-            # Leaves are rows where Feature == 'Leaf'
-            leaf_nodes = df[df["Feature"] == "Leaf"]
-
-            # For each tree, get the maximum node id among leaf nodes.
-            max_node_id_per_tree = leaf_nodes.groupby("Tree")["Node"].max().sort_index()
-
-            # Embedding size per tree = max_node_id + 1
-            num_nodes_per_tree = (max_node_id_per_tree.values + 1).astype(int)
-
-            self.leaf_embeddings = nn.ModuleList(
-                [nn.Embedding(int(n_nodes), self.leaf_embed_dim) for n_nodes in num_nodes_per_tree]
-            )
-
+            if self.booster is None:
+                print("Warning: booster_ not available; skipping leaf embeddings initialization.")
+            else:
+                dump = self.booster.dump_model()
+                tree_info = dump.get("tree_info", [])
+                if not tree_info:
+                    print("Warning: no tree_info found in dumped model; skipping leaf embeddings.")
+                else:
+                    # LightGBM stores num_leaves directly; indices are 0..num_leaves-1
+                    num_leaves_per_tree = [t.get("num_leaves", 0) for t in tree_info]
+                    self.leaf_embeddings = nn.ModuleList(
+                        [nn.Embedding(int(n), self.leaf_embed_dim) for n in num_leaves_per_tree]
+                    )
+                    print(f"Leaf embeddings initialized for {len(num_leaves_per_tree)} trees.")
+        else:
+            print("No leaf embeddings used.")
         return self
 
     @staticmethod
@@ -275,15 +298,24 @@ class XGBoostWrapper(nn.Module):
             return y.numpy()
         else:
             raise ValueError(f"Unsupported target shape {tuple(y.shape)}")
+
     # inference
-    def predict(self, X_torch):
-        X_np, original_shape = self._to_2d_numpy(X_torch)
-        #self.booster.set_param({"predictor": "cpu_predictor"})
-        preds = self.booster.inplace_predict(X_np).astype(np.float32)
-        preds_t = self._from_2d_numpy(preds, original_shape)  
+    def predict(self, X_torch: torch.Tensor) -> torch.Tensor:
+        X_np, original_shape = self._to_2d_numpy(X_torch.detach())
+        X_np = pd.DataFrame(X_np, columns=self.model.feature_name_)
+
+        if not self._fitted:
+            raise RuntimeError("LightGBM model not fitted. Call fit() first.")
+
+        if self.task == "binary":
+            # probability of the positive class
+            preds = self.model.predict_proba(X_np)[:, 1].astype(np.float32)
+        else:
+            preds = self.model.predict(X_np).astype(np.float32)
+
+        preds_t = self._from_2d_numpy(preds, original_shape)
         return preds_t.to(X_torch.device)
 
-    
     # encoding
     @torch.no_grad()
     def encode(self, X: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -296,16 +328,20 @@ class XGBoostWrapper(nn.Module):
             leaf_emb: (N, leaf_embed_dim)
         """
         if not self._fitted:
-            raise RuntimeError("XGBoostWrapper not fitted. Call fit() first.")
+            raise RuntimeError("LightGBMWrapper not fitted. Call fit() first.")
 
-        X_np, original_shape = self._to_2d_numpy(X)
+        X_np, original_shape = self._to_2d_numpy(X.detach())
+        X_np = pd.DataFrame(X_np, columns=self.model.feature_name_) 
 
-        # XGB scores
-        scores_np = self.booster.inplace_predict(X_np).astype("float32")
+        # scores
+        if self.task == "binary":
+            scores_np = self.model.predict_proba(X_np)[:, 1].astype("float32")
+        else:
+            scores_np = self.model.predict(X_np).astype("float32")
+
         scores_t = torch.from_numpy(scores_np)
-
         if scores_t.ndim == 1:
-            scores_t = scores_t.unsqueeze(-1)        # (N,1)
+            scores_t = scores_t.unsqueeze(-1)  # (N,1)
 
         scores_t = scores_t.to(X.device)
 
@@ -314,15 +350,15 @@ class XGBoostWrapper(nn.Module):
             leaf_emb = torch.empty(scores_t.shape[0], 0, device=X.device)
         else:
             emb_device = next(self.leaf_embeddings[0].parameters()).device
-            leaf_arr = self.model.apply(X_np).astype("int64")          # (N, n_trees)
-            leaf_ids = torch.from_numpy(leaf_arr).to(emb_device)       # (N, n_trees)
+            leaf_arr = self.model.predict(X_np, pred_leaf=True).astype("int64")  # (N, n_trees)
+            leaf_ids = torch.from_numpy(leaf_arr).to(emb_device)                # (N, n_trees)
 
             embeds = []
             for t, emb_layer in enumerate(self.leaf_embeddings):
                 ids_t = leaf_ids[:, t]          # (N,)
                 embeds.append(emb_layer(ids_t)) # (N, leaf_embed_dim)
 
-            leaf_emb = torch.stack(embeds, dim=1).sum(dim=1)           # (N, leaf_embed_dim)
+            leaf_emb = torch.stack(embeds, dim=1).sum(dim=1)  # (N, leaf_embed_dim)
             leaf_emb = leaf_emb.to(X.device)
 
         return scores_t, leaf_emb
@@ -332,6 +368,7 @@ class XGBoostWrapper(nn.Module):
         Simple, stateless forward. No memory, no indices.
         """
         X = self._concat_inputs(query_theta, query_phi)
+        
         scores, leaf_emb = self.encode(X)
         B, T, _ = query_theta.shape
         scores = scores.view(B, T, -1)
@@ -341,33 +378,34 @@ class XGBoostWrapper(nn.Module):
             "logits": [scores],
             "leaf_embeddings": leaf_emb,
         }
-    
-    def save(self, path):
-        # Save sklearn model
-        
-        with open(path + "xgb.pkl", "wb") as f:
+
+    def save(self, path: str):
+        # Save sklearn LightGBM model
+        with open(path + "lgbm.pkl", "wb") as f:
             pickle.dump(self.model, f)
 
-        # Save booster
-        booster = self.model.get_booster()
-        booster.save_model(path + "booster.json")
+        # Save booster (optional, mostly for inspection)
+        if hasattr(self.model, "booster_"):
+            self.model.booster_.save_model(path + "booster.txt")
 
-        torch.save(self.state_dict(), path+"embeddings.pt")
-        print(f"Saved XGBClassifier to {path}xgb.pkl and booster to {path}booster.json")
+        torch.save(self.state_dict(), path + "embeddings.pt")
+        print(f"Saved LGBM model to {path}lgbm.pkl and booster to {path}booster.txt")
 
-    def load(self, path):
-        with open(path + "xgb.pkl", "rb") as f:
+    def load(self, path: str):
+        with open(path + "lgbm.pkl", "rb") as f:
             self.model = pickle.load(f)
-        self.booster = self.model.get_booster()
-        state = torch.load(path+"embeddings.pt", map_location="cpu")
+        self.booster = getattr(self.model, "booster_", None)
+
+        state = torch.load(path + "embeddings.pt", map_location="cpu")
         self.load_state_dict(state)
-        print(f"Loaded XGBClassifier from {path}xgb.pkl")
+        print(f"Loaded LGBM model from {path}lgbm.pkl")
 
-class XGBWithLeafCache(XGBoostWrapper):
+
+class LGBMWithLeafCache(LightGBMWrapper):
     """
-    XGBoostWrapper + optional LeafCache.
+    LightGBM-based LightGBMWrapper + optional LeafCache.
 
-    Behaves exactly like XGBoostWrapper if:
+    Behaves exactly like LightGBMWrapper if:
       - no LeafCache is attached, or
       - forward() is called without query_idx.
 
@@ -390,7 +428,6 @@ class XGBWithLeafCache(XGBoostWrapper):
         super().__init__(
             config=config,
             task=task,
-            out_dim=out_dim,
             use_parameter_search=use_parameter_search,
             use_leaf_embeddings=use_leaf_embeddings,
             **extra_params,
@@ -412,10 +449,10 @@ class XGBWithLeafCache(XGBoostWrapper):
         Lazily attach / reattach a LeafCache after init.
         """
 
-        if device is None:
+        if device is None and self.leaf_embeddings is not None:
             device = next(self.parameters()).device
-        if not self.leaf_embed_dim:
-            raise ValueError("leaf_embed_dim is 0/False, cannot create LeafCache.")
+        #if not self.leaf_embed_dim:
+        #    raise ValueError("leaf_embed_dim is 0/False, cannot create LeafCache.")
 
         self.leaf_cache = LeafCache(
             num_samples=num_samples,
@@ -429,7 +466,7 @@ class XGBWithLeafCache(XGBoostWrapper):
         If query_idx and leaf_cache present → use memory.
         Else → fall back to parent (stateless) forward.
         """
-        # no cache or no indices: behave like plain XGBoostWrapper
+        # no cache or no indices: behave like plain wrapper
         if self.leaf_cache is None or query_idx is None:
             return super().forward(query_theta, query_phi, **kwargs)
 
@@ -447,25 +484,26 @@ class XGBWithLeafCache(XGBoostWrapper):
             "logits": [preds],
             "leaf_embeddings": leaf_emb,
         }
-    
+
     def save(self, path: str):
-        with open(path + "xgb.pkl", "wb") as f:
+        with open(path + "lgbm.pkl", "wb") as f:
             pickle.dump(self.model, f)
 
-        booster = self.model.get_booster()
-        booster.save_model(path + "booster.json")
+        if hasattr(self.model, "booster_"):
+            self.model.booster_.save_model(path + "booster.txt")
 
         state = self.state_dict()
         # drop all leaf_cache.* entries from the state dict
         state = {k: v for k, v in state.items() if not k.startswith("leaf_cache.")}
         torch.save(state, path + "embeddings.pt")
 
-        self.leaf_cache.save_cache(path + "leaf_cache.pt")
+        if self.leaf_cache is not None:
+            self.leaf_cache.save_cache(path + "leaf_cache.pt")
 
     def load(self, path: str):
-        with open(path + "xgb.pkl", "rb") as f:
+        with open(path + "lgbm.pkl", "rb") as f:
             self.model = pickle.load(f)
-        self.booster = self.model.get_booster()
+        self.booster = getattr(self.model, "booster_", None)
 
         state = torch.load(path + "embeddings.pt", map_location="cpu")
         self.load_state_dict(state)
