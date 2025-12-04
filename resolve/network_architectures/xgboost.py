@@ -80,6 +80,7 @@ class XGBoostWrapper(nn.Module):
         query_phi: torch.Tensor | None = None,
         target: torch.Tensor | None = None,
         loader=None,
+        **kwargs,
     ):
         """
         Fit the XGBoost model.
@@ -201,7 +202,7 @@ class XGBoostWrapper(nn.Module):
             cv_results = gsearch.cv_results_
             scores_df = pd.DataFrame(cv_results).sort_values(by="rank_test_score")
 
-            scores_df.to_csv("./xgb_random_search_results.csv", index=False)
+            #scores_df.to_csv("./xgb_random_search_results.csv", index=False)
 
             self.model = gsearch.best_estimator_
 

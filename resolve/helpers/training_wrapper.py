@@ -29,7 +29,7 @@ import matplotlib.pyplot as plt
 import dataclasses
 from ..utilities import utilities as utils
 from collections.abc import Mapping, Sequence
-from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss, logit_normal_bernoulli_nll
+from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss, logit_normal_bernoulli_nll, zero_loss
 
 import time, torch
 
@@ -51,6 +51,63 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+def sigmoid_expectation(mu, sigma):
+    # Bound the variance
+    sigma = 0.1 + 0.9*torch.nn.functional.softplus(sigma)
+    #sigma = 0.01 + 0.99*torch.nn.functional.softplus(sigma)
+    
+    y = 1+3/torch.pi**2*sigma**2
+    y = y.sqrt()
+    # Bound the divisor to > 0
+    tmp0 = torch.where(y==0.,1e-4,0.)
+    y=torch.add(y,tmp0)
+    
+    expectation = torch.sigmoid(mu/y) 
+    var = expectation * (1-expectation) * (1-(1/y))
+    #var = 0.01 + 0.99*torch.nn.functional.softplus(var)
+    #tmp = torch.where(var==0.,1.e-4,0.)
+    #var = torch.add(expectation, tmp)
+    
+    return expectation, var
+
+def validate_coverage(sigma1, sigma2, sigma3, y_data):
+        """
+        Validate the coverage of the model for 1, 2, and 3 sigma intervals.
+
+        Parameters:
+        - y_data (ndarray): True high-fidelity target values for validation.
+        - y_hf_pred_samples (ndarray): Posterior predictive samples for high-fidelity predictions.
+
+        Returns:
+        - dict: Percentages of validation data within 1, 2, and 3 sigma intervals.
+        """
+
+        coverage={}
+        counters = {1: 0, 2: 0, 3: 0}
+        for ix in range(y_data.shape[0]):
+
+            y_data_tmp = y_data[ix]
+            
+            #print(sigma1[0][ix], sigma1[1][ix], y_data_tmp)
+            # Calculate percentile intervals for the posterior samples
+
+            percentiles = {
+                1: (sigma1[0][ix], sigma1[1][ix]),
+                2: (sigma2[0][ix], sigma2[1][ix]),
+                3: (sigma3[0][ix], sigma3[1][ix]),
+            }
+
+            # Count the number of y_data points within each interval
+            for sigma in [1, 2, 3]:
+                low, high = percentiles[sigma]
+                #print(low, high, y.item())
+                if low <= y_data_tmp <= high:
+                    counters[sigma] += 1
+
+        # Calculate percentages
+        coverage={sigma: (counters[sigma])/y_data.shape[0] * 100 for sigma in [1, 2, 3]}
+        return coverage
 
 def get_git_hash(short=True):
     try:
@@ -242,7 +299,7 @@ class Trainer:
 
         self.model.train(train)
         running_loss = 0.0
-        y_true_all, y_pred_all, y_score_all = [], [], []
+        y_true_all, y_pred_all, y_score_all, sigma_all = [], [], [], []
         accum_steps = math.ceil(500./loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]) if train==True else 1.
 
         if train and self.criterion.base_loss_fn is not skip_loss:
@@ -252,7 +309,6 @@ class Trainer:
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
 
         for i, batch in enumerate(pbar):
-
             with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=autocast_dtype):
                 output, targets = self._forward_batch(batch, self.device, train=train, step=i+self.epoch*len(loader))
                 logit = output.get("logits", None)
@@ -273,8 +329,11 @@ class Trainer:
                     qx32      = query_x.float()
                 else:
                     logit32, targets32, qx32 = logit, targets, query_x
+                
 
-                loss = self.criterion(logit32, targets32, targets_x=qx32) + kl_term + add_loss
+                loss1 = self.criterion(logit32, targets32, targets_x=qx32)
+                loss = loss1 +kl_term + add_loss
+
 
             if train and self.criterion.base_loss_fn is not skip_loss:
                 if self.scaler.is_enabled():  # fp16 path
@@ -294,13 +353,23 @@ class Trainer:
 
             running_loss += float(loss.detach().cpu())
             y_true_all.append(targets.reshape(-1))
+
+            gauss =output.get("Norm", None)
+            if gauss is not None:
+                sigma_all.append(gauss[1].detach().reshape(-1)) 
+                y_pred_all.append(gauss[0].detach().reshape(-1))
+            else:            
+                if self.criterion.base_loss_fn is recon_loss_mse or self.criterion.base_loss_fn is zero_loss: 
+                    y_pred_all.append(self.criterion.p.detach())
+                elif self.criterion.base_loss_fn is logit_normal_bernoulli_nll:
+                    y_pred_all.append(self.criterion.p[1].detach())
+                elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
+                    y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1)) 
+                else:
+                    y_pred_all.append(logit[0].detach().reshape(-1))
             
-            if self.criterion.base_loss_fn is recon_loss_mse: 
-                y_pred_all.append(self.criterion.p.detach())
-            elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is logit_normal_bernoulli_nll or self.criterion.base_loss_fn is brier:
-                y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1)) 
-            else:
-                y_pred_all.append(logit[0].detach().reshape(-1))
+            
+            
             y_score_all.append(score.detach().reshape(-1))
             pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
             
@@ -308,10 +377,11 @@ class Trainer:
         y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
         y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
         y_score = torch.cat(y_score_all).float().cpu().numpy() if y_score_all else np.array([])
+        sigma = torch.cat(sigma_all).float().cpu().numpy() if len(sigma_all) > 0 else np.array([])
 
         avg_loss = running_loss / max(1, len(y_true_all))
 
-        return avg_loss, y_true, y_pred, y_score
+        return avg_loss, y_true, y_pred, y_score, sigma
 
     def fit(
         self,
@@ -345,6 +415,8 @@ class Trainer:
             mode = "min"
 
         best_score = -float("inf") if mode == "max" else float("inf")
+        best_loss = float("inf")
+        best_model_saved = False
         no_improve = 0
 
         num_epochs = int(self.nepochs*self.dataset.set_loader(0, "train").dataset.data["train"]["meta"]["num_epochs"])
@@ -354,9 +426,9 @@ class Trainer:
             self.epoch = epoch
             dataloader = self.dataset.set_loader(epoch, "train")
 
-            getattr(self.model, "fit", lambda *args, **kwargs: None)(loader=dataloader)
+            getattr(self.model, "fit", lambda *args, **kwargs: None)(loader=dataloader, trainer=self)
                 
-            train_loss, y_true_tr, y_pred_tr, y_score_tr = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + num_epochs}")
+            train_loss, y_true_tr, y_pred_tr, y_score_tr, _ = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + num_epochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
             m_tr["loss"] = train_loss
             self.metrics["train"] = m_tr
@@ -373,17 +445,20 @@ class Trainer:
 
             
             # Early stopping / checkpointing
-            if "validate" not in dataloader.dataset.data: continue
-            score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch)
-            improved = (score > best_score) if mode == "max" else (score < best_score)
-            if improved:
-                best_score = score
-                no_improve = 0
-                torch.save({"epoch": epoch, "model_state": self.model.state_dict()}, best_ckpt)
-            else:
-                no_improve += 1
-                if no_improve >= patience:
-                    break
+            if "validate":
+                score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch)
+                improved = (score > best_score) if mode == "max" else (score < best_score)
+                loss_tolerance = 0.05  # 5% tolerance on loss for checkpointing
+                if improved and best_loss*(1.0 + loss_tolerance) > self.metrics["validate"].get("loss"):
+                    best_score = score
+                    best_loss = self.metrics["validate"].get("loss")
+                    no_improve = 0
+                    torch.save({"epoch": epoch, "model_state": self.model.state_dict()}, best_ckpt)
+                    best_model_saved = True
+                else:
+                    no_improve += 1
+                    if no_improve >= patience:
+                        break
             
             # Memory hygiene
             gc.collect()
@@ -391,9 +466,23 @@ class Trainer:
                 torch.cuda.empty_cache()
             elif torch.backends.mps.is_available():
                 torch.mps.empty_cache()
-
+        
+        if os.path.exists(best_ckpt) and best_model_saved:
+            self.load_best_checkpoint(best_ckpt)
+        
         self.metrics["best_model"]={"best_score": float(best_score), "monitor": monitor, "mode": mode, "epochs_ran": epoch - self.epoch_start + 1}
         return self.metrics["best_model"]
+
+    def load_best_checkpoint(self, ckpt_path: str):
+        """Reload the best model from a checkpoint."""
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        
+        checkpoint = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.epoch_start = checkpoint["epoch"] + 1
+        print(f"Loaded best model from epoch {checkpoint['epoch']}")
+        return checkpoint
 
     def evaluate(
         self,
@@ -405,7 +494,7 @@ class Trainer:
     ) -> Dict[str, float]:
         
         self.epoch = epoch
-        self.model.to(self.device)
+        #self.model.to(self.device)
         if isinstance(self.criterion, torch.nn.Module):
             self.criterion.to(self.device)
 
@@ -413,8 +502,9 @@ class Trainer:
         if dataset_name not in dataloader.dataset.data: 
             return
         with torch.inference_mode():
-            loss, y_true_v, y_pred_v, y_score_v = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch+1}")
+            loss, y_true_v, y_pred_v, y_score_v, sigma = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch+1}")
         
+        '''
         # Optionally FIT TEMPERATURE on validation set
         T_used = None
         if self.is_binary:
@@ -469,11 +559,19 @@ class Trainer:
         else:
             # Non-binary mode: keep predictions as-is
             probs = y_pred_v
-        
+        '''
+        probs = y_pred_v
+
         # Compute metrics using calibrated probabilities
         m_v = _compute_metrics(y_true_v, y_pred_v, self.is_binary)
         m_v["loss"] = loss
         self.metrics[dataset_name] = m_v
+        if sigma.size > 0:
+            sigma1 = y_pred_v-sigma, y_pred_v+sigma
+            sigma2 = y_pred_v-2*sigma, y_pred_v+2*sigma
+            sigma3 = y_pred_v-3*sigma, y_pred_v+3*sigma
+            validate_coverage_test = validate_coverage(sigma1, sigma2, sigma3, y_true_v)
+            print(f"+- 1sigma: {validate_coverage_test[1]:.2f}; +- 2sigma: {validate_coverage_test[2]:.2f}; +- 3sigma: {validate_coverage_test[3]:.2f}")
 
         # Logging / plots
         if writer and epoch % self._report == 0:
@@ -736,7 +834,9 @@ class Trainer:
             print(f"----- Initializing warm-up phase — positives set to {self.dataset.dataset.data["train"]["meta"]["pos_frac"]:.2f} of the batch.----")
             self.fit(optimizer=optimizer, patience = patience, writer=writer, ckpt_dir=ckpt_dir, ckpt_name=ckpt_name,
             monitor=monitor, mode=mode)
-            self.epoch_start = self.nepochs
+            counter += self.nepochs
+            self.epoch_start = counter
+            
         
         self.dataset.config_file["model_settings"]["train"]["dataset"]["positive_ratio_train"] = None
         self.dataset.dataset = None

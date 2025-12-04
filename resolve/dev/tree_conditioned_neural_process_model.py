@@ -5,6 +5,7 @@ from resolve.conditional_neural_process_family.class_attention import SimplePool
 from resolve.conditional_neural_process_family.feature_encoder import FeatureEncoder, MLP
 from resolve.network_architectures.lightgbm import LGBMWithLeafCache
 from resolve.network_architectures.transformer_encoder import TransformerEncoder
+from resolve.helpers.losses import logit_normal_bernoulli_nll
 
 
 class DecoderHead(nn.Module):
@@ -90,7 +91,7 @@ class TreeConditionedCNP(nn.Module):
         query_theta: torch.Tensor | None = None,
         query_phi: torch.Tensor | None = None,
         target: torch.Tensor | None = None,
-        loader=None,):
+        loader=None,**kwargs):
         if self.tree._fitted == False:
             self.tree.fit(X, y, query_theta, query_phi, target, loader)
             nsamples = query_phi.shape[-2] if loader is None else loader.dataset.num_samples()
@@ -102,6 +103,7 @@ class TreeConditionedCNP(nn.Module):
         query_idx,
         context_theta, context_phi, context_y,
         context_idx,
+        target_y,
         *,
         mask_c=None,
         **_
@@ -149,16 +151,20 @@ class TreeConditionedCNP(nn.Module):
         for _ in range(1):
             h_t = self.attn(q_tokens=h_t, kv_tokens=R_ctx, key_mask=wS_ctx)
 
-        out = {"scores": score_tgt}
-        logits = self.base_decoder(torch.cat([R_t, h_t], dim=-1))  
-        mu = logits[...,0]
+
+        logit_cnp = self.base_decoder(torch.cat([R_t, h_t], dim=-1))  
+        
+        logit = logit_cnp[...,0]
         if self.base_decoder.out_dim == 2:
-            sigma = logits[...,1]
+            sigma = logit_cnp[...,1]
             sigma = sigma.clamp(min=-4.0, max=-0.5)  # σ in [~0.018, ~2.7]
             sigma = sigma.exp()
-            out.update({"logits": [mu,sigma]})
+            lambda_ = 0.01
+            loss, p = logit_normal_bernoulli_nll([logit,sigma], target_y)
+            mu, sigma = p
+            out.update({"logits": [logit], "Norm": [mu,sigma], "scores": score_tgt, "loss": lambda_* loss.mean()})
         else:
-            out.update({"logits": [mu]})
+            out.update({"logits": [logit],"scores": score_tgt})
         
         return out
 

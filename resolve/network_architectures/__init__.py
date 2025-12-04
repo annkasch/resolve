@@ -9,3 +9,5 @@ from .transformer_encoder import TransformerEncoder
 from .xgboost import XGBoostWrapper, XGBWithLeafCache
 from .lightgbm import LightGBMWrapper, LGBMWithLeafCache
 from .leaf_cache import LeafCache
+from .graph_neural_network import GNNBinaryClassifier
+from .nf_classifier import NormalizingFlowClassifier

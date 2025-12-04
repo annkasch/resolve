@@ -100,7 +100,7 @@ class IsolationForestWrapper(nn.Module):
             X: torch.Tensor | None = None,
             query_theta: torch.Tensor | None = None,
             query_phi: torch.Tensor | None = None,
-            loader=None):
+            loader=None, **kwargs):
         """
         Fit the Isolation Forest.
 

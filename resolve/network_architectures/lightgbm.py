@@ -86,6 +86,7 @@ class LightGBMWrapper(nn.Module):
         query_phi: torch.Tensor | None = None,
         target: torch.Tensor | None = None,
         loader=None,
+        **kwargs,
     ):
         """
         Fit the LightGBM model.
@@ -221,11 +222,10 @@ class LightGBMWrapper(nn.Module):
 
             cv_results = gsearch.cv_results_
             scores_df = pd.DataFrame(cv_results).sort_values(by="rank_test_score")
-            scores_df.to_csv("./lgbm_random_search_results.csv", index=False)
+            #scores_df.to_csv("./lgbm_random_search_results.csv", index=False)
 
             self.model = gsearch.best_estimator_
 
-        print("LightGBM training complete.")
         self._fitted = True
         self.booster = getattr(self.model, "booster_", None)
 
@@ -247,8 +247,7 @@ class LightGBMWrapper(nn.Module):
                         [nn.Embedding(int(n), self.leaf_embed_dim) for n in num_leaves_per_tree]
                     )
                     print(f"Leaf embeddings initialized for {len(num_leaves_per_tree)} trees.")
-        else:
-            print("No leaf embeddings used.")
+
         return self
 
     @staticmethod

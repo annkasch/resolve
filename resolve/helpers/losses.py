@@ -14,71 +14,57 @@ def logit_normal_bernoulli_nll(
     eps: float = 1e-12,
     **kward
 ) -> torch.Tensor:
-    """
-    Logit-Normal Bernoulli negative log-likelihood.
-
-    We assume a latent logit ℓ ~ N(mu, sigma^2), probability p = sigmoid(ℓ),
-    and label y ~ Bernoulli(p). This function computes:
-
-        NLL = -log ∫ Bernoulli(y | sigmoid(ℓ)) N(ℓ | mu, sigma^2) dℓ
-
-    using Gauss–Hermite quadrature.
-
-    Args
-    ----
-    mu      : (...,)   mean of the logit distribution
-    sigma   : (...,)   std of the logit distribution (must be > 0)
-    y       : (...,)   binary labels in {0,1}
-    num_points : int   number of GH quadrature points (5 or 10 supported)
-    reduction  : str   "mean", "sum", or "none"
-    eps     : float    numerical stability epsilon
-
-    Returns
-    -------
-    nll : scalar tensor if reduction != "none", else same shape as mu/y
-    """
     if num_points not in _GH_TABLE:
         raise ValueError(f"num_points={num_points} not supported; use 5 or 10.")
 
-    mu = z[0]
+    mu   = z[0]
     sigma = z[1]
-    # Split params on LAST dim
-    #mu, log_sigma = z.unbind(dim=-1)   # both (...,)
 
-    # Squeeze trailing singleton if present (B,N,1) -> (B,N)
     if y.dim() == mu.dim() + 1 and y.size(-1) == 1:
         y = y.squeeze(-1)
 
-    # Now broadcast y to mu if needed
     if y.shape != mu.shape:
         y = y.expand_as(mu)
 
-
-    # GH nodes/weights
     gh = _GH_TABLE[num_points]
     x = gh["x"].to(mu.device, mu.dtype)   # (M,)
     w = gh["w"].to(mu.device, mu.dtype)   # (M,)
 
-    # Add quadrature dim
-    mu_e    = mu.unsqueeze(-1)           # (...,1)
-    sigma_e = sigma.unsqueeze(-1)        # (...,1)
-    y_e     = y.unsqueeze(-1)            # (...,1)
+    mu_e    = mu.unsqueeze(-1)            # (..., 1)
+    sigma_e = sigma.unsqueeze(-1)         # (..., 1)
+    y_e     = y.unsqueeze(-1)             # (..., 1)
 
     # Sample logits
     L = mu_e + math.sqrt(2.0) * sigma_e * x  # (..., M)
 
-    # Bernoulli probs
+    # Bernoulli probs at each GH node
     P = torch.sigmoid(L)                     # (..., M)
 
-    # Likelihood p(y|L)
+    # Likelihood p(y | L)
     lik = P * y_e + (1.0 - P) * (1.0 - y_e)  # (..., M)
 
-    # Integrate under N(μ,σ²)
+    # Integral for NLL
     integral = (lik * w).sum(dim=-1) / math.sqrt(math.pi)  # (...,)
-
     nll = -torch.log(integral.clamp_min(eps))              # (...,)
 
-    return nll, torch.sigmoid(mu)
+    # --- Uncertainty on p = sigmoid(ℓ) (logit-normal over p) ---
+
+    # Normalize weights for expectation
+    w_norm = w / math.sqrt(math.pi)        # (M,)
+
+    # E[p]
+    mean_p = (P * w_norm).sum(dim=-1)      # (...,)
+
+    # E[p^2]
+    mean_p2 = (P**2 * w_norm).sum(dim=-1)  # (...,)
+
+    # Var[p] and Std[p]
+    var_p = (mean_p2 - mean_p**2).clamp_min(0.0)
+    std_p = torch.sqrt(var_p)
+
+    # Optionally: predictive variance of y ~ Bernoulli(p)
+    # pred_var_y = mean_p * (1 - mean_p) + var_p
+    return nll, {mean_p, std_p}
 
 def bce_with_logits(z, y, **kward):
     # z can be list/tuple or tensor
@@ -110,6 +96,11 @@ def brier(z, y, **kward):
     p = torch.sigmoid(z0)
     mse = F.mse_loss(p, y, reduction="none")
     return mse, p
+
+def zero_loss(z, y, **kward):
+    z0 = z[0]
+    zero = torch.zeros(z0.shape[0], device=z0.device, dtype=z0.dtype)
+    return zero, zero
 
 def recon_loss_mse(x_hat, y, x, **kward):
     # x_hat[0]: (N, M) or (B, T, M); x ground truth of same last-dim

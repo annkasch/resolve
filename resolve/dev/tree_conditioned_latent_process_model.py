@@ -113,7 +113,7 @@ class TreeConditionedLNP(nn.Module):
         query_theta: torch.Tensor | None = None,
         query_phi: torch.Tensor | None = None,
         target: torch.Tensor | None = None,
-        loader=None,):
+        loader=None,**kwargs):
         self.tree.fit(X, y, query_theta, query_phi, target, loader)
 
     def forward(

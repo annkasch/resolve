@@ -5,7 +5,7 @@ import os
 from resolve.utilities import utilities as utils
 from resolve.helpers import DataLoaderManager
 from resolve.helpers import Trainer, ModelsManager
-from resolve.helpers import AsymmetricFocalWithFPPenalty, gaussian_nll, recon_loss_mse, skip_loss, bce_with_logits, brier, logit_normal_bernoulli_nll
+from resolve.helpers import AsymmetricFocalWithFPPenalty, gaussian_nll, recon_loss_mse, skip_loss, bce_with_logits, brier, logit_normal_bernoulli_nll, zero_loss 
 from torch.utils.tensorboard import SummaryWriter
 import yaml
 import json
@@ -114,7 +114,7 @@ def main(path_to_settings):
     summary_train = trainer.fit(optimizer=optimizer, patience = config_file["model_settings"]["train"]["patience"], writer=writer, ckpt_dir=f"{path_out}/checkpoints", ckpt_name=f"model_{version}_best.pt",
             monitor="pr_auc", mode="max")
 
-    if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test", fit_temperature=(trainer.criterion.base_loss_fn == bce_with_logits))
+    if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test", fit_temperature=False)
 
     model.save(f'{path_out}/model_{version}_')
     normalizer_train = dataset_train.dataset._normalizer
@@ -124,7 +124,7 @@ def main(path_to_settings):
                                     config_file=config_file
                                     )
     dataset_test.set_dataset(normalizer=normalizer_train)
-    if model._get_name() == 'TreeConditionedCNP':
+    if model._get_name() == 'TreeConditionedCNP' or model._get_name() == 'LGBMResidualFT':
         model.tree.enable_leaf_cache(dataset_test.dataset.num_samples())
 
     tester = Trainer(model, dataset_test, epochs=1)

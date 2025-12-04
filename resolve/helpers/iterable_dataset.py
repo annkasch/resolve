@@ -444,3 +444,27 @@ class InMemoryIterableData(IterableDataset):
     
     def num_samples(self) -> int:
         return self.data["data"]["phi"].shape[-2]
+    
+    def get_data(self, key: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Get all data tensors for a given key ('train','test', 'validate')."""
+        if key not in self.data.keys():
+            raise ValueError(f"Invalid key: {key}. Must be one of {list(self.data.keys())}.")
+        
+        idx = torch.cat([self.data[key]["target"]["indices"], self.data[key]["target"]["indices"]]) if self.context_ratio > 0. else self.data[key]["target"]["indices"]
+        theta = self.data["data"]["theta"]
+        phi = self.data["data"]["phi"]
+        y = self.data["data"]["y"]
+
+        return theta.index_select(0, idx), phi.index_select(0, idx), y.index_select(0, idx)
+    
+    def get_positives(self, key: str):
+        theta, phi, y = self.get_data(key)
+        pos_mask = self.sampler.get_positive_indices(y)
+        pos_idx = pos_mask.nonzero(as_tuple=False).view(-1)
+        return theta.index_select(0, pos_idx), phi.index_select(0, pos_idx), y.index_select(0, pos_idx)
+    
+    def get_negatives(self, key: str):
+        theta, phi, y = self.get_data(key)
+        pos_mask = self.sampler.get_positive_indices(y)
+        neg_idx = (~pos_mask).nonzero(as_tuple=False).view(-1)
+        return theta.index_select(0, neg_idx), phi.index_select(0, neg_idx), y.index_select(0, neg_idx)
