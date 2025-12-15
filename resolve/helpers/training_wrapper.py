@@ -30,7 +30,6 @@ import dataclasses
 from ..utilities import utilities as utils
 from collections.abc import Mapping, Sequence
 from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss, logit_normal_bernoulli_nll, zero_loss
-
 import time, torch
 
 try:
@@ -52,24 +51,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-def sigmoid_expectation(mu, sigma):
-    # Bound the variance
-    sigma = 0.1 + 0.9*torch.nn.functional.softplus(sigma)
-    #sigma = 0.01 + 0.99*torch.nn.functional.softplus(sigma)
-    
-    y = 1+3/torch.pi**2*sigma**2
-    y = y.sqrt()
-    # Bound the divisor to > 0
-    tmp0 = torch.where(y==0.,1e-4,0.)
-    y=torch.add(y,tmp0)
-    
-    expectation = torch.sigmoid(mu/y) 
-    var = expectation * (1-expectation) * (1-(1/y))
-    #var = 0.01 + 0.99*torch.nn.functional.softplus(var)
-    #tmp = torch.where(var==0.,1.e-4,0.)
-    #var = torch.add(expectation, tmp)
-    
-    return expectation, var
 
 def validate_coverage(sigma1, sigma2, sigma3, y_data):
         """
@@ -99,14 +80,17 @@ def validate_coverage(sigma1, sigma2, sigma3, y_data):
             }
 
             # Count the number of y_data points within each interval
-            for sigma in [1, 2, 3]:
+            for sigma in enumerate([1, 2, 3]):
                 low, high = percentiles[sigma]
                 #print(low, high, y.item())
+                in_band = 0
                 if low <= y_data_tmp <= high:
                     counters[sigma] += 1
+                    in_band = sigma
+                if ix < 10: print(low, high, y_data_tmp, in_band)
 
         # Calculate percentages
-        coverage={sigma: (counters[sigma])/y_data.shape[0] * 100 for sigma in [1, 2, 3]}
+        coverage={sigma: (counters[sigma])/y_data.shape[0] * 100. for sigma in [1, 2, 3]}
         return coverage
 
 def get_git_hash(short=True):
@@ -295,29 +279,28 @@ class Trainer:
 
         return output, targets
 
-    def _run_epoch(self, loader, optimizer=None, train: bool = True, desc: str = "train") -> Tuple[float, np.ndarray, np.ndarray]:
+    def _run_epoch(self, loader, optimizer=None, train: bool = True, desc: str = "train",
+                pred_writer=None, file_offsets=None):
 
         self.model.train(train)
         running_loss = 0.0
+
+        # Keep these only if you need eval metrics; otherwise skip
         y_true_all, y_pred_all, y_score_all, sigma_all = [], [], [], []
         accum_steps = math.ceil(500./loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]) if train==True else 1.
 
-        if train and self.criterion.base_loss_fn is not skip_loss:
-            optimizer.zero_grad(set_to_none=True)
-
-        autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
 
         for i, batch in enumerate(pbar):
-            with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=autocast_dtype):
+            with torch.amp.autocast(self.device.type, enabled=self._amp_enabled, dtype=(torch.bfloat16 if self._use_bf16 else torch.float16)):
                 output, targets = self._forward_batch(batch, self.device, train=train, step=i+self.epoch*len(loader))
+
                 logit = output.get("logits", None)
                 score = output.get("scores", torch.tensor([], device=self.device))
-
                 kl_term = output.get("kl_term", 0.0)
                 add_loss = output.get("loss", 0.0)
-                
-                _, query, _ = batch
+
+                _, query, meta = batch  # <- assume meta holds file_id/row_idx (or wherever you store them)
                 query_x = torch.cat([query.theta, query.phi], dim=2)
                 query_x = _to_dev(query_x, self.device, non_blocking=(self.device.type == "cuda"))
 
@@ -326,20 +309,20 @@ class Trainer:
                 if logit[0].dtype != torch.float32:
                     logit32 = [x.float() for x in logit]
                     targets32 = targets.float()
-                    qx32      = query_x.float()
+                    qx32 = query_x.float()
                 else:
                     logit32, targets32, qx32 = logit, targets, query_x
-                
 
                 loss1 = self.criterion(logit32, targets32, targets_x=qx32)
-                loss = loss1 +kl_term + add_loss
+                loss = loss1 + kl_term + add_loss
 
-
+            # backward only in training
             if train and self.criterion.base_loss_fn is not skip_loss:
-                if self.scaler.is_enabled():  # fp16 path
+                if self.scaler.is_enabled():
                     self.scaler.scale(loss).backward()
-                else:  # bf16 or no-AMP
+                else:
                     loss.backward()
+
 
                 if (i + 1) % accum_steps == 0:
                     if self.scaler.is_enabled():
@@ -352,35 +335,51 @@ class Trainer:
             #    self.model.memory_bank.ema_update()
 
             running_loss += float(loss.detach().cpu())
-            y_true_all.append(targets.reshape(-1))
 
-            gauss =output.get("Norm", None)
+            # === compute prediction tensor ===
+            gauss = output.get("Norm", None)
             if gauss is not None:
-                sigma_all.append(gauss[1].detach().reshape(-1)) 
-                y_pred_all.append(gauss[0].detach().reshape(-1))
-            else:            
-                if self.criterion.base_loss_fn is recon_loss_mse or self.criterion.base_loss_fn is zero_loss: 
-                    y_pred_all.append(self.criterion.p.detach())
-                elif self.criterion.base_loss_fn is logit_normal_bernoulli_nll:
-                    y_pred_all.append(self.criterion.p[1].detach())
-                elif self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
-                    y_pred_all.append(torch.sigmoid(logit[0]).detach().reshape(-1)) 
+                pred_t = gauss[0].detach().reshape(-1)
+                sigma_t = gauss[1].detach().reshape(-1)
+            else:
+                sigma_t = None
+                if self.criterion.base_loss_fn is bce_with_logits or self.criterion.base_loss_fn is brier:
+                    pred_t = torch.sigmoid(logit[0]).detach().reshape(-1)
                 else:
-                    y_pred_all.append(logit[0].detach().reshape(-1))
-            
-            
-            
-            y_score_all.append(score.detach().reshape(-1))
-            pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
-            
+                    pred_t = logit[0].detach().reshape(-1)
 
+            # === write predictions during inference ===
+            if (not train) and (pred_writer is not None):
+                # Pull routing info from batch/meta (adapt these field names!)
+                file_id = meta.file_id.detach().cpu().numpy().reshape(-1)
+                row_idx = meta.row_idx.detach().cpu().numpy().reshape(-1)
+
+                # compute global indices
+                # file_offsets: numpy array/list where file_offsets[f] gives starting index of file f
+                global_idx = (np.asarray(file_offsets, dtype=np.int64)[file_id] + row_idx).astype(np.int64)
+
+                pred_np = pred_t.float().detach().cpu().numpy().astype(np.float32)
+                if sigma_t is not None:
+                    sigma_np = sigma_t.float().detach().cpu().numpy().astype(np.float32)
+                    pred_writer.write(global_idx, pred_np, sigma_np)
+                else:
+                    pred_writer.write(global_idx, pred_np)
+
+            # If you still want metric arrays, keep these; otherwise remove to save RAM
+            y_true_all.append(targets.reshape(-1).detach().cpu())
+            y_pred_all.append(pred_t.detach().cpu())
+            y_score_all.append(score.detach().reshape(-1).cpu())
+            if sigma_t is not None:
+                sigma_all.append(sigma_t.detach().cpu())
+
+            pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
+
+        # return metrics as before (or simplify for inference)
         y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
         y_pred = torch.cat(y_pred_all).float().cpu().numpy() if y_pred_all else np.array([])
         y_score = torch.cat(y_score_all).float().cpu().numpy() if y_score_all else np.array([])
         sigma = torch.cat(sigma_all).float().cpu().numpy() if len(sigma_all) > 0 else np.array([])
-
         avg_loss = running_loss / max(1, len(y_true_all))
-
         return avg_loss, y_true, y_pred, y_score, sigma
 
     def fit(
@@ -428,7 +427,7 @@ class Trainer:
 
             getattr(self.model, "fit", lambda *args, **kwargs: None)(loader=dataloader, trainer=self)
                 
-            train_loss, y_true_tr, y_pred_tr, y_score_tr, _ = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + num_epochs}")
+            train_loss, y_true_tr, y_pred_tr, y_score_tr, sigma = self._run_epoch(dataloader, optimizer, train=True, desc=f"train {epoch+1}/{self.epoch_start + num_epochs}")
             m_tr = _compute_metrics(y_true_tr, y_pred_tr, self.is_binary)
             m_tr["loss"] = train_loss
             self.metrics["train"] = m_tr
@@ -442,6 +441,14 @@ class Trainer:
                 if len(y_score_tr) > 0:
                     fig = utils.plot(y_score_tr.reshape(-1, 1), y_true_tr.reshape(-1, 1), it=epoch+1)
                     writer.add_figure(f'plot/score_tree_train', fig, global_step=epoch+1)
+            
+            if sigma.size > 0:
+                sigma1 = y_pred_tr-sigma, y_pred_tr+sigma
+                sigma2 = y_pred_tr-2*sigma, y_pred_tr+2*sigma
+                sigma3 = y_pred_tr-3*sigma, y_pred_tr+3*sigma
+                validate_coverage_test = validate_coverage(sigma1, sigma2, sigma3, y_true_tr)
+                print(f"+- 1sigma: {validate_coverage_test[1]:.2f}; +- 2sigma: {validate_coverage_test[2]:.2f}; +- 3sigma: {validate_coverage_test[3]:.2f}")
+
 
             
             # Early stopping / checkpointing
@@ -614,194 +621,24 @@ class Trainer:
         return score
 
     @torch.inference_mode()
-    def predict(self, dataset_name="predict", monitor="pr_auc",writer=None):
-            """
-            Run the model in prediction mode over the given dataset.
-            Processes data file by file and saves predictions back to the same files.
-            """
+    def predict(self, dataset_name="inference", epoch=0, out_path="out/preds.dat",
+                      n_total=None, file_offsets=None, with_sigma=False):
+        self.epoch = epoch
+        dataloader = self.dataset.set_loader(epoch, dataset_name)
 
-            self.model.to(self.device)
-            self.model.eval()
-            if isinstance(self.criterion, torch.nn.Module):
-                self.criterion.to(self.device)
-            
-            # Get dimensions from dataset parameters
-            sizes = {k: self.dataset.parameters[k]["size"] for k in ["theta", "phi", "target"]}
-            worker_id = 0  # Since we process one file at a time, we can use a single worker
-            
-            # Initialize data collectors
-            collectors = {
-                "y_pred": np.zeros((0, sizes["target"])),
-                "y_err": np.zeros((0, sizes["target"])),
-                "y_true": np.zeros((0, sizes["target"])),
-                "theta": np.zeros((0, sizes["theta"])),
-                "phi": np.zeros((0, sizes["phi"])),
-                "loss": 0.0
-            }
-            metrics_col =  np.empty((0, 4))
-            
-            dataloader = self.dataset.set_loader(0, mode="predict")
-            with tqdm(total=len(dataloader.dataset.files), desc="Processing files", unit="file" , disable=in_slurm) as pbar:
-                for batch, file_idx, file_completed in dataloader:
-                    _, query, _ = batch
-                    #query_phi = dataloader.dataset._normalizer.inverse_transform(query.phi[0], "phi").cpu().numpy()
-                    #query_theta = dataloader.dataset._normalizer.inverse_transform(query.theta[0], "theta").cpu().numpy()
-                    query_phi = dataloader.dataset._normalizer.inverse_transform(query.phi[0],"phi")
-                    query_theta = dataloader.dataset._normalizer.inverse_transform(query.theta[0],"theta")
+        if n_total is None:
+            n_total = self.dataset.n_total_samples  # adapt to your dataset
+        if file_offsets is None:
+            file_offsets = self.dataset.file_offsets  # prefix sums by file_id
 
-                    if not torch.is_tensor(query_phi):
-                        query_phi = torch.from_numpy(query_phi)
-                    if not torch.is_tensor(query_theta):
-                        query_theta = torch.from_numpy(query_theta)
+        writer = MemmapPredWriter(out_path, n_total=n_total, with_sigma=with_sigma)
 
-                    query_phi   = query_phi.to(self.device, non_blocking=(self.device.type=="cuda"))
-                    query_theta = query_theta.to(self.device, non_blocking=(self.device.type=="cuda"))
+        with torch.inference_mode():
+            self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch+1}",
+                            pred_writer=writer, file_offsets=file_offsets)
 
-                    # Forward pass
-                    autocast_dtype = torch.bfloat16 if self._use_bf16 else torch.float16
-                    with torch.inference_mode(), torch.amp.autocast(self.device.type,enabled=self._amp_enabled, dtype=autocast_dtype):
-                        output, targets = self._forward_batch(batch, self.device)
-                        logit = output.get("logits", None)
-                        query_x = torch.cat([query_theta, query_phi], dim=1) 
-
-                        # Keep loss numerically stable: do loss in fp32 if needed
-                        # fp32 is safer with custom losses
-                        if logit[0].dtype != torch.float32:
-                            logit32   = (logit[0]).float()
-                            targets32 = targets.float()
-                            qx32      = query_x.float()
-                        else:
-                            logit32, targets32, qx32 = logit[0], targets, query_x
-
-                        loss = self.criterion([logit32], targets32, targets_x=qx32) + output.get("kl_term", 0.0) + output.get("loss", 0.0)
-                    
-                    # Update loss
-                    collectors["loss"] += loss
-                                         
-
-                    # Update predictions
-                    if self.model._get_name()== 'ConditionalNeuralProcess':
-                        pred_data = logit[0][0].cpu().numpy()
-                        collectors["y_err"] = np.concatenate([collectors["y_err"], logit[1][0].cpu().numpy()], axis=0)
-                    else:
-                        pred_data = torch.sigmoid(logit[0]).cpu().numpy().reshape(-1, 1)
-                    
-                    # Collect batch data
-                    collectors["y_pred"] = np.concatenate([collectors["y_pred"], pred_data], axis=0)
-                    collectors["y_true"] = np.concatenate([collectors["y_true"], targets[0].cpu().numpy()], axis=0)
-                    collectors["theta"] = np.concatenate([collectors["theta"], query_theta], axis=0)
-                    collectors["phi"] = np.concatenate([collectors["phi"], query_phi], axis=0)
-
-                    if file_completed:
-                        # Get indices for data validation
-                        indices = {k: self.dataset.parameters[k]["selected_indices"] 
-                                 for k in ["phi", "theta", "target"]}
-                        
-                        with h5py.File(self.dataset.files[file_idx], "a") as f:
-                            # Load and validate data
-                            target_labels = self.dataset.parameters["target"]["selected_labels"]
-                            file_data = {
-                                "phi": np.array(f[self.dataset.parameters["phi"]["key"]][:,indices["phi"]]),
-                                "theta": np.array(f[self.dataset.parameters["theta"]["key"]][indices["theta"]]).reshape(-1, sizes["theta"]),
-                                "y_true": np.array(f[self.dataset.parameters["target"]["key"]][:, indices["target"]])
-                            }
-
-                            # Validate data consistency
-                            data_ok = all(
-                                np.allclose(file_data[k], np.asarray(collectors[k], dtype=file_data[k].dtype)[None, :], rtol=1e-5, atol=1e-5)
-                                for k in ["theta", "phi", "y_true"]
-                            )
-                            
-                            if not data_ok:
-                                print(f"Warning: Data mismatch in file {self.dataset.files[file_idx]}")
-                            else:
-                                # Set up HDF5 group
-                                model_name = self.model.__class__.__name__
-                                version = self.dataset.config_file["path_settings"]["version"]
-                                group_path = f"RESOLVE_{model_name}_{version}"
-                                prefix = group_path
-                                to_delete = [name for name in f.keys() if name.startswith(prefix)]
-                                for name in to_delete:
-                                    del f[name]
-
-                                grp = f.require_group(group_path)
-                                
-                                # Save predictions and metadata
-                                for i,l in enumerate(target_labels):
-                                    grp.create_dataset(f'{l}_true', data=collectors["y_true"][:, i], compression="gzip", chunks=True)
-                                    grp.create_dataset(f'{l}_pred', data=collectors["y_pred"][:, i], compression="gzip", chunks=True)
-                                    if collectors["y_err"].shape[0] > 0:
-                                        grp.create_dataset(f'{l}_pred_err', data=collectors["y_err"][:, i], compression="gzip", chunks=True)
-                                
-                                # Save provenance
-                                grp.attrs.update({
-                                    "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                    "model_name": model_name,
-                                    "version": version,
-                                    "git_hash": get_git_hash(short=True),
-                                    "phi_label": str(self.dataset.parameters["phi"]["selected_labels"]),
-                                    "theta_label": str(self.dataset.parameters["theta"]["selected_labels"]),
-                                    "target_label": str(self.dataset.parameters["target"]["selected_labels"])
-                                })
-                            
-                                # Save metrics
-                                # Save metrics
-                                m_v = _compute_metrics(collectors["y_true"], collectors["y_pred"], self.is_binary)
-                                
-                                m_v["loss"] = float(collectors["loss"])
-
-                                # Correct: update attributes directly from the dictionary
-                                grp.attrs.update({k: v for k, v in m_v.items() if not isinstance(v, (np.ndarray, torch.Tensor, list, tuple, dict))})
-
-                        # Log
-                        if writer and file_idx % self._report == 0.:
-                            #for k, v in m_v.items():
-                            #    writer.add_scalar(f"{dataset_name}/{k}", v, file_idx)
-                            for k, v in m_v.items(): writer.add_scalar(f"{dataset_name}/{k}", v, file_idx) if np.isscalar(v) else None
-                            fig = utils.plot(collectors["y_pred"], collectors["y_true"], it=file_idx)
-                            writer.add_figure(f'plot/{dataset_name}', fig, global_step=file_idx)
-
-                        # initialize an empty array with correct number of columns but 0 rows
-                        if metrics_col.shape[1] != len(m_v):
-                            metrics_col =  np.empty((0, len(m_v)))
-
-                        #metrics_col = np.vstack([metrics_col, np.array(list(m_v.values())).reshape(1, -1)])
-                        scalar_keys = globals().get("scalar_keys") or [k for k,v in m_v.items() if np.isscalar(v)]
-                        metrics_col = np.vstack([metrics_col if metrics_col.size and metrics_col.shape[1]==len(scalar_keys) else np.empty((0,len(scalar_keys))), np.array([m_v.get(k, np.nan) if np.isscalar(m_v.get(k, np.nan)) else np.nan for k in scalar_keys], float)[None,:]])
-                        #metrics_col = np.vstack([metrics_col, np.array([v for v in m_v.values() if np.isscalar(v)], dtype=float)[None, :]])
-                        # Reset collectors for next file
-                        collectors = {
-                                "y_pred": np.zeros((0, sizes["target"])),
-                                "y_err": np.zeros((0, sizes["target"])),
-                                "y_true": np.zeros((0, sizes["target"])),
-                                "theta": np.zeros((0, sizes["theta"])),
-                                "phi": np.zeros((0, sizes["phi"])),
-                                "loss": 0.0
-                            }
-
-                        pbar.update(1)
-
-            # Filter scalar metric names (consistent with metrics_col columns)
-            scalar_keys = globals().get("scalar_keys") or [
-                k for k, v in m_v.items() if np.isscalar(v)
-            ]
-            # Ensure metrics dict exists for this dataset
-            self.metrics.setdefault(dataset_name, {})
-
-            # Iterate only over scalar keys
-            for i, name in enumerate(scalar_keys):
-                vals = metrics_col[:, i]
-                self.metrics[dataset_name][f"{name}_avg"] = np.nanmean(vals)
-                self.metrics[dataset_name][name] = vals.tolist()
-
-            # Memory hygiene
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            elif torch.backends.mps.is_available():
-                torch.mps.empty_cache()
-
-            return {"monitor_avg": np.nanmean(self.metrics[dataset_name].get(monitor, float("nan")))}
+        writer.close()
+        return out_path
 
     def warm_up(
         self,
@@ -845,4 +682,23 @@ class Trainer:
         print(f"----- End of warm up -----")
 
 
-    
+class MemmapPredWriter:
+        def __init__(self, path: str, n_total: int, with_sigma: bool = False, dtype=np.float32):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            self.p_path = path
+            self.p = np.memmap(path, mode="w+", dtype=dtype, shape=(n_total,))
+            self.with_sigma = with_sigma
+            self.s = None
+            if with_sigma:
+                self.s_path = path.replace(".dat", "_sigma.dat")
+                self.s = np.memmap(self.s_path, mode="w+", dtype=dtype, shape=(n_total,))
+
+        def write(self, global_idx: np.ndarray, pred: np.ndarray, sigma: np.ndarray | None = None):
+            self.p[global_idx] = pred
+            if self.with_sigma and sigma is not None:
+                self.s[global_idx] = sigma
+
+        def close(self):
+            self.p.flush()
+            if self.s is not None:
+                self.s.flush()

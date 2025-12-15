@@ -18,8 +18,8 @@ import functools
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
 
-ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y", "idx"))
-QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi", "idx"))
+ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y", "idx", "file_indices"))
+QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi", "idx", "file_indices"))
 
 BatchCollection = collections.namedtuple(
     "BatchCollection",
@@ -279,25 +279,28 @@ class InMemoryIterableData(IterableDataset):
         theta = self.data["data"]["theta"]
         phi   = self.data["data"]["phi"]
         y     = self.data["data"]["y"]
+        file_indices = self.data["data"]["file_indices"]
 
         for b in range(b_start, b_end):
             idx_tgt = self.data[self.mode]["target"]["batches"][b]
             b_phi_tgt = phi.index_select(0, idx_tgt).unsqueeze(0)
             b_theta_tgt = theta.index_select(0, idx_tgt).unsqueeze(0)
             b_y_tgt     = y.index_select(0, idx_tgt).unsqueeze(0)
+            b_file_idx_tgt = file_indices.index_select(0, idx_tgt).unsqueeze(0)
 
             if self.context_ratio > 0.:
                 idx_ctx = self.data[self.mode]["context"]["batches"][b]
                 b_phi_ctx = phi.index_select(0, idx_ctx).unsqueeze(0)
                 b_theta_ctx = theta.index_select(0, idx_ctx).unsqueeze(0)
                 b_y_ctx     = y.index_select(0, idx_ctx).unsqueeze(0)
+                b_file_idx_ctx = file_indices.index_select(0, idx_ctx).unsqueeze(0)
             else:
-                b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0),torch.empty(0) 
+                b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx, b_file_idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0),torch.empty(0), torch.empty(0) 
 
 
             batch = BatchCollection(
-                context=ContextSet(theta=b_theta_ctx.contiguous(), phi=b_phi_ctx.contiguous(), y=b_y_ctx.contiguous(), idx=idx_ctx),
-                query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt),
+                context=ContextSet(theta=b_theta_ctx.contiguous(), phi=b_phi_ctx.contiguous(), y=b_y_ctx.contiguous(), idx=idx_ctx, file_indices=b_file_idx_ctx),
+                query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt, file_indices=b_file_idx_tgt),
                 target_y=b_y_tgt.contiguous(),
             )
             yield batch
@@ -311,24 +314,25 @@ class InMemoryIterableData(IterableDataset):
         b_phi_tgt = self.data["data"]["phi"].index_select(0, idx_tgt).unsqueeze(0)
         b_theta_tgt = self.data["data"]["theta"].index_select(0, idx_tgt).unsqueeze(0) if self.data[self.mode]["target"].get("theta",None) is not None else None
         b_y_tgt     = self.data["data"]["y"].index_select(0, idx_tgt).unsqueeze(0)     if self.data[self.mode]["target"].get("y",None)     is not None else None
+        b_file_idx_tgt = self.data["data"]["file_indices"].index_select(0, idx_tgt).unsqueeze(0)
 
         if self.context_ratio > 0.:
             idx_ctx = self.data[self.mode]["context"]["batches"][index]
             b_phi_ctx = self.data["data"]["phi"].index_select(0, idx_ctx).unsqueeze(0)
             b_theta_ctx = self.data["data"]["theta"].index_select(0, idx_ctx).unsqueeze(0) if self.data[self.mode]["context"].get("theta",None) is not None else None
             b_y_ctx     = self.data["data"]["y"].index_select(0, idx_ctx).unsqueeze(0)     if self.data[self.mode]["context"].get("y",None)     is not None else None
+            b_file_idx_ctx = self.data["data"]["file_indices"].index_select(0, idx_ctx).unsqueeze(0)
         else:
-            b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0),torch.empty(0) 
+            b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx, b_file_idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0) 
 
 
         batch = BatchCollection(
-            context=ContextSet(theta=b_theta_ctx.contiguous(), phi=b_phi_ctx.contiguous(), y=b_y_ctx.contiguous(), idx=idx_ctx),
-            query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt),
+            context=ContextSet(theta=b_theta_ctx.contiguous(), phi=b_phi_ctx.contiguous(), y=b_y_ctx.contiguous(), idx=idx_ctx, file_indices=b_file_idx_ctx),
+            query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt, file_indices=b_file_idx_tgt),
             target_y=b_y_tgt.contiguous(),
         )
 
         yield batch
-
 
     def _predict_iter(self):
         """Iterator for prediction mode where we process one file at a time from memory."""

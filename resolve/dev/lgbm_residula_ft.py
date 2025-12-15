@@ -93,13 +93,13 @@ class LGBMResidualFT(nn.Module):
 
         logit = logit_ft[...,0]
         if self.decoder.out_dim == 2:
-            sigma = logit_ft[...,1]
-            sigma = sigma.clamp(min=-4.0, max=-0.5)  # σ in [~0.018, ~2.7]
-            sigma = sigma.exp()
-            lambda_ = 0.01
-            loss, p = logit_normal_bernoulli_nll([logit,sigma], target_y)
+            sigma_ft = logit_ft[...,1]
+            sigma_ft = sigma_ft.clamp(min=-4.0, max=-0.5)  # σ in [~0.018, ~2.7]
+            sigma_ft = sigma_ft.exp()
+            lambda_ = 0.
+            loss, p = logit_normal_bernoulli_nll([logit,sigma_ft], target_y)
             mu, sigma = p
-            out.update({"logits": [logit], "Norm": [mu,sigma], "scores": score_lgbm, "loss": lambda_* loss.mean()})
+            out.update({"logits": [logit, sigma_ft], "Norm": [mu,sigma], "scores": score_lgbm, "loss": lambda_* loss.mean()})
         else:
             out.update({"logits": [logit],"scores": score_lgbm})
 

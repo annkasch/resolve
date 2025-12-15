@@ -14,6 +14,17 @@ def logit_normal_bernoulli_nll(
     eps: float = 1e-12,
     **kward
 ) -> torch.Tensor:
+    """
+    Logit-Normal Bernoulli negative log-likelihood.
+
+    We assume a latent logit ℓ ~ N(mu, sigma^2), probability p = sigmoid(ℓ),
+    and label y ~ Bernoulli(p). This function computes:
+
+        NLL = -log ∫ Bernoulli(y | sigmoid(ℓ)) N(ℓ | mu, sigma^2) dℓ
+
+    using Gauss–Hermite quadrature.
+    """
+    
     if num_points not in _GH_TABLE:
         raise ValueError(f"num_points={num_points} not supported; use 5 or 10.")
 
