@@ -46,8 +46,8 @@ class InMemoryIterableData(IterableDataset):
         theta, phi, y, fidx = self._load_data_to_mem(self.files, self.parameter_config)
         
         self.theta_to_id = self.sampler.get_unique_ids(theta)
-        n_tmp = 1000000
-        self.data = self._set_data(theta[:n_tmp], phi[:n_tmp], y[:n_tmp], fidx[:n_tmp])
+
+        self.data = self._set_data(theta, phi, y, fidx)
         self.build_batches(0)
         
     def make_empty_like(self,*tensors):
