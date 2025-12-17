@@ -31,6 +31,10 @@ from ..utilities import utilities as utils
 from collections.abc import Mapping, Sequence
 from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss, logit_normal_bernoulli_nll, zero_loss
 import time, torch
+import numpy as np
+import zarr
+from numcodecs import Blosc
+
 
 try:
     from .data_generator import BatchFormatter
@@ -348,22 +352,37 @@ class Trainer:
                 else:
                     pred_t = logit[0].detach().reshape(-1)
 
-            # === write predictions during inference ===
+                # ---- write during inference ----
             if (not train) and (pred_writer is not None):
-                # Pull routing info from batch/meta (adapt these field names!)
+                # routing info (adapt names to your actual meta)
                 file_id = meta.file_id.detach().cpu().numpy().reshape(-1)
                 row_idx = meta.row_idx.detach().cpu().numpy().reshape(-1)
 
-                # compute global indices
-                # file_offsets: numpy array/list where file_offsets[f] gives starting index of file f
-                global_idx = (np.asarray(file_offsets, dtype=np.int64)[file_id] + row_idx).astype(np.int64)
+                # global index
+                fo = np.asarray(file_offsets, dtype=np.int64)
+                global_idx = (fo[file_id] + row_idx).astype(np.int64)
 
-                pred_np = pred_t.float().detach().cpu().numpy().astype(np.float32)
-                if sigma_t is not None:
-                    sigma_np = sigma_t.float().detach().cpu().numpy().astype(np.float32)
-                    pred_writer.write(global_idx, pred_np, sigma_np)
+                # theta/phi (flatten to align with pred_t)
+                theta_np = query.theta.detach().cpu().float().reshape(-1, query.theta.shape[-1]).numpy()
+                phi_np   = query.phi.detach().cpu().float().reshape(-1, query.phi.shape[-1]).numpy()
+
+                pred_np = pred_t.detach().cpu().float().numpy().astype(np.float32, copy=False)
+
+                if sigma_t is not None and pred_writer.sigma is not None:
+                    sigma_np = sigma_t.detach().cpu().float().numpy().astype(np.float32, copy=False)
                 else:
-                    pred_writer.write(global_idx, pred_np)
+                    sigma_np = None
+
+                pred_writer.write(
+                    global_idx=global_idx,
+                    pred=pred_np,
+                    theta=theta_np.astype(np.float32, copy=False),
+                    phi=phi_np.astype(np.float32, copy=False),
+                    file_id=file_id,
+                    row_idx=row_idx,
+                    sigma=sigma_np,
+                    sort_by_idx=True,  # improves chunk locality
+                )
 
             # If you still want metric arrays, keep these; otherwise remove to save RAM
             y_true_all.append(targets.reshape(-1).detach().cpu())
@@ -444,10 +463,11 @@ class Trainer:
             
             if sigma.size > 0:
                 sigma1 = y_pred_tr-sigma, y_pred_tr+sigma
-                sigma2 = y_pred_tr-2*sigma, y_pred_tr+2*sigma
-                sigma3 = y_pred_tr-3*sigma, y_pred_tr+3*sigma
-                validate_coverage_test = validate_coverage(sigma1, sigma2, sigma3, y_true_tr)
-                print(f"+- 1sigma: {validate_coverage_test[1]:.2f}; +- 2sigma: {validate_coverage_test[2]:.2f}; +- 3sigma: {validate_coverage_test[3]:.2f}")
+                #sigma2 = y_pred_tr-2*sigma, y_pred_tr+2*sigma
+                #sigma3 = y_pred_tr-3*sigma, y_pred_tr+3*sigma
+                print(sigma1[0][:10], sigma1[1][:10], y_true_tr[:10])
+            #    validate_coverage_test = validate_coverage(sigma1, sigma2, sigma3, y_true_tr)
+            #    print(f"+- 1sigma: {validate_coverage_test[1]:.2f}; +- 2sigma: {validate_coverage_test[2]:.2f}; +- 3sigma: {validate_coverage_test[3]:.2f}")
 
 
             
@@ -460,7 +480,7 @@ class Trainer:
                     best_score = score
                     best_loss = self.metrics["validate"].get("loss")
                     no_improve = 0
-                    torch.save({"epoch": epoch, "model_state": self.model.state_dict()}, best_ckpt)
+                    self.model.save({"epoch": epoch, "model_state": self.model.state_dict()}, best_ckpt)
                     best_model_saved = True
                 else:
                     no_improve += 1
@@ -577,8 +597,8 @@ class Trainer:
             sigma1 = y_pred_v-sigma, y_pred_v+sigma
             sigma2 = y_pred_v-2*sigma, y_pred_v+2*sigma
             sigma3 = y_pred_v-3*sigma, y_pred_v+3*sigma
-            validate_coverage_test = validate_coverage(sigma1, sigma2, sigma3, y_true_v)
-            print(f"+- 1sigma: {validate_coverage_test[1]:.2f}; +- 2sigma: {validate_coverage_test[2]:.2f}; +- 3sigma: {validate_coverage_test[3]:.2f}")
+            #validate_coverage_test = validate_coverage(sigma1, sigma2, sigma3, y_true_v)
+            #print(f"+- 1sigma: {validate_coverage_test[1]:.2f}; +- 2sigma: {validate_coverage_test[2]:.2f}; +- 3sigma: {validate_coverage_test[3]:.2f}")
 
         # Logging / plots
         if writer and epoch % self._report == 0:
@@ -621,24 +641,38 @@ class Trainer:
         return score
 
     @torch.inference_mode()
-    def predict(self, dataset_name="inference", epoch=0, out_path="out/preds.dat",
-                      n_total=None, file_offsets=None, with_sigma=False):
+    def predict(self, dataset_name="inference", epoch=0, out_store="pred_store.zarr",
+                        with_sigma=True, compressor="zstd1"):
+
         self.epoch = epoch
         dataloader = self.dataset.set_loader(epoch, dataset_name)
 
-        if n_total is None:
-            n_total = self.dataset.n_total_samples  # adapt to your dataset
-        if file_offsets is None:
-            file_offsets = self.dataset.file_offsets  # prefix sums by file_id
+        # You need these from your dataset:
+        n_total = dataloader.dataset.num_samples()        # total samples across all files
+        file_offsets = self.dataset.file_offsets()      # prefix sum offsets by file_id
 
-        writer = MemmapPredWriter(out_path, n_total=n_total, with_sigma=with_sigma)
+        # Infer d_theta/d_phi from one batch (or store them in dataset config)
+        batch0 = next(iter(dataloader))
+        _, query0, _ = batch0
+        d_theta = query0.theta.shape[-1]
+        d_phi   = query0.phi.shape[-1]
+
+        writer = ZarrPredWriter(
+            store_path=out_store,
+            n_total=n_total,
+            d_theta=d_theta,
+            d_phi=d_phi,
+            with_sigma=with_sigma,
+            chunks=200_000,
+            compressor=compressor,
+        )
 
         with torch.inference_mode():
-            self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch+1}",
+            _ = self._run_epoch(dataloader, optimizer=None, train=False,
+                            desc=f"{dataset_name} {epoch+1}",
                             pred_writer=writer, file_offsets=file_offsets)
 
-        writer.close()
-        return out_path
+        return out_store
 
     def warm_up(
         self,
@@ -682,23 +716,90 @@ class Trainer:
         print(f"----- End of warm up -----")
 
 
-class MemmapPredWriter:
-        def __init__(self, path: str, n_total: int, with_sigma: bool = False, dtype=np.float32):
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            self.p_path = path
-            self.p = np.memmap(path, mode="w+", dtype=dtype, shape=(n_total,))
-            self.with_sigma = with_sigma
-            self.s = None
-            if with_sigma:
-                self.s_path = path.replace(".dat", "_sigma.dat")
-                self.s = np.memmap(self.s_path, mode="w+", dtype=dtype, shape=(n_total,))
+class ZarrPredWriter:
+    """
+    Disk-backed prediction store indexed by global_idx.
+    Writes:
+      - pred: (N,)
+      - sigma: (N,) optional
+      - theta: (N, d_theta)
+      - phi: (N, d_phi)
+      - file_id: (N,)
+      - row_idx: (N,)
+    """
+    def __init__(
+        self,
+        store_path: str,
+        n_total: int,
+        d_theta: int,
+        d_phi: int,
+        with_sigma: bool = False,
+        chunks: int = 200_000,
+        compressor="zstd1",  # "none" for max speed, or "zstd1" common compromise
+        dtype_pred="f4",
+        dtype_x="f4",
+    ):
+        if compressor == "none":
+            comp = None
+        elif compressor == "zstd1":
+            comp = Blosc(cname="zstd", clevel=1, shuffle=Blosc.BITSHUFFLE)
+        else:
+            raise ValueError(f"Unknown compressor={compressor}")
 
-        def write(self, global_idx: np.ndarray, pred: np.ndarray, sigma: np.ndarray | None = None):
-            self.p[global_idx] = pred
-            if self.with_sigma and sigma is not None:
-                self.s[global_idx] = sigma
+        root = zarr.open(store_path, mode="w")
+        c = (min(chunks, n_total),)
 
-        def close(self):
-            self.p.flush()
-            if self.s is not None:
-                self.s.flush()
+        self.pred = root.create_dataset("pred", shape=(n_total,), chunks=c, dtype=dtype_pred,
+                                        compressor=comp, overwrite=True)
+        self.sigma = None
+        if with_sigma:
+            self.sigma = root.create_dataset("sigma", shape=(n_total,), chunks=c, dtype=dtype_pred,
+                                             compressor=comp, overwrite=True)
+
+        self.theta = root.create_dataset("theta", shape=(n_total, d_theta), chunks=(c[0], d_theta),
+                                         dtype=dtype_x, compressor=comp, overwrite=True)
+        self.phi   = root.create_dataset("phi",   shape=(n_total, d_phi),   chunks=(c[0], d_phi),
+                                         dtype=dtype_x, compressor=comp, overwrite=True)
+
+        self.file_id = root.create_dataset("file_id", shape=(n_total,), chunks=c, dtype="i4",
+                                           compressor=comp, overwrite=True)
+        self.row_idx = root.create_dataset("row_idx", shape=(n_total,), chunks=c, dtype="i8",
+                                           compressor=comp, overwrite=True)
+
+        root.attrs["n_total"] = int(n_total)
+        root.attrs["d_theta"] = int(d_theta)
+        root.attrs["d_phi"]   = int(d_phi)
+
+    def write(
+        self,
+        global_idx: np.ndarray,
+        pred: np.ndarray,
+        theta: np.ndarray,
+        phi: np.ndarray,
+        file_id: np.ndarray,
+        row_idx: np.ndarray,
+        sigma: np.ndarray | None = None,
+        sort_by_idx: bool = True,
+    ):
+        global_idx = np.asarray(global_idx, dtype=np.int64).reshape(-1)
+
+        if sort_by_idx:
+            order = np.argsort(global_idx)
+            global_idx = global_idx[order]
+            pred  = pred[order]
+            theta = theta[order]
+            phi   = phi[order]
+            file_id = file_id[order]
+            row_idx = row_idx[order]
+            if sigma is not None:
+                sigma = sigma[order]
+
+        # Coordinate selection for 1D / 2D datasets
+        self.pred.set_coordinate_selection((global_idx,), pred)
+        self.theta.set_coordinate_selection((global_idx, slice(None)), theta)
+        self.phi.set_coordinate_selection((global_idx, slice(None)), phi)
+        self.file_id.set_coordinate_selection((global_idx,), file_id.astype(np.int32, copy=False))
+        self.row_idx.set_coordinate_selection((global_idx,), row_idx.astype(np.int64, copy=False))
+
+        if self.sigma is not None and sigma is not None:
+            self.sigma.set_coordinate_selection((global_idx,), sigma)

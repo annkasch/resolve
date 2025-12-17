@@ -46,8 +46,8 @@ class InMemoryIterableData(IterableDataset):
         theta, phi, y, fidx = self._load_data_to_mem(self.files, self.parameter_config)
         
         self.theta_to_id = self.sampler.get_unique_ids(theta)
-
-        self.data = self._set_data(theta, phi, y, fidx)
+        n_tmp = 1000000
+        self.data = self._set_data(theta[:n_tmp], phi[:n_tmp], y[:n_tmp], fidx[:n_tmp])
         self.build_batches(0)
         
     def make_empty_like(self,*tensors):
@@ -449,6 +449,7 @@ class InMemoryIterableData(IterableDataset):
     def num_samples(self) -> int:
         return self.data["data"]["phi"].shape[-2]
     
+    
     def get_data(self, key: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get all data tensors for a given key ('train','test', 'validate')."""
         if key not in self.data.keys():
@@ -472,3 +473,13 @@ class InMemoryIterableData(IterableDataset):
         pos_mask = self.sampler.get_positive_indices(y)
         neg_idx = (~pos_mask).nonzero(as_tuple=False).view(-1)
         return theta.index_select(0, neg_idx), phi.index_select(0, neg_idx), y.index_select(0, neg_idx)
+    
+    def file_offsets(self):
+        row_idx = self.data[self.mode]["target"]["indices"]
+        file_id = self.data["data"]["file_indices"].index_select(0, row_idx)
+        n_files = int(file_id.max()) + 1
+        max_row = torch.full((n_files,), -1, device=row_idx.device, dtype=row_idx.dtype)
+        max_row.scatter_reduce_(0, file_id, row_idx, reduce="amax", include_self=True)
+        lengths = max_row + 1
+        offsets = torch.cat([lengths.new_zeros(1), lengths[:-1].cumsum(0)])
+        return offsets, lengths

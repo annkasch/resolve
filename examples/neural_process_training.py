@@ -111,12 +111,12 @@ def main(path_to_settings):
                 )
 
     # Train the model
-    summary_train = trainer.fit(optimizer=optimizer, patience = config_file["model_settings"]["train"]["patience"], writer=writer, ckpt_dir=f"{path_out}/checkpoints", ckpt_name=f"model_{version}_best.pt",
+    summary_train = trainer.fit(optimizer=optimizer, patience = config_file["model_settings"]["train"]["patience"], writer=writer, ckpt_dir=f"{path_out}/checkpoints", ckpt_name=f"model_{version}",
             monitor="pr_auc", mode="max")
 
     if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test", fit_temperature=False)
 
-    model.save(f'{path_out}/model_{version}_')
+    model.save(model.state_dict(), f'{path_out}/model_{version}_')
     normalizer_train = dataset_train.dataset._normalizer
 
     # load data:

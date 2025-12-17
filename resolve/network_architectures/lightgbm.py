@@ -485,7 +485,7 @@ class LGBMWithLeafCache(LightGBMWrapper):
         }
 
     def save(self, path: str):
-        with open(path + "lgbm.pkl", "wb") as f:
+        with open(path + "_lgbm.pkl", "wb") as f:
             pickle.dump(self.model, f)
 
         if hasattr(self.model, "booster_"):
@@ -494,18 +494,36 @@ class LGBMWithLeafCache(LightGBMWrapper):
         state = self.state_dict()
         # drop all leaf_cache.* entries from the state dict
         state = {k: v for k, v in state.items() if not k.startswith("leaf_cache.")}
-        torch.save(state, path + "embeddings.pt")
+        torch.save(state, path + "_embeddings.pt")
 
         if self.leaf_cache is not None:
-            self.leaf_cache.save_cache(path + "leaf_cache.pt")
+            self.leaf_cache.save_cache(path + "_leaf_cache.pt")
 
     def load(self, path: str):
-        with open(path + "lgbm.pkl", "rb") as f:
+        with open(path + "_lgbm.pkl", "rb") as f:
             self.model = pickle.load(f)
         self.booster = getattr(self.model, "booster_", None)
+        print("test 1")
 
-        state = torch.load(path + "embeddings.pt", map_location="cpu")
+        print("Initializing leaf embeddings from model metadata...")
+
+        dump = self.booster.dump_model()
+        tree_info = dump.get("tree_info", [])
+        if not tree_info:
+            print("Warning: no tree_info found in dumped model; skipping leaf embeddings.")
+        else:
+            # LightGBM stores num_leaves directly; indices are 0..num_leaves-1
+            num_leaves_per_tree = [t.get("num_leaves", 0) for t in tree_info]
+            self.leaf_embeddings = nn.ModuleList(
+                [nn.Embedding(int(n), self.leaf_embed_dim) for n in num_leaves_per_tree]
+            )
+            print(f"Leaf embeddings initialized for {len(num_leaves_per_tree)} trees.")
+
+
+        state = torch.load(path + "_embeddings.pt", map_location="cpu")
+        print(state.keys())
         self.load_state_dict(state)
 
         if self.leaf_cache is not None:
-            self.leaf_cache.load_cache(path + "leaf_cache.pt")
+            print("test 2")
+            self.leaf_cache.load_cache(path + "_leaf_cache.pt")

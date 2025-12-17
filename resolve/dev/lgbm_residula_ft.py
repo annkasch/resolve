@@ -111,8 +111,6 @@ class LGBMResidualFT(nn.Module):
 
         return out
     
-    def save(self, path):
-        torch.save(self.state_dict(), path+'_model.pth')
     
     def fit(self,X: torch.Tensor | None = None,
         y: torch.Tensor | None = None,
@@ -125,6 +123,18 @@ class LGBMResidualFT(nn.Module):
             nsamples = query_phi.shape[-2] if loader is None else loader.dataset.num_samples()
             self.tree.enable_leaf_cache(nsamples, next(self.parameters()).device)
     
-    def save(self, path):
-        torch.save(self.state_dict(), path+'_model.pth')
+    def save(self,state, path):
+        # drop all tree.leaf_cache.* entries from the state dict
+        print(state)
+        print(state.keys())
+        state["model_state"] = {k: v for k, v in state["model_state"].items() if not k.startswith("tree.leaf_cache.")}
+        torch.save(state, path+'_model.pth')
         self.tree.save(path)
+    
+    def load(self, path):
+        self.tree.load(path)
+        state = torch.load(path+'_model.pth', map_location='cpu')
+        state["model_state"] = {k: v for k, v in state["model_state"].items() if not k.startswith("tree.leaf_cache.")}
+        self.load_state_dict(state['model_state'])
+
+        

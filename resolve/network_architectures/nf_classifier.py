@@ -95,3 +95,10 @@ class NormalizingFlowClassifier(nn.Module):
 
         avg_train_nll = train_nll_sum / train_n
 
+    def save(self,state, path):
+        # drop all tree.leaf_cache.* entries from the state dict
+        torch.save(state, path+'_model.pth')
+    
+    def load(self, path):
+        state = torch.load(path+'_model.pth', map_location='cpu')
+        self.load_state_dict(state['model_state'])

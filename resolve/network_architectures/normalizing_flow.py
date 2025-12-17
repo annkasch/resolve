@@ -256,3 +256,11 @@ class NVPFlow(nn.Module):
         z = self._base_dist().sample((num_samples,)).to(device)  # (N, D)
         x = self._inverse_flow(z)
         return x
+
+    def save(self,state, path):
+        # drop all tree.leaf_cache.* entries from the state dict
+        torch.save(state, path+'_model.pth')
+    
+    def load(self, path):
+        state = torch.load(path+'_model.pth', map_location='cpu')
+        self.load_state_dict(state['model_state'])

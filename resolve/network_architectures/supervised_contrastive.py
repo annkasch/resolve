@@ -72,7 +72,11 @@ class SupervisedContrastive(nn.Module):
 
         return {"logits": [logits], "loss": supcon}
 
-    def save(self, path):
-        torch.save(self.state_dict(), path+'_model.pth')
-
+    def save(self,state, path):
+        # drop all tree.leaf_cache.* entries from the state dict
+        torch.save(state, path+'_model.pth')
+    
+    def load(self, path):
+        state = torch.load(path+'_model.pth', map_location='cpu')
+        self.load_state_dict(state['model_state'])
 
