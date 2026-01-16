@@ -302,7 +302,7 @@ class LightGBMWrapper(nn.Module):
     def predict(self, X_torch: torch.Tensor) -> torch.Tensor:
         X_np, original_shape = self._to_2d_numpy(X_torch.detach())
         X_np = pd.DataFrame(X_np, columns=self.model.feature_name_)
-
+        print(self._fitted)
         if not self._fitted:
             raise RuntimeError("LightGBM model not fitted. Call fit() first.")
 
@@ -391,12 +391,15 @@ class LightGBMWrapper(nn.Module):
         print(f"Saved LGBM model to {path}lgbm.pkl and booster to {path}booster.txt")
 
     def load(self, path: str):
+        print("running load")
         with open(path + "lgbm.pkl", "rb") as f:
             self.model = pickle.load(f)
         self.booster = getattr(self.model, "booster_", None)
 
         state = torch.load(path + "embeddings.pt", map_location="cpu")
         self.load_state_dict(state)
+        self._fitted = True
+        print("fitted?", self._fitted)
         print(f"Loaded LGBM model from {path}lgbm.pkl")
 
 
@@ -503,7 +506,6 @@ class LGBMWithLeafCache(LightGBMWrapper):
         with open(path + "_lgbm.pkl", "rb") as f:
             self.model = pickle.load(f)
         self.booster = getattr(self.model, "booster_", None)
-        print("test 1")
 
         print("Initializing leaf embeddings from model metadata...")
 
@@ -518,6 +520,7 @@ class LGBMWithLeafCache(LightGBMWrapper):
                 [nn.Embedding(int(n), self.leaf_embed_dim) for n in num_leaves_per_tree]
             )
             print(f"Leaf embeddings initialized for {len(num_leaves_per_tree)} trees.")
+        self._fitted = True
 
 
         state = torch.load(path + "_embeddings.pt", map_location="cpu")

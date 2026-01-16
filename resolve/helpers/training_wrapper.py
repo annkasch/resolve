@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import math
 from tqdm import tqdm
+from pathlib import Path
 in_slurm = "SLURM_JOB_ID" in os.environ
 from sklearn.metrics import (
     mean_absolute_error,
@@ -30,8 +31,6 @@ import dataclasses
 from ..utilities import utilities as utils
 from collections.abc import Mapping, Sequence
 from resolve.helpers.losses import bce_with_logits, brier, recon_loss_mse, skip_loss, logit_normal_bernoulli_nll, zero_loss
-import time, torch
-import numpy as np
 import zarr
 from numcodecs import Blosc
 
@@ -284,7 +283,7 @@ class Trainer:
         return output, targets
 
     def _run_epoch(self, loader, optimizer=None, train: bool = True, desc: str = "train",
-                pred_writer=None, file_offsets=None):
+                pred_writer=None):
 
         self.model.train(train)
         running_loss = 0.0
@@ -353,35 +352,30 @@ class Trainer:
                     pred_t = logit[0].detach().reshape(-1)
 
                 # ---- write during inference ----
+
             if (not train) and (pred_writer is not None):
                 # routing info (adapt names to your actual meta)
-                file_id = meta.file_id.detach().cpu().numpy().reshape(-1)
-                row_idx = meta.row_idx.detach().cpu().numpy().reshape(-1)
-
-                # global index
-                fo = np.asarray(file_offsets, dtype=np.int64)
-                global_idx = (fo[file_id] + row_idx).astype(np.int64)
+                file_id = query.file_indices.detach().cpu().numpy().reshape(-1)
+                row_idx = query.idx.detach().cpu().numpy().reshape(-1)
 
                 # theta/phi (flatten to align with pred_t)
-                theta_np = query.theta.detach().cpu().float().reshape(-1, query.theta.shape[-1]).numpy()
-                phi_np   = query.phi.detach().cpu().float().reshape(-1, query.phi.shape[-1]).numpy()
+                theta = loader.dataset._normalizer.inverse_transform(query.theta[0], "theta")
+                theta_np = theta.detach().cpu().float().numpy()
+                phi = loader.dataset._normalizer.inverse_transform(query.phi[0], "phi")
+                phi_np   = phi.detach().cpu().float().numpy()
 
                 pred_np = pred_t.detach().cpu().float().numpy().astype(np.float32, copy=False)
+                sigma_np = sigma_t.detach().cpu().float().numpy().astype(np.float32, copy=False) if sigma_t is not None else None
+                targets_np = targets.detach().reshape(-1).cpu().float().numpy().astype(np.float32, copy=False) if targets is not None else None
 
-                if sigma_t is not None and pred_writer.sigma is not None:
-                    sigma_np = sigma_t.detach().cpu().float().numpy().astype(np.float32, copy=False)
-                else:
-                    sigma_np = None
-
-                pred_writer.write(
-                    global_idx=global_idx,
-                    pred=pred_np,
+                pred_writer.write_to_zarr(
                     theta=theta_np.astype(np.float32, copy=False),
                     phi=phi_np.astype(np.float32, copy=False),
                     file_id=file_id,
                     row_idx=row_idx,
+                    pred=pred_np,
                     sigma=sigma_np,
-                    sort_by_idx=True,  # improves chunk locality
+                    target=targets_np,
                 )
 
             # If you still want metric arrays, keep these; otherwise remove to save RAM
@@ -641,15 +635,14 @@ class Trainer:
         return score
 
     @torch.inference_mode()
-    def predict(self, dataset_name="inference", epoch=0, out_store="pred_store.zarr",
-                        with_sigma=True, compressor="zstd1"):
+    def predict(self, dataset_name="inference", epoch=0, path_out=".",
+                        compressor="zstd1"):
 
         self.epoch = epoch
         dataloader = self.dataset.set_loader(epoch, dataset_name)
 
         # You need these from your dataset:
         n_total = dataloader.dataset.num_samples()        # total samples across all files
-        file_offsets = self.dataset.file_offsets()      # prefix sum offsets by file_id
 
         # Infer d_theta/d_phi from one batch (or store them in dataset config)
         batch0 = next(iter(dataloader))
@@ -657,22 +650,22 @@ class Trainer:
         d_theta = query0.theta.shape[-1]
         d_phi   = query0.phi.shape[-1]
 
-        writer = ZarrPredWriter(
-            store_path=out_store,
+        self.writer = ZarrPredWriter(
+            store_path=path_out,
             n_total=n_total,
             d_theta=d_theta,
             d_phi=d_phi,
-            with_sigma=with_sigma,
             chunks=200_000,
             compressor=compressor,
+            predictor=None,
         )
 
-        with torch.inference_mode():
-            _ = self._run_epoch(dataloader, optimizer=None, train=False,
-                            desc=f"{dataset_name} {epoch+1}",
-                            pred_writer=writer, file_offsets=file_offsets)
+        #with torch.inference_mode():
+        #    _ = self._run_epoch(dataloader, optimizer=None, train=False,
+        #                    desc=f"{dataset_name} {epoch+1}",
+        #                    pred_writer=self.writer)
+        self.writer.close()
 
-        return out_store
 
     def warm_up(
         self,
@@ -715,17 +708,19 @@ class Trainer:
         self.nepochs = num_epochs
         print(f"----- End of warm up -----")
 
-
 class ZarrPredWriter:
     """
-    Disk-backed prediction store indexed by global_idx.
-    Writes:
-      - pred: (N,)
-      - sigma: (N,) optional
-      - theta: (N, d_theta)
-      - phi: (N, d_phi)
-      - file_id: (N,)
-      - row_idx: (N,)
+    Fast disk-backed prediction store indexed by global row_idx.
+
+    Strategy:
+      - buffer writes in RAM
+      - flush grouped by zarr chunk
+      - per chunk: one minimal-span read-modify-write (RMW) per dataset
+      - never use coordinate/orthogonal selection
+
+    Notes:
+      - fastest with compressor="none"
+      - handles arbitrary (random) row_idx
     """
     def __init__(
         self,
@@ -733,11 +728,12 @@ class ZarrPredWriter:
         n_total: int,
         d_theta: int,
         d_phi: int,
-        with_sigma: bool = False,
         chunks: int = 200_000,
-        compressor="zstd1",  # "none" for max speed, or "zstd1" common compromise
+        compressor="none",      # fastest: "none"; if needed: "zstd1"
         dtype_pred="f4",
         dtype_x="f4",
+        buffer_rows: int | None = None,  # default: 2 * chunk rows
+        predictor: Trainer | None = None,
     ):
         if compressor == "none":
             comp = None
@@ -745,61 +741,260 @@ class ZarrPredWriter:
             comp = Blosc(cname="zstd", clevel=1, shuffle=Blosc.BITSHUFFLE)
         else:
             raise ValueError(f"Unknown compressor={compressor}")
+        
+        self.store_path = f"{store_path}/inference"
 
-        root = zarr.open(store_path, mode="w")
-        c = (min(chunks, n_total),)
+        root = zarr.open(f"{self.store_path}/store.zarr", mode="w", zarr_format=2)
+        c0 = int(min(chunks, n_total))
+        self._chunk0 = c0
+        self._d_theta = int(d_theta)
+        self._d_phi = int(d_phi)
 
-        self.pred = root.create_dataset("pred", shape=(n_total,), chunks=c, dtype=dtype_pred,
+        self.predictor = predictor
+
+
+        self.target = root.create_dataset("target", shape=(n_total,), chunks=(c0,), dtype=dtype_pred,
                                         compressor=comp, overwrite=True)
-        self.sigma = None
-        if with_sigma:
-            self.sigma = root.create_dataset("sigma", shape=(n_total,), chunks=c, dtype=dtype_pred,
+
+        self.pred = root.create_dataset("pred", shape=(n_total,), chunks=(c0,), dtype=dtype_pred,
+                                        compressor=comp, overwrite=True)
+        
+        self.sigma = root.create_dataset("sigma", shape=(n_total,), chunks=(c0,), dtype=dtype_pred,
                                              compressor=comp, overwrite=True)
 
-        self.theta = root.create_dataset("theta", shape=(n_total, d_theta), chunks=(c[0], d_theta),
+        self.theta = root.create_dataset("theta", shape=(n_total, d_theta), chunks=(c0, d_theta),
                                          dtype=dtype_x, compressor=comp, overwrite=True)
-        self.phi   = root.create_dataset("phi",   shape=(n_total, d_phi),   chunks=(c[0], d_phi),
+        self.phi   = root.create_dataset("phi",   shape=(n_total, d_phi),   chunks=(c0, d_phi),
                                          dtype=dtype_x, compressor=comp, overwrite=True)
 
-        self.file_id = root.create_dataset("file_id", shape=(n_total,), chunks=c, dtype="i4",
+        self.file_id = root.create_dataset("file_id", shape=(n_total,), chunks=(c0,), dtype="i4",
                                            compressor=comp, overwrite=True)
-        self.row_idx = root.create_dataset("row_idx", shape=(n_total,), chunks=c, dtype="i8",
+        self.row_idx = root.create_dataset("row_idx", shape=(n_total,), chunks=(c0,), dtype="i8",
                                            compressor=comp, overwrite=True)
 
         root.attrs["n_total"] = int(n_total)
         root.attrs["d_theta"] = int(d_theta)
         root.attrs["d_phi"]   = int(d_phi)
 
-    def write(
-        self,
-        global_idx: np.ndarray,
-        pred: np.ndarray,
-        theta: np.ndarray,
-        phi: np.ndarray,
-        file_id: np.ndarray,
-        row_idx: np.ndarray,
-        sigma: np.ndarray | None = None,
-        sort_by_idx: bool = True,
-    ):
-        global_idx = np.asarray(global_idx, dtype=np.int64).reshape(-1)
+        # ---- RAM buffer (fast path) ----
+        self._buf_cap = int(buffer_rows or (2 * c0))
+        self._buf_n = 0
+        self._b_row = np.empty(self._buf_cap, dtype=np.int64)
+        self._b_pred = np.empty(self._buf_cap, dtype=self.pred.dtype)
+        self._b_tgt = np.empty(self._buf_cap, dtype=self.pred.dtype)
+        self._b_theta = np.empty((self._buf_cap, d_theta), dtype=self.theta.dtype)
+        self._b_phi   = np.empty((self._buf_cap, d_phi),   dtype=self.phi.dtype)
+        self._b_fid = np.empty(self._buf_cap, dtype=np.int32)
+        self._b_sig = np.empty(self._buf_cap, dtype=self.pred.dtype)
 
-        if sort_by_idx:
-            order = np.argsort(global_idx)
-            global_idx = global_idx[order]
-            pred  = pred[order]
-            theta = theta[order]
-            phi   = phi[order]
-            file_id = file_id[order]
-            row_idx = row_idx[order]
+    def write_to_zarr(self, theta, phi, file_id, row_idx, pred, sigma=None, target=None):
+        # cast/validate cheaply
+        theta   = np.asarray(theta, self.theta.dtype)
+        phi     = np.asarray(phi, self.phi.dtype)
+        file_id = np.asarray(file_id, np.int32)
+        row_idx = np.asarray(row_idx, np.int64)
+
+        pred    = np.asarray(pred, self.pred.dtype)
+        if sigma is not None:
+            sigma = np.asarray(sigma, self.pred.dtype)
+        if target is not None:
+            target = np.asarray(target, self.pred.dtype)
+
+        n = row_idx.size
+        if n == 0:
+            return
+
+        i = 0
+        while i < n:
+            free = self._buf_cap - self._buf_n
+            if free == 0:
+                self.flush()
+                free = self._buf_cap
+
+            take = min(free, n - i)
+            j = self._buf_n
+
+            self._b_row[j:j+take] = row_idx[i:i+take]
+            self._b_fid[j:j+take] = file_id[i:i+take]
+
+            self._b_theta[j:j+take, :] = theta[i:i+take, :]
+            self._b_phi[j:j+take, :] = phi[i:i+take, :]
+            
+            self._b_pred[j:j+take] = pred[i:i+take]
+            self._b_sig[j:j+take] = sigma[i:i+take] if sigma is not None else None
+            self._b_tgt[j:j+take] = target[i:i+take] if target is not None else None
+
+            self._buf_n += take
+            i += take
+
+            if self._buf_n >= self._buf_cap:
+                self.flush()
+
+    def flush(self):
+        n = self._buf_n
+        if n == 0:
+            return
+
+        # Sort once per flush (not per write call)
+        row = self._b_row[:n]
+        o = np.argsort(row)
+        row = row[o]
+        fid   = self._b_fid[:n][o]
+        
+        theta = self._b_theta[:n, :][o, :]
+        phi   = self._b_phi[:n, :][o, :]
+        
+        pred = self._b_pred[:n][o]
+        sig   = self._b_sig[:n][o] if self._b_sig is not None else None
+        tgt   = self._b_tgt[:n][o] if self._b_tgt is not None else None
+
+        c = self._chunk0
+        cid = row // c
+        cuts = np.flatnonzero(np.diff(cid)) + 1
+        starts = np.r_[0, cuts]
+        ends   = np.r_[cuts, n]
+
+        for s, e in zip(starts, ends):
+            base = int(cid[s]) * c
+            loc  = row[s:e] - base
+            lo, hi = int(loc[0]), int(loc[-1])
+            sl = slice(base + lo, base + hi + 1)
+            rel = (loc - lo).astype(np.int64, copy=False)
+
+            # 1D
+            b = self.file_id[sl]; b[rel] = fid[s:e];  self.file_id[sl] = b
+            b = self.row_idx[sl]; b[rel] = row[s:e];  self.row_idx[sl] = b
+            b = self.pred[sl];    b[rel] = pred[s:e]; self.pred[sl] = b
+            # optional
+            if self.sigma is not None:
+                b = self.sigma[sl]; b[rel] = sig[s:e]; self.sigma[sl] = b
+            if self.target is not None:
+                b = self.target[sl]; b[rel] = tgt[s:e]; self.target[sl] = b
+
+            # 2D
+            b = self.theta[sl, :]; b[rel, :] = theta[s:e, :]; self.theta[sl, :] = b
+            b = self.phi[sl, :];   b[rel, :] = phi[s:e, :];   self.phi[sl, :] = b
+
+        self._buf_n = 0
+
+    def write_to_h5(self, path_out, data, compression=None, chunk_rows=100_000):
+        theta, phi, pred, sigma, tgt = data
+        theta = np.asarray(theta)
+        phi   = np.asarray(phi)
+        n, d_phi = phi.shape
+        _, d_theta = theta.shape
+
+        with h5py.File(path_out, "w") as f:
+            gdata = f.create_group("data")
+            gmeta = f.create_group("meta")
+
+            # chunking along rows
+            ch_phi = (min(chunk_rows, n), d_phi)
+            ch_x   = (min(chunk_rows, n), d_theta + d_phi)
+
+            gdata.create_dataset("phi", data=phi, chunks=ch_phi, compression=compression)
+
+            # x cached: allocate then fill (no big temporary concatenate)
+            x = gdata.create_dataset("x", shape=(n, d_theta + d_phi),
+                                    dtype=phi.dtype, chunks=ch_x, compression=compression)
+            x[:, :d_theta] = theta
+            x[:, d_theta:] = phi
+
+            pred = np.asarray(pred)
+            gdata.create_dataset("y_predicted", data=pred, chunks=(min(chunk_rows, n),),
+                                    compression=compression)
+            rate_pred = np.sum(pred)/ pred.size
+            rate_pred_var = int(rate_pred*pred.size)/(pred.size**2)
+            
             if sigma is not None:
-                sigma = sigma[order]
+                sigma = np.asarray(sigma)
+                gdata.create_dataset("y_pred_sigma", data=sigma, chunks=(min(chunk_rows, n),),
+                                    compression=compression)
+                rate_pred_var = np.sum(sigma)/(sigma.size**2) if sigma is not None else 0.
 
-        # Coordinate selection for 1D / 2D datasets
-        self.pred.set_coordinate_selection((global_idx,), pred)
-        self.theta.set_coordinate_selection((global_idx, slice(None)), theta)
-        self.phi.set_coordinate_selection((global_idx, slice(None)), phi)
-        self.file_id.set_coordinate_selection((global_idx,), file_id.astype(np.int32, copy=False))
-        self.row_idx.set_coordinate_selection((global_idx,), row_idx.astype(np.int64, copy=False))
+            # ------------------
+            # metadata
+            # ------------------
+            gmeta.attrs.update({
+                    "git_hash": get_git_hash(short=True),
+                    "theta": theta[0],
+                    "n_rows": int(n),
+                    "d_theta": int(d_theta),
+                    "d_phi": int(d_phi),
+                    "x_definition": "x = concat(theta, phi)",
+                    "rate_pred": rate_pred,
+                    "rate_pred_var": rate_pred_var,
+            })
+            if self.predictor is not None:
+                gmeta.attrs.update({
+                    "model_name": f"RESOVLE_{self.predicter.model.__class__.__name__}",
+                    "phi_label": str(self.predicter.dataset.parameters["phi"]["selected_labels"]),
+                    "theta_label": str(self.predicter.dataset.parameters["theta"]["selected_labels"]),
+                    "target_label": str(self.predicter.dataset.parameters["target"]["selected_labels"]),
+                    "x_label": str(self.predicter.dataset.parameters["theta"]["selected_labels"])+str(predicter.dataset.parameters["phi"]["selected_labels"]),
 
-        if self.sigma is not None and sigma is not None:
-            self.sigma.set_coordinate_selection((global_idx,), sigma)
+                })
+
+            if tgt is not None:
+                tgt = np.asarray(tgt)
+                gdata.create_dataset("y_target", data=pred, chunks=(min(chunk_rows, n),),
+                                    compression=compression)
+            
+                tgt_rate = np.sum(tgt)/ tgt.size if tgt is not None else 0.
+                rate_tgt_var= np.sum(tgt)/ (tgt.size**2) if tgt is not None else 0.
+                gmeta.attrs.update({
+                    "rate_sim": tgt_rate,
+                    "rate_sim_var": rate_tgt_var,
+
+                })
+    
+    def convert_and_sort_zarr_to_h5(self, chunk_rows=500_000):
+
+        root = zarr.open(f"{self.store_path}/store.zarr", mode="r")
+
+        file_id = root["file_id"]
+        theta   = root["theta"]
+        phi     = root["phi"]
+        target  = root.get("target", None)
+        pred    = root["pred"]
+        sigma   = root.get("sigma", None)
+
+        file_id_np = file_id[:]
+        files =  np.char.add(np.char.add("file_", file_id_np.astype(str)),".h5") if self.predictor is None else self.predicter.dataset.files
+        for fidx, path in enumerate(files):
+            path = Path(path)
+            if str(path).endswith(('.h5', '.hdf5')):
+                filename = Path(path.stem + "_out.h5")
+            else:
+                filename = Path(path.stem + "_out.h5")
+
+            filename = f"{self.store_path}/{filename}"
+
+            out = []
+            mask = (file_id[:] == fidx)
+
+            idx = np.nonzero(mask)[0]
+            out.append((
+                theta[idx],
+                phi[idx],
+                target[idx] if target is not None else None,
+                pred[idx],
+                sigma[idx] if sigma is not None else None
+            ))
+
+            # concatenate
+            theta_o, phi_o, tgt_o, pred_o, sig_o = zip(*out)
+            out = (
+                np.concatenate(theta_o),
+                np.concatenate(phi_o),
+                np.concatenate(pred_o),
+                np.concatenate(sig_o) if sig_o[0] is not None else None,
+                np.concatenate(tgt_o) if tgt_o[0] is not None else None,
+            )
+            self.write_to_h5(filename, out)
+
+    # needs to be run after the last write in order to flush the remaining chunk
+    def close(self):
+        #self.flush()
+        self.convert_and_sort_zarr_to_h5()
+        os.system(f"rm {self.store_path}/store.zarr")

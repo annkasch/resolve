@@ -29,7 +29,7 @@ class DecoderHead(nn.Module):
         return hidden
 
 # ---------- full model ----------
-class LGBMResidualFT(nn.Module):
+class BDTFTTransformer(nn.Module):
     def __init__(self, d_theta, d_phi, d_y, tree_config, out_dim=1, d_model=64, depth=1, n_heads=4, threshold = [0.,1.], use_tokenizer=False,use_cls_token=False):
         super().__init__()
         self.tree = LGBMWithLeafCache(config=tree_config["config"], 

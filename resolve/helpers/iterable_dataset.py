@@ -263,12 +263,6 @@ class InMemoryIterableData(IterableDataset):
         per = int(math.ceil(n / info.num_workers)); s = info.id * per; e = min(s + per, n); return s, e
 
     def __iter__(self):
-        if self.mode == "predict":
-            return self._predict_iter()
-        else:
-            return self._train_iter()
-
-    def _train_iter(self):
         """Iterator for train/validate/test. Uses precomputed batch-index plans if present."""
 
         batches_tgt = self.data[self.mode]["target"].get("batches", None)
@@ -305,7 +299,6 @@ class InMemoryIterableData(IterableDataset):
             )
             yield batch
 
-    
     def __getitem__(self, index):
         """
         Return the i-th yielded batch.
@@ -333,70 +326,7 @@ class InMemoryIterableData(IterableDataset):
         )
 
         yield batch
-
-    def _predict_iter(self):
-        """Iterator for prediction mode where we process one file at a time from memory."""
-        worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
-
-        # Get data for current mode
-        theta = self.data[self.mode]["theta"]
-        phi = self.data[self.mode]["phi"]
-        y = self.data[self.mode]["y"]
-        file_indices = self.data[self.mode]["file_indices"]
-
-        # Get unique file indices
-        unique_files = torch.unique(file_indices)
-        
-        # Split files among workers
-        files_for_worker = unique_files[worker_id::num_workers]
-
-        for file_idx in files_for_worker:
-            # Get mask for current file
-            file_mask_t = (file_indices[1] == file_idx)
-            file_mask_ctx = (file_indices[0] == file_idx)
-
-            # Get data for current file
-            file_theta_t = theta[1][file_mask_t]
-            file_phi_t = phi[1][file_mask_t]
-            file_y_t = y[1][file_mask_t]
-            file_theta_ctx = theta[0][file_mask_ctx]
-            file_phi_ctx = phi[0][file_mask_ctx]
-            file_y_ctx = y[0][file_mask_ctx]
-
-            # Process file in batches
-            n = file_phi_t.shape[0]
-
-            ratio_ctx = self.context_ratio/(1.-self.context_ratio)
-            for start_idx in range(0, n, self.batch_size_tgt):
-                end_idx = min(start_idx + self.batch_size_tgt, n)
-                start_idx_ctx = start_idx*ratio_ctx
-                end_idx_ctx = end_idx*ratio_ctx
-                
-                # Extract batch
-                theta_t = file_theta_t[start_idx:end_idx]
-                phi_t = file_phi_t[start_idx:end_idx]
-                y_t = file_y_t[start_idx:end_idx]
-                theta_ctx = file_theta_ctx[start_idx_ctx:end_idx_ctx]
-                phi_ctx = file_phi_ctx[start_idx_ctx:end_idx_ctx]
-                y_ctx = file_y_ctx[start_idx_ctx:end_idx_ctx]
-
-                def ensure_3d(a): return a.unsqueeze(0) if a.dim()==2 else a
-                theta_ctx, phi_ctx, y_ctx  = map(ensure_3d, (theta_ctx, phi_ctx, y_ctx))
-                theta_t, phi_t, y_t = map(ensure_3d, (theta_t, phi_t, y_t))
-
-                ctx_theta_cell = self.sampler.to_cell(theta_ctx,1).to(torch.float32)
-                qry_theta_cell = self.sampler.to_cell(theta_t,1).to(torch.float32)
-        
-                batch = BatchCollection(
-                    context=ContextSet(theta=theta_ctx.contiguous(), phi=phi_ctx.contiguous(), y=y_ctx.contiguous(), theta_cell=ctx_theta_cell.contiguous()),
-                    query=QuerySet(theta=theta_t.contiguous(), phi=phi_t.contiguous(), theta_cell=qry_theta_cell.contiguous()),
-                    target_y=y_t.contiguous(),
-                )
-                
-                yield batch, file_idx.item(), end_idx >= n
-    
+ 
     def _format_batch(self, theta, phi, y):
 
         n_ctx = int(phi.shape[0] * self.context_ratio)
@@ -449,7 +379,6 @@ class InMemoryIterableData(IterableDataset):
     def num_samples(self) -> int:
         return self.data["data"]["phi"].shape[-2]
     
-    
     def get_data(self, key: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get all data tensors for a given key ('train','test', 'validate')."""
         if key not in self.data.keys():
@@ -474,12 +403,3 @@ class InMemoryIterableData(IterableDataset):
         neg_idx = (~pos_mask).nonzero(as_tuple=False).view(-1)
         return theta.index_select(0, neg_idx), phi.index_select(0, neg_idx), y.index_select(0, neg_idx)
     
-    def file_offsets(self):
-        row_idx = self.data[self.mode]["target"]["indices"]
-        file_id = self.data["data"]["file_indices"].index_select(0, row_idx)
-        n_files = int(file_id.max()) + 1
-        max_row = torch.full((n_files,), -1, device=row_idx.device, dtype=row_idx.dtype)
-        max_row.scatter_reduce_(0, file_id, row_idx, reduce="amax", include_self=True)
-        lengths = max_row + 1
-        offsets = torch.cat([lengths.new_zeros(1), lengths[:-1].cumsum(0)])
-        return offsets, lengths
