@@ -2,11 +2,11 @@ path_settings:
   version: v1.2.2
   path_to_files_train: ./binary-black-hole/in/data/lf/v1.0/training_cnp
   path_to_files_test: ./binary-black-hole/in/data/lf/v1.0/training_regression
-  path_to_files_inference: ./binary-black-hole/in/data/lf/v1.0/training_regression
+  path_to_files_predict: ./binary-black-hole/in/data/lf/v1.0/training_regression
   path_out_model: ./binary-black-hole/out
 model_settings:
   network:
-    model_used: BDTFTTransformer # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
+    model_used: LGBMResidualFT # Choose the model you want to use; Supported: 'ConditionalNeuralProcess', 'HCTargetAttnNP', 'HCTargetAttnLNP'
     models: 
       Autoencoder:
         representation_size: 8
@@ -134,7 +134,7 @@ model_settings:
             reg_lambda: 1.0
             max_depth: 8
             min_child_weight: 2
-      BDTFTTransformer:
+      LGBMResidualFT:
         representation_size: 64
         depth: 4
         n_heads: 8
@@ -191,7 +191,7 @@ model_settings:
       max_positive_reuse: 5
       num_data_pass_per_phase: 1
     batch_size: 1000
-    training_epochs: 5
+    training_epochs: 17
     patience: 20
     learning_rate: 0.001
     report_frequency: 100

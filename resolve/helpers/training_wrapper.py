@@ -884,6 +884,8 @@ class ZarrPredWriter:
         n, d_phi = phi.shape
         _, d_theta = theta.shape
 
+        print(theta.shape, phi.shape)
+
         with h5py.File(path_out, "w") as f:
             gdata = f.create_group("data")
             gmeta = f.create_group("meta")
