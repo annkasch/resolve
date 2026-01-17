@@ -179,20 +179,10 @@ class InMemoryIterableData(IterableDataset):
     @staticmethod
     def _read_in_from_file(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         if file_path.endswith(('.h5', '.hdf5')):
+
             with h5py.File(file_path, 'r') as hdf:
                 phi = hdf[parameter_config['phi']['key']][:,parameter_config['phi']['selected_indices']]
-                
-                theta = hdf[parameter_config['theta']['key']]
-                
-                if len(parameter_config['theta']['selected_indices']) != 0:
-                    if theta.ndim == 1:
-                        theta_vec = theta[parameter_config['theta']['selected_indices']]             # (T,)
-                        # broadcast, then copy once during final assembly
-                        theta = torch.from_numpy(theta_vec).unsqueeze(0).expand(phi.shape[0], -1)
-                    else:
-                        theta = theta[:, parameter_config['theta']['selected_indices']]
-                else:
-                    theta = torch.from_numpy(theta)
+                theta = hdf[parameter_config['theta']['key']][:,parameter_config['theta']['selected_indices']]
 
                 tgt_ds = hdf[parameter_config['target']['key']]
                 if tgt_ds.ndim > 1 and parameter_config['target']['selected_indices'] != None:
@@ -201,6 +191,7 @@ class InMemoryIterableData(IterableDataset):
                     y = tgt_ds[:].reshape(-1, 1)
 
             phi = torch.from_numpy(phi)
+            theta = torch.from_numpy(theta)
             y = torch.from_numpy(y)
 
         elif file_path.endswith('.csv'):

@@ -10,6 +10,7 @@ import operator
 import functools
 import matplotlib.pyplot as plt
 import gc
+import time
 
 def set_random_seed(seed=42):
     random.seed(seed)           # Python's built-in random module
@@ -23,6 +24,77 @@ def set_random_seed(seed=42):
         torch.cuda.manual_seed_all(seed)  # If using multi-GPU
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
+def dump_h5(path):
+    with h5py.File(path, "r") as f:
+        def visit(name, obj):
+            print(name)
+            for k, v in obj.attrs.items():
+                print(f"  @ {k}: {v}")
+        f.visititems(visit)
+
+
+
+def restructure_hdf5(in_path, out_path):
+    with h5py.File(in_path, "r") as f:
+        # --- read inputs ---
+        phi = f["phi"][...]
+        phi_excl = f["excluded_phi"][...].T
+        phi_labels = f["phi_labels"][...]
+        phi_excl_labels = f["excluded_phi_headers"][...]
+
+        theta = f["theta"][...]              # shape (d_theta,)
+        theta_labels = f["theta_headers"][...]
+
+
+        target = f["target"][...]
+        target_labels = f["target_headers"][...]
+        target_labels[0] = "DCO".encode("utf-8")
+        target_labels[1]="BBH".encode("utf-8")
+
+    # --- 2) concatenate phi + excluded_phi ---
+    phi_all = np.concatenate([phi, phi_excl], axis=1)
+    phi_all_labels = np.concatenate(
+        [phi_labels.astype("S"), phi_excl_labels.astype("S")]
+    )
+    
+    # --- 3) build X = [theta | phi] ---
+    N = phi_all.shape[0]
+    theta_row = theta.reshape(1, -1)
+    theta_broadcast = np.repeat(theta_row, N, axis=0)
+    x = np.concatenate([theta_broadcast, phi_all], axis=1)
+
+    x_labels = np.concatenate(
+        [theta_labels.astype("S"), phi_all_labels]
+    )
+
+    # --- write new file ---
+    with h5py.File(out_path, "w") as f:
+        # meta (file attributes)
+        meta = f.create_group("meta")
+        meta.attrs["sim_toolkit"] = "COMPAS"
+        meta.attrs["git_hash"] = "a8794034bb52b0eb77374158f483c81752069e3e"
+        meta.attrs["created_utc"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        meta.attrs["theta"] = theta
+        meta.attrs["theta_labels"] = theta_labels.astype("S")
+
+        # x
+        dx = f.create_group("features").create_dataset("values", data=x)
+        dx.attrs["labels"] = x_labels
+        dx.attrs["theta_cols"] = np.arange(theta_broadcast.shape[1], dtype=np.int64)
+        dx.attrs["phi_cols"]   = np.arange(theta_broadcast.shape[1], x.shape[1], dtype=np.int64)
+        
+
+        # target
+        dlabels = f.create_group("labels")
+        dt = dlabels.create_dataset("values", data=target)
+        dt.attrs["labels"] = target_labels.astype("S")
+        for col,name in enumerate(target_labels):
+            col_rate = target[:,col].mean()
+            dt.attrs[f"rate_{name.astype(str)}"] = col_rate
+            col_var = np.sum(target[:,col])/target.size**2
+            dt.attrs[f"rate_var_{name.astype(str)}"] = col_var
+
 
 def get_all_files(path_to_files, ending='.csv'):
     """This function finds all file in a directory with a given ending

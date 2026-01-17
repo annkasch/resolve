@@ -242,7 +242,7 @@ simulation_settings: # Settings related to the data
   - Stellar_Type(2)
   - Stellar_Type@ZAMS(2)
   target_labels:
-  - BBH Events
+  - BBH
   target_label_plot: $\hat{\epsilon}$
   target_range:
   - 0

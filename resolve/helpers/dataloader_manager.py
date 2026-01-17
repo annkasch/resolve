@@ -1,4 +1,5 @@
 import numpy as np
+import h5py
 from pathlib import Path
 import collections
 import torch
@@ -30,19 +31,21 @@ class DataLoaderManager:
         self.files = self._get_hdf5_files(Path(self.config_file["path_settings"][f"path_to_files_{self.mode}"]))
         self.dataloader = None
 
-
         # base parameter spec
         sim = config_file["simulation_settings"]
-        
+
         self.parameters = {
-            "phi":    {"key": "phi",    "label_key": "phi_labels",    "selected_labels": sim["phi_labels"],    "size": len(sim["phi_labels"]),      "selected_indices": None},
-            "theta":  {"key": "theta",  "label_key": "theta_headers", "selected_labels": sim["theta_labels"],  "size": len(sim["theta_labels"]),  "selected_indices": None},
-            "target": {"key": "target", "label_key": "target_headers","selected_labels": sim["target_labels"], "size": len(sim["target_labels"]), "selected_indices": None},
+            "phi":    {"key": "features/values",  "selected_labels": sim["phi_labels"],    "size": len(sim["phi_labels"]),    "selected_indices": None},
+            "theta":  {"key": "features/values",  "selected_labels": sim["theta_labels"],  "size": len(sim["theta_labels"]),  "selected_indices": None},
+            "target": {"key": "labels/values",    "selected_labels": sim["target_labels"], "size": len(sim["target_labels"]), "selected_indices": None},
         }
+
         if self.files[0].endswith(('.h5', '.hdf5')):
-            self.parameters["phi"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["phi"])
-            self.parameters["target"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["target"])
-            self.parameters["theta"]["selected_indices"] = utils.find_selected_indices(self.files[0],self.parameters["theta"])
+            with h5py.File(self.files[0], "r") as f:
+                for k in self.parameters:
+                    labels= f[self.parameters[k]["key"]].attrs["labels"].astype(str)
+                    indices = [labels.tolist().index(name) for name in self.parameters[k]["selected_labels"]]
+                    self.parameters[k]["selected_indices"] = indices
 
         self.positive_condition  = self.config_file["simulation_settings"]["signal_condition"]
 

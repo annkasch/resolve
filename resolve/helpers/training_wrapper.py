@@ -657,14 +657,16 @@ class Trainer:
             d_phi=d_phi,
             chunks=200_000,
             compressor=compressor,
-            predictor=None,
+            trainer=self,
         )
 
-        #with torch.inference_mode():
-        #    _ = self._run_epoch(dataloader, optimizer=None, train=False,
-        #                    desc=f"{dataset_name} {epoch+1}",
-        #                    pred_writer=self.writer)
+        with torch.inference_mode():
+            _ = self._run_epoch(dataloader, optimizer=None, train=False,
+                            desc=f"{dataset_name} {epoch+1}",
+                            pred_writer=self.writer)
         self.writer.close()
+        out = self.writer.get_aggregated()
+        return out
 
 
     def warm_up(
@@ -733,7 +735,7 @@ class ZarrPredWriter:
         dtype_pred="f4",
         dtype_x="f4",
         buffer_rows: int | None = None,  # default: 2 * chunk rows
-        predictor: Trainer | None = None,
+        trainer: Trainer | None = None,
     ):
         if compressor == "none":
             comp = None
@@ -742,15 +744,14 @@ class ZarrPredWriter:
         else:
             raise ValueError(f"Unknown compressor={compressor}")
         
-        self.store_path = f"{store_path}/inference"
-
+        self.store_path = store_path
         root = zarr.open(f"{self.store_path}/store.zarr", mode="w", zarr_format=2)
         c0 = int(min(chunks, n_total))
         self._chunk0 = c0
         self._d_theta = int(d_theta)
         self._d_phi = int(d_phi)
 
-        self.predictor = predictor
+        self.trainer = trainer
 
 
         self.target = root.create_dataset("target", shape=(n_total,), chunks=(c0,), dtype=dtype_pred,
@@ -884,72 +885,92 @@ class ZarrPredWriter:
         n, d_phi = phi.shape
         _, d_theta = theta.shape
 
-        print(theta.shape, phi.shape)
-
         with h5py.File(path_out, "w") as f:
-            gdata = f.create_group("data")
-            gmeta = f.create_group("meta")
-
-            # chunking along rows
-            ch_phi = (min(chunk_rows, n), d_phi)
             ch_x   = (min(chunk_rows, n), d_theta + d_phi)
-
-            gdata.create_dataset("phi", data=phi, chunks=ch_phi, compression=compression)
-
-            # x cached: allocate then fill (no big temporary concatenate)
-            x = gdata.create_dataset("x", shape=(n, d_theta + d_phi),
+            dx = f.create_group("features").create_dataset("values", shape=(n, d_theta + d_phi),
                                     dtype=phi.dtype, chunks=ch_x, compression=compression)
-            x[:, :d_theta] = theta
-            x[:, d_theta:] = phi
+            dx[:, :d_theta] = theta
+            dx[:, d_theta:] = phi
+            dx.attrs["theta_cols"] = np.arange(d_theta, dtype=np.int64)
+            dx.attrs["phi_cols"]   = np.arange(d_theta, d_theta+d_phi, dtype=np.int64)
+            if self.trainer is not None:
+                labels = self.trainer.dataset.parameters["theta"]["selected_labels"]+self.trainer.dataset.parameters["phi"]["selected_labels"]
+                dx.attrs["labels"] = np.array(labels, dtype="S")
 
-            pred = np.asarray(pred)
-            gdata.create_dataset("y_predicted", data=pred, chunks=(min(chunk_rows, n),),
-                                    compression=compression)
-            rate_pred = np.sum(pred)/ pred.size
-            rate_pred_var = int(rate_pred*pred.size)/(pred.size**2)
+            glabels = f.create_group("prediction")
+            dpred = glabels.create_dataset("values", data=pred, chunks=(min(chunk_rows, n),),compression=compression)
+            if sigma is not None:
+                dsigma = glabels.create_dataset("sigma", data=sigma, chunks=(min(chunk_rows, n),),compression=compression)
+            if tgt is not None:
+                dsim = f.create_group("labels").create_dataset("values", data=tgt, chunks=(min(chunk_rows, n),),compression=compression)
+            if self.trainer is not None:
+                labels = self.trainer.dataset.parameters["target"]["selected_labels"]
+                dpred.attrs["labels"] = np.array(labels, dtype="S")
+                if tgt is not None:
+                    dsim.attrs["labels"] = np.array(labels, dtype="S")
+
             
+            pred = np.asarray(pred)
+            sigma = np.asarray(sigma) if sigma is not None else None
+            tgt = np.asarray(tgt) if tgt is not None else None
+
+            # Ensure pred is (N, dy)
+            if pred.ndim == 1:
+                pred = pred[:, None]
+                sigma = sigma[:, None] if sigma is not None else None
+                tgt = tgt[:, None] if tgt is not None else None
+                
+            N, dy = pred.shape
+
+            # Column-wise rates
+            rate_pred = pred.mean(axis=0)
             if sigma is not None:
                 sigma = np.asarray(sigma)
-                gdata.create_dataset("y_pred_sigma", data=sigma, chunks=(min(chunk_rows, n),),
-                                    compression=compression)
-                rate_pred_var = np.sum(sigma)/(sigma.size**2) if sigma is not None else 0.
+                if sigma.ndim == 1:
+                    sigma = sigma[:, None]
+
+                rate_pred_var = np.sum(sigma**2, axis=0) / (N**2)
+            else:
+                counts = (rate_pred * N).astype(int)
+                rate_pred_var = counts / (N**2)
+
+            rate_sim = tgt.mean(axis=0)                # shape (dy,)
+            rate_sim_var = (rate_sim * N).astype(int) / (N**2)   # same semantics as your int(sum)/N^2
+            
+            # Get label strings (decode bytes if needed)
+            if self.trainer is not None:
+                labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in dpred.attrs["labels"]]
+            else:
+                labels = [str(i) for i in range(dy)]
+
+            # Write attributes
+
+            for col, name in enumerate(labels):
+                dpred.attrs[f"rate_{name}"] = float(rate_pred[col])
+                dpred.attrs[f"rate_var_{name}"] = float(rate_pred_var[col])if sigma is not None else float(rate_pred_var[col])
+                if tgt is not None:
+                    dsim.attrs[f"rate_{name}"] = float(rate_sim[col])
+                    dsim.attrs[f"rate_var_{name}"] = float(rate_sim_var[col])
 
             # ------------------
             # metadata
             # ------------------
+            gmeta = f.create_group("meta")
             gmeta.attrs.update({
                     "git_hash": get_git_hash(short=True),
+                    "created_utc": time.strftime("%Y-%m-%d %H:%M:%S"),
                     "theta": theta[0],
                     "n_rows": int(n),
                     "d_theta": int(d_theta),
-                    "d_phi": int(d_phi),
-                    "x_definition": "x = concat(theta, phi)",
-                    "rate_pred": rate_pred,
-                    "rate_pred_var": rate_pred_var,
             })
-            if self.predictor is not None:
+            if self.trainer is not None:
                 gmeta.attrs.update({
-                    "model_name": f"RESOVLE_{self.predicter.model.__class__.__name__}",
-                    "phi_label": str(self.predicter.dataset.parameters["phi"]["selected_labels"]),
-                    "theta_label": str(self.predicter.dataset.parameters["theta"]["selected_labels"]),
-                    "target_label": str(self.predicter.dataset.parameters["target"]["selected_labels"]),
-                    "x_label": str(self.predicter.dataset.parameters["theta"]["selected_labels"])+str(predicter.dataset.parameters["phi"]["selected_labels"]),
+                    "model_name": f"RESOLVE_{self.trainer.model.__class__.__name__}",
+                    "config": str(self.trainer.dataset.config_file),
+                    "theta_label": str(self.trainer.dataset.parameters["theta"]["selected_labels"]),
 
                 })
 
-            if tgt is not None:
-                tgt = np.asarray(tgt)
-                gdata.create_dataset("y_target", data=pred, chunks=(min(chunk_rows, n),),
-                                    compression=compression)
-            
-                tgt_rate = np.sum(tgt)/ tgt.size if tgt is not None else 0.
-                rate_tgt_var= np.sum(tgt)/ (tgt.size**2) if tgt is not None else 0.
-                gmeta.attrs.update({
-                    "rate_sim": tgt_rate,
-                    "rate_sim_var": rate_tgt_var,
-
-                })
-    
     def convert_and_sort_zarr_to_h5(self, chunk_rows=500_000):
 
         root = zarr.open(f"{self.store_path}/store.zarr", mode="r")
@@ -961,16 +982,13 @@ class ZarrPredWriter:
         pred    = root["pred"]
         sigma   = root.get("sigma", None)
 
-        file_id_np = file_id[:]
-        files =  np.char.add(np.char.add("file_", file_id_np.astype(str)),".h5") if self.predictor is None else self.predicter.dataset.files
-        for fidx, path in enumerate(files):
+        file_id_np = np.unique(file_id[:])
+        files =  np.char.add("file_", file_id_np.astype(str)) if self.trainer is None else self.trainer.dataset.files
+        
+        pbar = tqdm(files, total=len(files), leave=True, disable=in_slurm)
+        for fidx, path in enumerate(pbar):
             path = Path(path)
-            if str(path).endswith(('.h5', '.hdf5')):
-                filename = Path(path.stem + "_out.h5")
-            else:
-                filename = Path(path.stem + "_out.h5")
-
-            filename = f"{self.store_path}/{filename}"
+            filename = f"{self.store_path}/{Path(path.stem + "_out.h5")}"
 
             out = []
             mask = (file_id[:] == fidx)
@@ -995,8 +1013,55 @@ class ZarrPredWriter:
             )
             self.write_to_h5(filename, out)
 
+    def get_aggregated(self):
+        y_pred, y_std_pred = [], []
+        y_true, y_std_true = [], []
+        theta = []
+
+        files = [p for p in Path(self.store_path).glob("*.h5")]
+        for f in files:
+            with h5py.File(f, "r") as h5:
+                theta_tmp = np.asarray(h5["meta"].attrs["theta"], dtype=float)
+                theta.append(theta_tmp.reshape(1,-1))
+                
+                yp_tmp = np.zeros(0)
+                yp_std_tmp = np.zeros(0)
+                yt_tmp = np.zeros(0) if "labels" in h5 else None
+                yt_std_tmp = np.zeros(0) if "labels" in h5 else None
+
+                attrs = h5["prediction/values"].attrs
+                for k in attrs:
+                        if k.startswith("rate_"):
+                                if k.startswith("rate_var"):
+                                    yp_std_tmp = np.append(yp_std_tmp, np.sqrt(attrs[k]))
+                                else:
+                                        yp_tmp = np.append(yp_tmp, attrs[k])
+                y_pred.append(yp_tmp)
+                y_std_pred.append(yp_std_tmp)
+
+                if yt_tmp is None: continue
+                attrs = h5["labels/values"].attrs
+                for k in attrs:
+                        if k.startswith("rate_"):
+                                if k.startswith("rate_var"): 
+                                    yt_std_tmp = np.append(yt_std_tmp, np.sqrt(attrs[k]))
+                                else:
+                                        yt_tmp = np.append(yt_tmp, attrs[k])
+                y_true.append(yt_tmp)
+                y_std_true.append(yt_std_tmp)
+
+        theta = np.concatenate(theta, axis=0)
+
+        y_pred = np.concatenate(y_pred, axis=0)
+        y_std_pred = np.concatenate(y_std_pred, axis=0)
+        y_true = np.concatenate(y_true, axis=0)
+        y_std_true = np.concatenate(y_std_true, axis=0)
+        
+        return theta, y_pred,y_std_pred, y_true, y_std_true
+
     # needs to be run after the last write in order to flush the remaining chunk
     def close(self):
-        #self.flush()
+        self.flush()
+        print("Writing data to disc")
         self.convert_and_sort_zarr_to_h5()
-        os.system(f"rm {self.store_path}/store.zarr")
+        os.system(f"rm -r {self.store_path}/store.zarr")
