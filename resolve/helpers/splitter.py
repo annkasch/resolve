@@ -1,6 +1,5 @@
 import torch
 from sklearn.model_selection import train_test_split
-import math
 
 class Splitter():
     def __init__(self, mode="global", seed=None) -> None:

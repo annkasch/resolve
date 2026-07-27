@@ -1,10 +1,38 @@
-from .training_wrapper import Trainer
-from .dataloader_manager import DataLoaderManager
-from .losses import AsymmetricFocalWithFPPenalty, bce_with_logits, gaussian_nll, recon_loss_mse, skip_loss, brier, logit_normal_bernoulli_nll, zero_loss
-from .iterable_dataset import InMemoryIterableData
-from .normalizer import Normalizer
-from .model_manager import ModelsManager
-from .model_visualizer import ModelVisualizer
-from .feature_analysis import UMAPAnalyzer
-from .sampler import Sampler
-from .splitter import Splitter
+from importlib import import_module
+
+
+_EXPORTS = {
+    "Trainer": ".training_wrapper",
+    "DataLoaderManager": ".dataloader_manager",
+    "AsymmetricFocalWithFPPenalty": ".losses",
+    "bce_with_logits": ".losses",
+    "gaussian_nll": ".losses",
+    "recon_loss_mse": ".losses",
+    "skip_loss": ".losses",
+    "brier": ".losses",
+    "logit_normal_bernoulli_nll": ".losses",
+    "zero_loss": ".losses",
+    "InMemoryIterableData": ".iterable_dataset",
+    "Normalizer": ".normalizer",
+    "ModelsManager": ".model_manager",
+    "ModelVisualizer": ".model_visualizer",
+    "UMAPAnalyzer": ".feature_analysis",
+    "Sampler": ".sampler",
+    "Splitter": ".splitter",
+}
+
+__all__ = sorted(_EXPORTS)
+
+
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module = import_module(_EXPORTS[name], __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted((*globals(), *__all__))

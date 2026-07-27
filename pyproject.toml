@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "resolve"
 version = "1.0.0"
-description = "A Python package for a rare event surrogate model (RESOVLE)"
+description = "A Python package for rare-event surrogate modeling (RESOLVE)"
 authors = [
     { name = "annkaschue", email = "annkaschue@gmail.com" }
 ]
@@ -19,6 +19,9 @@ dependencies = [
     "pyyaml",
     "ipywidgets",
     "tqdm",
+    "h5py",
+    "pandas",
+    "scikit-learn",
     "imbalanced-learn==0.8.1",
     "termcolor",
     "scipy",
@@ -27,7 +30,8 @@ dependencies = [
     "backports.tarfile",
     "pymc==5.22.0",
     "xgboost",
-    "snap",
+    "zarr",
+    "numcodecs",
     "seaborn"
 ]
 classifiers = [
@@ -36,8 +40,30 @@ classifiers = [
     "Operating System :: OS Independent"
 ]
 
-[tool.setuptools]
-packages = ["resolve"]
+[project.optional-dependencies]
+boosting = [
+    "lightgbm",
+]
+graphs = [
+    "hnswlib",
+    "torch-geometric",
+]
+analysis = [
+    "umap-learn",
+]
+memory-bank = [
+    "faiss-cpu",
+]
+all = [
+    "lightgbm",
+    "hnswlib",
+    "torch-geometric",
+    "umap-learn",
+    "faiss-cpu",
+]
+
+[tool.setuptools.packages.find]
+include = ["resolve*"]
 
 [project.urls]
 Homepage = "https://github.com/annkasch/resolve"

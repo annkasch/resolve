@@ -1,4 +1,3 @@
-import numpy as np
 import h5py
 from pathlib import Path
 import collections
@@ -91,4 +90,3 @@ class DataLoaderManager:
     def close_loader(self):
         self.dataloader.dataset.close()
     
-

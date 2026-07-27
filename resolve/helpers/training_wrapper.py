@@ -1,8 +1,7 @@
 
-from multiprocessing import context
-import os, time
+import os
+import time
 import gc
-from turtle import Turtle
 from typing import Dict, Optional, Tuple, Union
 import numpy as np
 import torch
@@ -47,12 +46,6 @@ except Exception:
     AsymmetricFocalWithFPPenalty = None  # type: ignore
 
 import subprocess
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import average_precision_score, roc_auc_score
-import numpy as np
-import torch
-import torch.nn.functional as F
 
 
 def validate_coverage(sigma1, sigma2, sigma3, y_data):
