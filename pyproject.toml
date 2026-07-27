@@ -54,6 +54,9 @@ analysis = [
 memory-bank = [
     "faiss-cpu",
 ]
+dev = [
+    "pytest>=8",
+]
 all = [
     "lightgbm",
     "hnswlib",
@@ -64,6 +67,10 @@ all = [
 
 [tool.setuptools.packages.find]
 include = ["resolve*"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
 
 [project.urls]
 Homepage = "https://github.com/annkasch/resolve"
