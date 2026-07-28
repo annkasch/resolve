@@ -75,19 +75,3 @@ class Normalizer:
             self._to_numpy(x)
         )
         return self._to_tensor(transformed, x)
-
-    def fit_transform_as_f32(self, **feature_groups):
-        """
-        Fit and transform multiple feature groups (e.g., theta, phi).
-        
-        Example:
-            theta, phi = self.fit_transform(theta=theta, phi=phi)
-        """
-
-        transformed = {}
-        for name, data in feature_groups.items():
-            transformed[name] = self.fit_transform(data, name)
-
-            transformed[name] = transformed[name].float();
-            transformed[name].contiguous()
-        return tuple(transformed.values())

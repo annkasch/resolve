@@ -1,5 +1,6 @@
 import copy
 import csv
+import inspect
 from pathlib import Path
 
 import h5py
@@ -8,9 +9,18 @@ import pytest
 import torch
 
 import resolve.helpers.data_source as data_source
-from resolve.helpers.data_source import DataValidationError
+import resolve.helpers.dataloader_manager as dataloader_manager_module
+import resolve.helpers.iterable_dataset as iterable_dataset_module
+from resolve.helpers import (
+    BatchCollection,
+    ContextSet,
+    DataValidationError,
+    QuerySet,
+)
 from resolve.helpers.dataloader_manager import DataLoaderManager
+from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
+from resolve.helpers.sampler import Sampler
 
 
 FEATURE_LABELS = ("theta_value", "phi_value", "unused")
@@ -161,6 +171,9 @@ def test_loader_emits_expected_values_and_batch_contract(loader_case):
         context_size = batch.context.idx.numel()
         query_size = batch.query.idx.numel()
 
+        assert type(batch) is BatchCollection
+        assert type(batch.context) is ContextSet
+        assert type(batch.query) is QuerySet
         assert batch._fields == ("context", "query", "target_y")
         assert batch.context._fields == (
             "theta",
@@ -745,6 +758,65 @@ def test_dataset_replacement_revalidates_before_loading(tmp_path, monkeypatch):
 
     assert manager.dataset is original_dataset
     assert manager.dataset.data is not None
+
+
+def test_warmup_ratio_schedule_remains_deferred_until_scalar_phase(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=20)
+    _write_csv(data_directory / "part_0.csv", rows)
+    config = _make_config(data_directory, "csv", context_ratio=0.0)
+    config["model_settings"]["train"]["dataset"][
+        "positive_ratio_train"
+    ] = [0.2, 0.1]
+
+    manager = DataLoaderManager(mode="train", config_file=config)
+    manager.set_dataset()
+
+    assert manager.dataset.dataset_config.positive_ratio_train == (0.2, 0.1)
+    assert manager.dataset.data["train"]["target"]["indices"].numel() == len(
+        rows
+    )
+
+
+def test_loader_batch_types_are_canonical_and_dead_apis_are_removed(
+    loader_case,
+):
+    manager, _rows = loader_case
+    batch = next(iter(manager.set_loader(epoch=0, mode="train")))
+
+    assert type(batch) is BatchCollection
+    assert iterable_dataset_module.BatchCollection is BatchCollection
+    assert iterable_dataset_module.ContextSet is ContextSet
+    assert iterable_dataset_module.QuerySet is QuerySet
+    assert not hasattr(dataloader_manager_module, "BatchCollection")
+    assert not hasattr(dataloader_manager_module, "ContextSet")
+    assert not hasattr(dataloader_manager_module, "QuerySet")
+    assert not hasattr(dataloader_manager_module, "running_average")
+
+    assert "make_empty_like" not in InMemoryIterableData.__dict__
+    assert "__getitem__" not in InMemoryIterableData.__dict__
+    assert "set_normalizer" not in InMemoryIterableData.__dict__
+    assert not hasattr(manager.dataset, "theta_to_id")
+    assert not hasattr(manager.dataset, "nepochs")
+
+    assert not hasattr(Sampler, "get_unique_ids")
+    assert not hasattr(Sampler, "to_cell")
+    assert not hasattr(Sampler, "_as_key")
+    assert not hasattr(Sampler, "build_batches_with_posneg_ratio")
+    assert "randperm" not in inspect.signature(Sampler.build_batches).parameters
+    assert "unused_neg_subset" not in inspect.signature(
+        Sampler.sample_positives_negatives
+    ).parameters
+    assert "unused_neg_subset" not in inspect.signature(
+        Sampler.groupaware_pos_sampling
+    ).parameters
+    assert not hasattr(Normalizer, "fit_transform_as_f32")
+
+
+def test_low_level_dataset_requires_validated_data_source():
+    with pytest.raises(TypeError, match="ValidatedDataSource"):
+        InMemoryIterableData(data_source=[])
 
 
 @pytest.mark.parametrize("injection", ("constructor", "set_dataset"))

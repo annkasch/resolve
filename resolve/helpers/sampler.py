@@ -1,7 +1,6 @@
 import torch
-from typing import List, Optional, Sequence, Tuple, Dict, Union, Any
+from typing import Optional, Tuple
 import operator
-from sklearn.model_selection import train_test_split
 import functools
 import numpy as np
 import math
@@ -30,7 +29,7 @@ class Sampler():
             self._seed_for(epoch, stream, group)
         )
 
-    def build_batches(self, idx_array, batch_size: int, randperm=None, epoch=0):
+    def build_batches(self, idx_array, batch_size: int, epoch=0):
         if batch_size <= 0:
             raise ValueError("batch_size must be greater than zero.")
 
@@ -57,26 +56,6 @@ class Sampler():
             batches = torch.split(idx_array, batch_size)
 
         return batches, len(batches), None
-    @staticmethod
-    def get_unique_ids(x):
-        if x.ndim == 1:
-            unique_x = torch.unique(x)
-        else:
-            unique_x = torch.unique(x, dim=0)
-
-        x_to_id = {tuple(t.tolist()): i for i, t in enumerate(unique_x)}
-
-        return x_to_id
-
-    def to_cell(self, x_norm, num_bins):
-
-        t = x_norm.clamp(0.0, 1.0)
-        idx = torch.round(t * (num_bins-1)).long()  # 0..num_bins-1 per dim
-        to_cell = 0
-        for i in range(t.shape[1]):
-            to_cell += idx[:,i] * num_bins**(t.shape[1]-1-(i))
-        return to_cell
-
     def sample_positives_negatives(
         self,
         pos_idx: torch.Tensor,
@@ -85,7 +64,6 @@ class Sampler():
         nP_tot: int = 0,     # 0 => no reuse; >0 => cap per epoch
         max_pos_reuse_per_epoch: int = 0,
         sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
-        unused_neg_subset: torch.Tensor | None = None,
         seed: int | None = None,          # reproducible positive order
         epoch: int = 0,
         group: int = 0,
@@ -145,11 +123,6 @@ class Sampler():
         remaining_negatives = neg_idx[~torch.isin(neg_idx, neg_plan)]
         return pos_pool, neg_plan, remaining_negatives
 
-    @staticmethod
-    def _as_key(t: torch.Tensor) -> Tuple:
-        """Turn a 1D/ND row tensor into a Python hashable key."""
-        return tuple(t.tolist()) if t.ndim > 0 else (t.item(),)
-
     def groupaware_pos_sampling(
         self,
         theta: torch.Tensor,                     # shape [N] or [N, d]
@@ -158,7 +131,6 @@ class Sampler():
         target_pos_frac: float,
         max_pos_reuse_per_epoch: int = 0,
         sticky_frac: float = 0.25,
-        unused_neg_subset: torch.Tensor | None = None,
         seed=None,
         epoch: int = 0,
     ):
@@ -280,110 +252,6 @@ class Sampler():
         epochs = 1 + (n_neg_total / n_neg_per_epoch - 1) / (1.0 - sticky_frac)
         return math.ceil(epochs)+1
 
-    def build_batches_with_posneg_ratio(self,
-        y: torch.Tensor,
-        target_pos_frac: float,
-        batch_size: int,
-        max_pos_reuse_per_epoch: int = 0,     # 0 => no reuse; >0 => cap per epoch
-        sticky_frac: float = 0.25,            # keep 25% of last epoch's negs
-        last_neg_subset: torch.Tensor | None = None,
-        seed: int | None = None,          # reproducible positive order
-    ):
-        assert batch_size >= 2
-        n_total = y.shape[0]
-
-        pos_mask = self.get_positive_indices(y)
-        pos_idx, neg_idx = pos_mask.nonzero(as_tuple=False).view(-1), (~pos_mask).nonzero(as_tuple=False).view(-1)
-
-        nP, nN = pos_idx.numel(), neg_idx.numel()
-
-        if nP == 0 or nN == 0:
-            raise ValueError("Both classes required.")
-        # batches to roughly cover n_total rows
-        M = max(1, math.ceil(n_total /batch_size))
-
-        # epoch positive budget
-        reuse = max(1, max_pos_reuse_per_epoch)
-        Pmax = nP * reuse
-        Pneed = int(round((nN / 1.-target_pos_frac) * target_pos_frac))
-
-        Ptot = min(Pneed, Pmax)
-        if Ptot == 0:
-            Nneed = nN
-        else:   
-            Nneed = int(round((Ptot / target_pos_frac) * (1.-target_pos_frac)))
-        n_total = Ptot + Nneed
-        M = max(1, math.ceil(n_total / batch_size))
-
-        # per-batch positive counts (balanced rounding, at least 0, at most B-1)
-        avgk = Ptot / M
-        kfloor = int(math.floor(avgk))
-        rem = Ptot - kfloor * M
-        k_list = [min(batch_size-1, max(0, kfloor + (1 if b < rem else 0))) for b in range(M)]
-
-        # positives: build pool with reuse cap, then shuffle with seed
-        pos_pool = (pos_idx.repeat_interleave(reuse) if max_pos_reuse_per_epoch > 0 else pos_idx)
-        pos_pool = pos_pool[:Ptot]
-        seed = seed if seed is not None else self.seed
-        if pos_pool.numel() > 1:
-            g = torch.Generator().manual_seed(seed)
-            perm = torch.randperm(pos_pool.numel(), generator=g)
-            pos_pool = pos_pool[perm]
-
-        # chunk positives
-        pos_chunks, pptr = [], 0
-        for k in k_list:
-            pos_chunks.append(pos_pool[pptr:pptr+k]); pptr += k
-
-        # negatives: sticky + seeded shuffle (no replacement in plan)
-        Nneed = sum(batch_size - k for k in k_list)
-        sticky = (last_neg_subset[: int(sticky_frac * Nneed)]
-                if (last_neg_subset is not None and Nneed > 0) else torch.empty(0, dtype=torch.long))
-
-        # choose remaining negatives by seeded shuffle excluding sticky
-        if Nneed > sticky.numel():
-            take_new = Nneed - sticky.numel()
-
-            if sticky.numel() == 0:
-                base = neg_idx
-            else:
-                # Exclude sticky *by value*, not by position
-                mask = ~torch.isin(neg_idx, sticky)
-                base = neg_idx[mask]
-
-            if base.numel() > 1:
-                g = torch.Generator().manual_seed(seed+1)
-                perm = torch.randperm(base.numel(), generator=g)
-                base = base[perm]
-
-            new_block = base[:take_new]
-            neg_plan = torch.cat((sticky, new_block))
-        else:
-            neg_plan = sticky
-
-        # chunk negatives
-        neg_chunks, nptr = [], 0
-        for k in k_list:
-            need = batch_size - k
-            neg_chunks.append(neg_plan[nptr:nptr+need]); nptr += need
-
-        # assemble batches
-        g = torch.Generator()
-        g.manual_seed(seed+2)
-
-        batches = []
-        for b in range(M):
-            batch = torch.cat((pos_chunks[b], neg_chunks[b]))
-            perm = torch.randperm(batch.numel(), generator=g)
-            batches.append(batch[perm])
-
-        nepochs = self.epochs_until_full_coverage(nN, Nneed, sticky_frac)
-
-        state = neg_plan
-        meta  = {"batch_size": batch_size, "num_batches": M,
-                "pos_frac": (Ptot / max(1, (batch_size * M))), "num_epochs": nepochs}
-        return batches, state, meta, perm
-
     def positive_function(self, positive_condition):
         positive_fn = np.full(len(positive_condition), None) 
         for i, cond_str in enumerate(positive_condition):
@@ -421,7 +289,7 @@ class Sampler():
                 value=value,
             )
 
-    def get_positive_indices(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_positive_indices(self, y: torch.Tensor) -> torch.Tensor:
             y2 = y if y.ndim > 1 else y.unsqueeze(1)
 
             if callable(self.positive_fn):

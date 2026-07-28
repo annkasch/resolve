@@ -3,6 +3,8 @@ from importlib import import_module
 
 _EXPORTS = {
     "Trainer": ".training_wrapper",
+    "BatchCollection": ".batch_types",
+    "ContextSet": ".batch_types",
     "DataLoaderManager": ".dataloader_manager",
     "DataValidationError": ".data_source",
     "AsymmetricFocalWithFPPenalty": ".losses",
@@ -15,6 +17,7 @@ _EXPORTS = {
     "zero_loss": ".losses",
     "InMemoryIterableData": ".iterable_dataset",
     "Normalizer": ".normalizer",
+    "QuerySet": ".batch_types",
     "ModelsManager": ".model_manager",
     "ModelVisualizer": ".model_visualizer",
     "UMAPAnalyzer": ".feature_analysis",

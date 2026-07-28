@@ -1,20 +1,12 @@
 import math
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
-from typing import List, Optional, Tuple
-import collections
+from typing import Optional, Sequence, Tuple
+from resolve.helpers.batch_types import BatchCollection, ContextSet, QuerySet
 from resolve.helpers.data_source import DatasetSettings, ValidatedDataSource
 from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
-
-ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y", "idx", "file_indices"))
-QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi", "idx", "file_indices"))
-
-BatchCollection = collections.namedtuple(
-    "BatchCollection",
-    ("context", "query", "target_y")
-)
 
 class InMemoryIterableData(IterableDataset):
     _MODE_TO_CODE = {
@@ -28,7 +20,7 @@ class InMemoryIterableData(IterableDataset):
     }
 
     def __init__(self, data_source: ValidatedDataSource, batch_size: int = 1000,
-                 dataset_config: DatasetSettings = None, positive_condition: Optional[List]=None,
+                 dataset_config: DatasetSettings = None, positive_condition: Optional[Sequence[str]]=None,
                  normalizer: Optional[Normalizer] = None, mode: Optional[str] = "train") -> None:
         super().__init__()
 
@@ -47,7 +39,6 @@ class InMemoryIterableData(IterableDataset):
         self.mode = mode
         self._normalizer = self._prepare_normalizer(normalizer)
         self.sampler = Sampler(positive_condition, shuffle=self.shuffle, seed=self.seed)
-        self.nepochs = 1
         self._base_indices = {}
         self._built_epochs = {}
         self._iteration_mode = torch.tensor(
@@ -61,8 +52,6 @@ class InMemoryIterableData(IterableDataset):
 
         # load all data into memory
         theta, phi, y, fidx = self.data_source.load()
-        
-        self.theta_to_id = self.sampler.get_unique_ids(theta)
 
         self.data = self._set_data(theta, phi, y, fidx)
         self.build_batches(0)
@@ -118,9 +107,6 @@ class InMemoryIterableData(IterableDataset):
             normalizer.validate_fitted()
         return normalizer
         
-    def make_empty_like(self,*tensors):
-                return [torch.empty_like(t) for t in tensors]
-    
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
         self.context_ratio = self.dataset_config.context_ratio
         if not 0.0 <= self.context_ratio < 1.0:
@@ -259,7 +245,7 @@ class InMemoryIterableData(IterableDataset):
         positive_ratio = self.dataset_config.positive_ratio_train
         if (
             mode != "train"
-            or isinstance(positive_ratio, list)
+            or isinstance(positive_ratio, (list, tuple))
             or positive_ratio is None
         ):
             return indices, None
@@ -397,12 +383,6 @@ class InMemoryIterableData(IterableDataset):
         self.set_mode(mode)
         self._iteration_epoch.fill_(int(epoch))
     
-    def set_normalizer(self, method_or_obj):
-        if isinstance(method_or_obj, Normalizer):
-            self._normalizer = method_or_obj
-        else:
-            self._normalizer = Normalizer(method_or_obj)
-
     def _compute_worker_slice(self, n: int) -> Tuple[int, int]:
         info = get_worker_info()
         if info is None: return 0, n
@@ -449,34 +429,6 @@ class InMemoryIterableData(IterableDataset):
             )
             yield batch
 
-    def __getitem__(self, index):
-        """
-        Return the i-th yielded batch.
-        """
-        idx_tgt = self.data[self.mode]["target"]["batches"][index]
-        b_phi_tgt = self.data["data"]["phi"].index_select(0, idx_tgt).unsqueeze(0)
-        b_theta_tgt = self.data["data"]["theta"].index_select(0, idx_tgt).unsqueeze(0) if self.data[self.mode]["target"].get("theta",None) is not None else None
-        b_y_tgt     = self.data["data"]["y"].index_select(0, idx_tgt).unsqueeze(0)     if self.data[self.mode]["target"].get("y",None)     is not None else None
-        b_file_idx_tgt = self.data["data"]["file_indices"].index_select(0, idx_tgt).unsqueeze(0)
-
-        if self.context_ratio > 0.:
-            idx_ctx = self.data[self.mode]["context"]["batches"][index]
-            b_phi_ctx = self.data["data"]["phi"].index_select(0, idx_ctx).unsqueeze(0)
-            b_theta_ctx = self.data["data"]["theta"].index_select(0, idx_ctx).unsqueeze(0) if self.data[self.mode]["context"].get("theta",None) is not None else None
-            b_y_ctx     = self.data["data"]["y"].index_select(0, idx_ctx).unsqueeze(0)     if self.data[self.mode]["context"].get("y",None)     is not None else None
-            b_file_idx_ctx = self.data["data"]["file_indices"].index_select(0, idx_ctx).unsqueeze(0)
-        else:
-            b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx, b_file_idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0), torch.empty(0) 
-
-
-        batch = BatchCollection(
-            context=ContextSet(theta=b_theta_ctx.contiguous(), phi=b_phi_ctx.contiguous(), y=b_y_ctx.contiguous(), idx=idx_ctx, file_indices=b_file_idx_ctx),
-            query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt, file_indices=b_file_idx_tgt),
-            target_y=b_y_tgt.contiguous(),
-        )
-
-        yield batch
- 
     def close(self):
         """Delete all tensors and arrays from memory to free up resources."""
         # Clear main data dictionary
@@ -485,11 +437,6 @@ class InMemoryIterableData(IterableDataset):
                 for key in self.data[mode]:
                     self.data[mode][key] = None
             self.data = None
-        
-        # Clear unused data
-        for attr in ['_theta_unused', '_phi_unused', '_y_unused', '_fidx_unused']:
-            if hasattr(self, attr):
-                setattr(self, attr, None)
         
         # Clear normalizer
         if hasattr(self, '_normalizer'):

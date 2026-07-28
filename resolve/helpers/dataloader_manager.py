@@ -1,23 +1,7 @@
-import collections
-
 from torch.utils.data import DataLoader
 from resolve.helpers.data_source import preflight_data_loader
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
-
-
-ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
-QuerySet = collections.namedtuple("QuerySet", ("theta", "phi"))
-BatchCollection = collections.namedtuple(
-    "BatchCollection",
-    ("context", "query", "target_y"),
-)
-
-
-def running_average(batch_sum, batch_count, mean, I):
-    mean = mean + (batch_sum - batch_count * mean) / (I + batch_count)
-    I += batch_count
-    return mean
 
 
 class DataLoaderManager:
