@@ -1,6 +1,5 @@
 from pathlib import Path
 import collections
-import torch
 from torch.utils.data import DataLoader
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
@@ -111,6 +110,7 @@ class DataLoaderManager:
                 "set_dataset(normalizer=...)."
             )
 
+        self._dispose_loader(close_dataset=True)
         self.dataset = InMemoryIterableData(
                 files=self.files,
                 batch_size=self.config_file["model_settings"]["train"]["batch_size"],
@@ -124,29 +124,74 @@ class DataLoaderManager:
             )
         self._normalizer = self.dataset._normalizer
 
+    def _loader_options(self):
+        settings = self.config_file["model_settings"]["dataloader"]
+        num_workers = int(settings["dataloader_number_of_workers"])
+        if num_workers < 0:
+            raise ValueError(
+                "dataloader_number_of_workers must be non-negative."
+            )
+
+        options = {
+            "batch_size": None,
+            "num_workers": num_workers,
+            "pin_memory": bool(
+                settings.get("dataloader_pin_memory", False)
+            ),
+            "persistent_workers": (
+                bool(
+                    settings.get(
+                        "dataloader_persistent_workers",
+                        False,
+                    )
+                )
+                if num_workers > 0
+                else False
+            ),
+        }
+        if num_workers > 0:
+            options["prefetch_factor"] = settings.get(
+                "dataloader_prefetch_factor",
+                None,
+            )
+        return options
+
+    def _dispose_loader(self, close_dataset=False):
+        loader = self.dataloader
+        dataset = self.dataset
+        if loader is not None:
+            iterator = getattr(loader, "_iterator", None)
+            if iterator is not None:
+                iterator._shutdown_workers()
+                loader._iterator = None
+            dataset = loader.dataset
+            self.dataloader = None
+
+        if close_dataset and dataset is not None:
+            dataset.close()
+            if self.dataset is dataset:
+                self.dataset = None
+
     def set_loader(self, epoch, mode="train", shuffle=True):
         if self.dataset is None:
             self.set_dataset()
 
-        self.dataset.set_mode(mode)
         plan_epoch = (
             epoch
             if shuffle
             else self.dataset._built_epochs.get(mode, 0)
         )
+        self.dataset.set_iteration(mode, plan_epoch)
         self.dataset.build_batches(plan_epoch, mode=mode)
-        
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_size=None,  # required for IterableDataset
-            num_workers=self.config_file["model_settings"]["dataloader"]["dataloader_number_of_workers"],
-            prefetch_factor=self.config_file["model_settings"]["dataloader"]["dataloader_prefetch_factor"],
-            pin_memory=torch.cuda.is_available(),
-            persistent_workers=self.config_file["model_settings"]["dataloader"]["dataloader_persistent_workers"]
-        )
+
+        if self.dataloader is None:
+            self.dataloader = DataLoader(
+                self.dataset,
+                **self._loader_options(),
+            )
 
         return self.dataloader
     
     def close_loader(self):
-        self.dataloader.dataset.close()
+        self._dispose_loader(close_dataset=True)
     

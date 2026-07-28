@@ -1,3 +1,4 @@
+import copy
 import csv
 from pathlib import Path
 
@@ -862,3 +863,194 @@ def test_positive_sampling_plan_is_resume_deterministic(tmp_path):
     resumed = DataLoaderManager(mode="train", config_file=config)
     assert _index_plan(resumed, 4) == expected
     assert _index_plan(resumed, 3) != expected
+
+
+def test_zero_worker_loader_normalizes_multiprocessing_options(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    dataloader_config = config["model_settings"]["dataloader"]
+    dataloader_config["dataloader_prefetch_factor"] = 4
+    dataloader_config["dataloader_persistent_workers"] = True
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    loader = manager.set_loader(epoch=0, mode="train")
+
+    assert loader.num_workers == 0
+    assert loader.prefetch_factor is None
+    assert loader.persistent_workers is False
+    assert list(loader)
+
+
+@pytest.mark.parametrize(
+    ("configured_pin_memory", "cuda_available"),
+    ((False, True), (True, False)),
+)
+def test_loader_honors_configured_pin_memory(
+    tmp_path,
+    monkeypatch,
+    configured_pin_memory,
+    cuda_available,
+):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    config["model_settings"]["dataloader"][
+        "dataloader_pin_memory"
+    ] = configured_pin_memory
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    loader = manager.set_loader(epoch=0, mode="train")
+
+    assert loader.pin_memory is configured_pin_memory
+
+
+def test_loader_instance_is_reused_across_epochs_and_modes(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=30))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.25,
+    )
+    dataset_config = config["model_settings"]["train"]["dataset"]
+    dataset_config["shuffle_dataset"] = "global"
+    dataset_config["val_ratio"] = 0.2
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    loader = manager.set_loader(epoch=0, mode="train")
+    epoch_zero = list(loader)
+    epoch_three_loader = manager.set_loader(epoch=3, mode="train")
+    epoch_three = list(epoch_three_loader)
+    validation_loader = manager.set_loader(epoch=3, mode="validate")
+    validation = list(validation_loader)
+
+    assert epoch_three_loader is loader
+    assert validation_loader is loader
+    assert [
+        batch.query.idx.tolist() for batch in epoch_zero
+    ] != [
+        batch.query.idx.tolist() for batch in epoch_three
+    ]
+    assert validation
+
+
+def test_shuffle_false_reuses_current_training_plan(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=24))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.25,
+    )
+    config["model_settings"]["train"]["dataset"]["shuffle_dataset"] = "global"
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    expected = _index_plan(manager, 2)
+    actual = [
+        (
+            batch.context.idx.tolist(),
+            batch.query.idx.tolist(),
+        )
+        for batch in manager.set_loader(
+            epoch=9,
+            mode="train",
+            shuffle=False,
+        )
+    ]
+
+    assert actual == expected
+
+
+def test_persistent_worker_observes_epoch_and_mode_updates(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=40))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.25,
+    )
+    dataset_config = config["model_settings"]["train"]["dataset"]
+    dataset_config["shuffle_dataset"] = "global"
+    dataset_config["val_ratio"] = 0.2
+    dataloader_config = config["model_settings"]["dataloader"]
+    dataloader_config["dataloader_number_of_workers"] = 1
+    dataloader_config["dataloader_prefetch_factor"] = 2
+    dataloader_config["dataloader_persistent_workers"] = True
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    loader = manager.set_loader(epoch=0, mode="train")
+    epoch_zero = [
+        batch.query.idx.tolist() for batch in loader
+    ]
+    workers = tuple(loader._iterator._workers)
+    worker_pids = [worker.pid for worker in workers]
+
+    same_loader = manager.set_loader(epoch=4, mode="train")
+    epoch_four = [
+        batch.query.idx.tolist() for batch in same_loader
+    ]
+    validation = [
+        batch.query.idx.tolist()
+        for batch in manager.set_loader(epoch=4, mode="validate")
+    ]
+
+    direct_config = copy.deepcopy(config)
+    direct_dataloader = direct_config["model_settings"]["dataloader"]
+    direct_dataloader["dataloader_number_of_workers"] = 0
+    direct_dataloader["dataloader_persistent_workers"] = False
+    direct = DataLoaderManager(mode="train", config_file=direct_config)
+    expected_epoch_four = [
+        batch.query.idx.tolist()
+        for batch in direct.set_loader(epoch=4, mode="train")
+    ]
+    expected_validation = [
+        batch.query.idx.tolist()
+        for batch in direct.set_loader(epoch=4, mode="validate")
+    ]
+
+    assert same_loader is loader
+    assert [worker.pid for worker in loader._iterator._workers] == worker_pids
+    assert epoch_four != epoch_zero
+    assert epoch_four == expected_epoch_four
+    assert validation == expected_validation
+
+    manager.close_loader()
+    assert manager.dataloader is None
+    assert manager.dataset is None
+    assert all(not worker.is_alive() for worker in workers)
+    manager.close_loader()
+
+
+def test_replacing_dataset_invalidates_cached_loader(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    manager = DataLoaderManager(mode="train", config_file=config)
+    old_loader = manager.set_loader(epoch=0, mode="train")
+    old_dataset = manager.dataset
+
+    manager.set_dataset()
+
+    assert manager.dataloader is None
+    assert manager.dataset is not old_dataset
+    assert old_loader.dataset.data is None

@@ -20,6 +20,16 @@ BatchCollection = collections.namedtuple(
 )
 
 class InMemoryIterableData(IterableDataset):
+    _MODE_TO_CODE = {
+        "train": 0,
+        "validate": 1,
+        "test": 2,
+        "inference": 3,
+    }
+    _CODE_TO_MODE = {
+        code: mode for mode, code in _MODE_TO_CODE.items()
+    }
+
     def __init__(self, files: Sequence[str], batch_size: int = 1000,
                  parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
                  normalizer: Optional[Normalizer] = None, mode: Optional[str] = "train") -> None:
@@ -35,6 +45,14 @@ class InMemoryIterableData(IterableDataset):
         self.nepochs = 1
         self._base_indices = {}
         self._built_epochs = {}
+        self._iteration_mode = torch.tensor(
+            self._MODE_TO_CODE[self.mode],
+            dtype=torch.int64,
+        ).share_memory_()
+        self._iteration_epoch = torch.tensor(
+            0,
+            dtype=torch.int64,
+        ).share_memory_()
 
         # load all data into memory
         theta, phi, y, fidx = self._load_data_to_mem(self.files, self.parameter_config)
@@ -565,7 +583,18 @@ class InMemoryIterableData(IterableDataset):
         return Theta, Phi, y, fidx
 
     def set_mode(self, mode):
+        if mode not in self._MODE_TO_CODE:
+            raise ValueError(
+                f"Unsupported dataset mode {mode!r}. Expected one of "
+                f"{sorted(self._MODE_TO_CODE)}."
+            )
         self.mode = mode
+
+        self._iteration_mode.fill_(self._MODE_TO_CODE[mode])
+
+    def set_iteration(self, mode, epoch):
+        self.set_mode(mode)
+        self._iteration_epoch.fill_(int(epoch))
     
     def set_normalizer(self, method_or_obj):
         if isinstance(method_or_obj, Normalizer):
@@ -580,8 +609,12 @@ class InMemoryIterableData(IterableDataset):
 
     def __iter__(self):
         """Iterator for train/validate/test. Uses precomputed batch-index plans if present."""
+        mode = self._CODE_TO_MODE[int(self._iteration_mode.item())]
+        epoch = int(self._iteration_epoch.item())
+        self.mode = mode
+        self.build_batches(epoch, mode=mode)
 
-        batches_tgt = self.data[self.mode]["target"].get("batches", None)
+        batches_tgt = self.data[mode]["target"].get("batches", None)
         total_batches = len(batches_tgt)
         b_start, b_end = self._compute_worker_slice(total_batches)  # reuse same helper; it just slices a range
         if b_start >= b_end:
@@ -592,14 +625,14 @@ class InMemoryIterableData(IterableDataset):
         file_indices = self.data["data"]["file_indices"]
 
         for b in range(b_start, b_end):
-            idx_tgt = self.data[self.mode]["target"]["batches"][b]
+            idx_tgt = self.data[mode]["target"]["batches"][b]
             b_phi_tgt = phi.index_select(0, idx_tgt).unsqueeze(0)
             b_theta_tgt = theta.index_select(0, idx_tgt).unsqueeze(0)
             b_y_tgt     = y.index_select(0, idx_tgt).unsqueeze(0)
             b_file_idx_tgt = file_indices.index_select(0, idx_tgt).unsqueeze(0)
 
             if self.context_ratio > 0.:
-                idx_ctx = self.data[self.mode]["context"]["batches"][b]
+                idx_ctx = self.data[mode]["context"]["batches"][b]
                 b_phi_ctx = phi.index_select(0, idx_ctx).unsqueeze(0)
                 b_theta_ctx = theta.index_select(0, idx_ctx).unsqueeze(0)
                 b_y_ctx     = y.index_select(0, idx_ctx).unsqueeze(0)
