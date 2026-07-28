@@ -1,5 +1,8 @@
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.exceptions import NotFittedError
+from sklearn.utils.validation import check_is_fitted
 import torch
+
 
 class Normalizer:
     def __init__(self, method: str = None):
@@ -28,6 +31,25 @@ class Normalizer:
         if feature_grp not in self.scalers:
             self.scalers[feature_grp] = self._make_scaler()
         return self.scalers[feature_grp]
+
+    def validate_fitted(self, feature_groups=("theta", "phi")):
+        """Raise a clear error unless every requested scaler has been fitted."""
+        missing = []
+        for feature_group in feature_groups:
+            scaler = self.scalers.get(feature_group)
+            if scaler is None:
+                missing.append(feature_group)
+                continue
+            try:
+                check_is_fitted(scaler)
+            except NotFittedError:
+                missing.append(feature_group)
+
+        if missing:
+            raise ValueError(
+                "Normalizer requires fitted scaler state for feature groups: "
+                f"{missing}."
+            )
 
     def fit(self, x: torch.Tensor, feature_grp: str):
         self._get_scaler(feature_grp).fit(x)

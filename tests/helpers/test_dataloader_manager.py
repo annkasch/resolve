@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from resolve.helpers.dataloader_manager import DataLoaderManager
+from resolve.helpers.normalizer import Normalizer
 
 
 FEATURE_LABELS = ("theta_value", "phi_value", "unused")
@@ -68,6 +69,8 @@ def _make_config(data_directory: Path, file_format: str, context_ratio=0.5):
     return {
         "path_settings": {
             "path_to_files_train": str(data_directory),
+            "path_to_files_test": str(data_directory),
+            "path_to_files_inference": str(data_directory),
         },
         "simulation_settings": {
             "file_format": file_format,
@@ -503,6 +506,194 @@ def test_hdf5_rejects_inconsistent_row_counts(tmp_path):
 
     with pytest.raises(ValueError, match="Inconsistent row counts"):
         manager.set_dataset()
+
+
+@pytest.mark.parametrize("injection", ("constructor", "set_dataset"))
+def test_external_loader_uses_fitted_training_normalizer(tmp_path, injection):
+    train_directory = tmp_path / "train"
+    test_directory = tmp_path / "test"
+    train_directory.mkdir()
+    test_directory.mkdir()
+    train_rows = _make_rows(0)
+    test_rows = _make_rows(6)
+    _write_csv(train_directory / "part_0.csv", train_rows)
+    _write_csv(test_directory / "part_0.csv", test_rows)
+
+    config = _make_config(
+        train_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    config["path_settings"]["path_to_files_test"] = str(test_directory)
+    config["model_settings"]["train"]["dataset"][
+        "use_feature_normalization"
+    ] = "zscore"
+
+    train_manager = DataLoaderManager(mode="train", config_file=config)
+    train_manager.set_dataset()
+    training_normalizer = train_manager.normalizer
+
+    if injection == "constructor":
+        test_manager = DataLoaderManager(
+            mode="test",
+            config_file=config,
+            normalizer=training_normalizer,
+        )
+    else:
+        test_manager = DataLoaderManager(mode="test", config_file=config)
+        test_manager.set_dataset(normalizer=training_normalizer)
+
+    batches = list(test_manager.set_loader(epoch=0, mode="test"))
+
+    raw_theta = np.asarray(
+        [[row["theta_value"]] for row in test_rows],
+        dtype=np.float32,
+    )
+    raw_phi = np.asarray(
+        [[row["phi_value"]] for row in test_rows],
+        dtype=np.float32,
+    )
+    theta_scaler = training_normalizer._get_scaler("theta")
+    phi_scaler = training_normalizer._get_scaler("phi")
+    expected_theta = torch.from_numpy(theta_scaler.transform(raw_theta)).float()
+    expected_phi = torch.from_numpy(phi_scaler.transform(raw_phi)).float()
+
+    assert batches
+    assert test_manager.normalizer is training_normalizer
+    torch.testing.assert_close(
+        test_manager.dataset.data["data"]["theta"],
+        expected_theta,
+    )
+    torch.testing.assert_close(
+        test_manager.dataset.data["data"]["phi"],
+        expected_phi,
+    )
+
+
+@pytest.mark.parametrize("mode", ("test", "inference"))
+def test_external_loader_requires_normalizer_when_enabled(tmp_path, mode):
+    data_directory = tmp_path / mode
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    config["model_settings"]["train"]["dataset"][
+        "use_feature_normalization"
+    ] = "zscore"
+    manager = DataLoaderManager(mode=mode, config_file=config)
+
+    with pytest.raises(ValueError, match="requires a fitted training normalizer"):
+        manager.set_loader(epoch=0, mode=mode)
+
+    assert manager.dataset is None
+
+
+def test_external_loader_rejects_unfitted_normalizer(tmp_path):
+    data_directory = tmp_path / "test"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    config["model_settings"]["train"]["dataset"][
+        "use_feature_normalization"
+    ] = "zscore"
+
+    with pytest.raises(ValueError, match="requires fitted scaler state"):
+        DataLoaderManager(
+            mode="test",
+            config_file=config,
+            normalizer=Normalizer("zscore"),
+        )
+
+
+def test_external_loader_rejects_mismatched_normalizer(tmp_path):
+    data_directory = tmp_path / "data"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    train_config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    train_config["model_settings"]["train"]["dataset"][
+        "use_feature_normalization"
+    ] = "zscore"
+    train_manager = DataLoaderManager(mode="train", config_file=train_config)
+    train_manager.set_dataset()
+
+    test_config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    test_config["model_settings"]["train"]["dataset"][
+        "use_feature_normalization"
+    ] = "minmax"
+
+    with pytest.raises(ValueError, match="does not match configured method"):
+        DataLoaderManager(
+            mode="test",
+            config_file=test_config,
+            normalizer=train_manager.normalizer,
+        )
+
+
+def test_training_loader_rejects_injected_normalizer(tmp_path):
+    data_directory = tmp_path / "train"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+
+    with pytest.raises(ValueError, match="create and fit their own normalizer"):
+        DataLoaderManager(
+            mode="train",
+            config_file=config,
+            normalizer=Normalizer(),
+        )
+
+
+def test_external_loader_without_normalization_initializes_automatically(tmp_path):
+    data_directory = tmp_path / "test"
+    data_directory.mkdir()
+    rows = _make_rows(0)
+    _write_csv(data_directory / "part_0.csv", rows)
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    manager = DataLoaderManager(mode="test", config_file=config)
+
+    batches = list(manager.set_loader(epoch=0, mode="test"))
+
+    expected_theta = torch.tensor(
+        [[row["theta_value"]] for row in rows],
+        dtype=torch.float32,
+    )
+    expected_phi = torch.tensor(
+        [[row["phi_value"]] for row in rows],
+        dtype=torch.float32,
+    )
+    assert batches
+    assert manager.normalizer is not None
+    torch.testing.assert_close(
+        manager.dataset.data["data"]["theta"],
+        expected_theta,
+    )
+    torch.testing.assert_close(
+        manager.dataset.data["data"]["phi"],
+        expected_phi,
+    )
 
 
 @pytest.mark.xfail(

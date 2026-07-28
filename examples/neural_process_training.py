@@ -48,11 +48,11 @@ def main(path_to_settings):
     dataset_train.set_dataset()
 
     if config_file["model_settings"]["train"]["dataset"]["use_feature_normalization"] == "zscore":
-        print("theta mean: ", dataset_train.dataset._normalizer._get_scaler("theta").mean_)
-        print("phi mean: ", dataset_train.dataset._normalizer._get_scaler("phi").mean_)
+        print("theta mean: ", dataset_train.normalizer._get_scaler("theta").mean_)
+        print("phi mean: ", dataset_train.normalizer._get_scaler("phi").mean_)
     elif config_file["model_settings"]["train"]["dataset"]["use_feature_normalization"] == "minmax":
-        print("theta mean: ", dataset_train.dataset._normalizer._get_scaler("theta").data_range_)
-        print("phi mean: ", dataset_train.dataset._normalizer._get_scaler("phi").data_range_)
+        print("theta mean: ", dataset_train.normalizer._get_scaler("theta").data_range_)
+        print("phi mean: ", dataset_train.normalizer._get_scaler("phi").data_range_)
 
     os.system(f'mkdir -p {path_out}/model_{version}_tensorboard_logs')
     os.system(f'rm {path_out}/model_{version}_tensorboard_logs/events*')
@@ -117,13 +117,12 @@ def main(path_to_settings):
     if config_file["model_settings"]["train"]["dataset"].get("test_ratio",0.) > 0.: _ = trainer.evaluate(writer=writer, dataset_name="test", fit_temperature=False)
 
     model.save(model.state_dict(), f'{path_out}/model_{version}_')
-    normalizer_train = dataset_train.dataset._normalizer
-
     # load data:
     dataset_test = DataLoaderManager(mode = "test", 
-                                    config_file=config_file
+                                    config_file=config_file,
+                                    normalizer=dataset_train.normalizer,
                                     )
-    dataset_test.set_dataset(normalizer=normalizer_train)
+    dataset_test.set_dataset()
     if model._get_name() == 'TreeConditionedCNP' or model._get_name() == 'LGBMResidualFT':
         model.tree.enable_leaf_cache(dataset_test.dataset.num_samples())
 

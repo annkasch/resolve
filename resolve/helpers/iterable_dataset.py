@@ -22,7 +22,7 @@ BatchCollection = collections.namedtuple(
 class InMemoryIterableData(IterableDataset):
     def __init__(self, files: Sequence[str], batch_size: int = 1000,
                  parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
-                 normalizer: Optional[Normalizer]=Normalizer(), mode: Optional[str] = "train") -> None:
+                 normalizer: Optional[Normalizer] = None, mode: Optional[str] = "train") -> None:
         super().__init__()
         
         self.files, self.shuffle, self.seed = list(files), dataset_config["shuffle_dataset"], dataset_config["seed"]
@@ -30,7 +30,7 @@ class InMemoryIterableData(IterableDataset):
         self.batch_size = batch_size
         
         self.mode = mode
-        self._normalizer = normalizer
+        self._normalizer = self._prepare_normalizer(normalizer)
         self.sampler = Sampler(positive_condition, shuffle=self.shuffle, seed=self.seed)
         self.sampler._epoch_counter = -1   
         self.nepochs = 1     
@@ -42,6 +42,60 @@ class InMemoryIterableData(IterableDataset):
 
         self.data = self._set_data(theta, phi, y, fidx)
         self.build_batches(0)
+
+    @staticmethod
+    def _canonical_normalization_method(method):
+        return None if method in (None, "none") else method
+
+    def _prepare_normalizer(
+        self,
+        normalizer: Optional[Normalizer],
+    ) -> Optional[Normalizer]:
+        configured_method = self.dataset_config.get(
+            "use_feature_normalization",
+            None,
+        )
+        canonical_method = self._canonical_normalization_method(
+            configured_method
+        )
+        if canonical_method not in (None, "zscore", "minmax"):
+            raise ValueError(
+                "Unsupported feature normalization method "
+                f"{configured_method!r}; expected 'none', 'zscore', or "
+                "'minmax'."
+            )
+
+        if self.mode == "train":
+            if normalizer is not None:
+                raise ValueError(
+                    "Training datasets create and fit their own normalizer; "
+                    "do not inject one."
+                )
+            return None
+
+        if normalizer is None:
+            if canonical_method is not None:
+                raise ValueError(
+                    f"{self.mode.capitalize()} data using "
+                    f"{configured_method!r} normalization requires a fitted "
+                    "training normalizer."
+                )
+            return Normalizer(configured_method)
+
+        if not isinstance(normalizer, Normalizer):
+            raise TypeError("normalizer must be a Normalizer instance.")
+
+        normalizer_method = self._canonical_normalization_method(
+            normalizer.method
+        )
+        if normalizer_method != canonical_method:
+            raise ValueError(
+                f"Injected normalizer method {normalizer.method!r} does not "
+                f"match configured method {configured_method!r}."
+            )
+        if canonical_method is not None:
+            normalizer.validate_fitted()
+        return normalizer
         
     def make_empty_like(self,*tensors):
                 return [torch.empty_like(t) for t in tensors]
@@ -130,6 +184,11 @@ class InMemoryIterableData(IterableDataset):
             data["train"].update({"target":{"indices": idx, "batch_size": batch_size_tgt, "ratio": 1.-self.context_ratio, "unused": unused},"meta": meta})    
             
         else:
+            if self._canonical_normalization_method(
+                self.dataset_config.get("use_feature_normalization", None)
+            ) is None:
+                self._normalizer.fit(theta, "theta")
+                self._normalizer.fit(phi, "phi")
             theta = self._normalizer.transform(x=theta, feature_grp="theta")
             phi = self._normalizer.transform(x=phi, feature_grp="phi")
             theta = theta.float().contiguous(); phi = phi.float().contiguous()
