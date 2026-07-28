@@ -58,11 +58,6 @@ class InMemoryIterableData(IterableDataset):
         
         if self.mode == "train":
             data = {"train": {}, "test": {}, "validate": {}}
-            # apply normalization
-            self._normalizer = Normalizer(self.dataset_config.get("use_feature_normalization", None))
-            theta, phi = self._normalizer.fit_transform_as_f32(theta=theta, phi=phi)
-
-            data.update({"data": {"theta": theta, "phi": phi, "y": y, "file_indices": fidx}})
 
             # split into training, validation and testing data
             val_size = self.dataset_config.get('val_ratio',0.2)
@@ -81,7 +76,28 @@ class InMemoryIterableData(IterableDataset):
                     idx_test, idx_test_ctx = splitter.train_test_split(idx_test, groups=theta[idx_test], test_size=self.context_ratio)
                     data["test"].update({"context":{"indices": idx_test_ctx, "batch_size": batch_size_ctx, "ratio":self.context_ratio}})  
                 data["test"].update({"target":{"indices": idx_test, "batch_size": batch_size_tgt, "ratio": 1.-self.context_ratio},"meta": {"num_epochs": 1, "pos_frac": positive_ratio_data, "num_batches": {}}})
-                
+
+            # Fit feature transforms on training rows only, then apply them
+            # consistently to all partitions.
+            self._normalizer = Normalizer(
+                self.dataset_config.get("use_feature_normalization", None)
+            )
+            self._normalizer.fit(theta.index_select(0, idx), "theta")
+            self._normalizer.fit(phi.index_select(0, idx), "phi")
+            theta = self._normalizer.transform(theta, "theta").float().contiguous()
+            phi = self._normalizer.transform(phi, "phi").float().contiguous()
+
+            data.update(
+                {
+                    "data": {
+                        "theta": theta,
+                        "phi": phi,
+                        "y": y,
+                        "file_indices": fidx,
+                    }
+                }
+            )
+
             # split training data into context and target data
             # apply mixup to context data only
             if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:

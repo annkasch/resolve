@@ -224,6 +224,60 @@ def test_loader_emits_expected_values_and_batch_contract(loader_case):
     )
 
 
+def test_normalizer_is_fit_only_on_training_rows(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=12)
+    for row_id, row in enumerate(rows):
+        row["theta_value"] = float(2**row_id)
+        row["phi_value"] = float(1_000 + row_id**3)
+    _write_csv(data_directory / "part_0.csv", rows)
+
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    dataset_config = config["model_settings"]["train"]["dataset"]
+    dataset_config["val_ratio"] = 0.25
+    dataset_config["test_ratio"] = 0.25
+    dataset_config["use_feature_normalization"] = "zscore"
+
+    manager = DataLoaderManager(mode="train", config_file=config)
+    manager.set_dataset()
+
+    train_indices = manager.dataset.data["train"]["target"]["indices"]
+    raw_theta = np.asarray([row["theta_value"] for row in rows])
+    raw_phi = np.asarray([row["phi_value"] for row in rows])
+    expected_theta_mean = raw_theta[train_indices.tolist()].mean()
+    expected_phi_mean = raw_phi[train_indices.tolist()].mean()
+    normalizer = manager.dataset._normalizer
+    theta_scaler = normalizer._get_scaler("theta")
+    phi_scaler = normalizer._get_scaler("phi")
+
+    assert int(theta_scaler.n_samples_seen_) == train_indices.numel()
+    assert int(phi_scaler.n_samples_seen_) == train_indices.numel()
+    np.testing.assert_allclose(theta_scaler.mean_, [expected_theta_mean])
+    np.testing.assert_allclose(phi_scaler.mean_, [expected_phi_mean])
+
+    expected_theta = torch.from_numpy(
+        ((raw_theta - theta_scaler.mean_[0]) / theta_scaler.scale_[0]).astype(
+            np.float32
+        )
+    ).unsqueeze(1)
+    expected_phi = torch.from_numpy(
+        ((raw_phi - phi_scaler.mean_[0]) / phi_scaler.scale_[0]).astype(np.float32)
+    ).unsqueeze(1)
+    torch.testing.assert_close(
+        manager.dataset.data["data"]["theta"],
+        expected_theta,
+    )
+    torch.testing.assert_close(
+        manager.dataset.data["data"]["phi"],
+        expected_phi,
+    )
+
+
 @pytest.mark.xfail(
     strict=True,
     reason="HDF5 column indices are currently resolved from only the first file",
