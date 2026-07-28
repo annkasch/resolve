@@ -52,16 +52,29 @@ class Normalizer:
             )
 
     def fit(self, x: torch.Tensor, feature_grp: str):
-        self._get_scaler(feature_grp).fit(x)
+        self._get_scaler(feature_grp).fit(self._to_numpy(x))
     
     def fit_transform(self, x: torch.Tensor, feature_grp: str) -> torch.Tensor:
-        return torch.from_numpy(self._get_scaler(feature_grp).fit_transform(x))
+        transformed = self._get_scaler(feature_grp).fit_transform(
+            self._to_numpy(x)
+        )
+        return self._to_tensor(transformed, x)
 
     def transform(self, x: torch.Tensor, feature_grp: str) -> torch.Tensor:
-        return torch.from_numpy(self._get_scaler(feature_grp).transform(x))
+        transformed = self._get_scaler(feature_grp).transform(
+            self._to_numpy(x)
+        )
+        return self._to_tensor(transformed, x)
 
-    def inverse_transform(self, x: torch.Tensor, feature_grp: str):
-        return torch.from_numpy(self._get_scaler(feature_grp).inverse_transform(x))
+    def inverse_transform(
+        self,
+        x: torch.Tensor,
+        feature_grp: str,
+    ) -> torch.Tensor:
+        transformed = self._get_scaler(feature_grp).inverse_transform(
+            self._to_numpy(x)
+        )
+        return self._to_tensor(transformed, x)
 
     def fit_transform_as_f32(self, **feature_groups):
         """
