@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 import torch
 
+import resolve.helpers.data_source as data_source
+from resolve.helpers.data_source import DataValidationError
 from resolve.helpers.dataloader_manager import DataLoaderManager
 from resolve.helpers.normalizer import Normalizer
 
@@ -375,8 +377,8 @@ def test_hdf5_returns_columns_in_configured_order(tmp_path):
 @pytest.mark.parametrize(
     ("configured_labels", "error_pattern"),
     [
-        (["missing"], "missing requested labels"),
-        (["theta_value", "theta_value"], "contain duplicates"),
+        (["missing"], "missing requested .* labels"),
+        (["theta_value", "theta_value"], "duplicate labels"),
     ],
 )
 def test_hdf5_rejects_invalid_configured_labels(
@@ -394,10 +396,8 @@ def test_hdf5_rejects_invalid_configured_labels(
     )
     config["simulation_settings"]["theta_labels"] = configured_labels
 
-    manager = DataLoaderManager(mode="train", config_file=config)
-
-    with pytest.raises(ValueError, match=error_pattern):
-        manager.set_dataset()
+    with pytest.raises(DataValidationError, match=error_pattern):
+        DataLoaderManager(mode="train", config_file=config)
 
 
 def test_hdf5_rejects_duplicate_schema_labels(tmp_path):
@@ -408,24 +408,22 @@ def test_hdf5_rejects_duplicate_schema_labels(tmp_path):
         _make_rows(0),
         feature_labels=("theta_value", "theta_value", "phi_value"),
     )
-    manager = DataLoaderManager(
-        mode="train",
-        config_file=_make_config(
-            data_directory,
-            file_format="h5",
-            context_ratio=0.0,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="has duplicate labels"):
-        manager.set_dataset()
+    with pytest.raises(DataValidationError, match="has duplicate labels"):
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(
+                data_directory,
+                file_format="h5",
+                context_ratio=0.0,
+            ),
+        )
 
 
 @pytest.mark.parametrize(
     ("mutation", "error_pattern"),
     [
         ("remove_labels", "has no 'labels' attribute"),
-        ("remove_dataset", "is missing dataset"),
+        ("remove_dataset", "is missing .*dataset"),
     ],
 )
 def test_hdf5_rejects_missing_schema_metadata(
@@ -443,17 +441,15 @@ def test_hdf5_rejects_missing_schema_metadata(
         else:
             del output["labels"]
 
-    manager = DataLoaderManager(
-        mode="train",
-        config_file=_make_config(
-            data_directory,
-            file_format="h5",
-            context_ratio=0.0,
-        ),
-    )
-
-    with pytest.raises(ValueError, match=error_pattern):
-        manager.set_dataset()
+    with pytest.raises(DataValidationError, match=error_pattern):
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(
+                data_directory,
+                file_format="h5",
+                context_ratio=0.0,
+            ),
+        )
 
 
 def test_hdf5_reads_one_dimensional_targets_as_columns(tmp_path):
@@ -496,17 +492,259 @@ def test_hdf5_rejects_inconsistent_row_counts(tmp_path):
         rows,
         target_rows=rows[:-1],
     )
-    manager = DataLoaderManager(
-        mode="train",
-        config_file=_make_config(
-            data_directory,
-            file_format="h5",
-            context_ratio=0.0,
-        ),
+    with pytest.raises(DataValidationError, match="inconsistent row counts"):
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(
+                data_directory,
+                file_format="h5",
+                context_ratio=0.0,
+            ),
+        )
+
+
+def test_preflight_aggregates_config_and_multifile_schema_issues(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    first_path = data_directory / "part_0.h5"
+    second_path = data_directory / "part_1.h5"
+    _write_hdf5(first_path, _make_rows(0))
+    _write_hdf5(
+        second_path,
+        _make_rows(6),
+        target_rows=_make_rows(6)[:-1],
+    )
+    with h5py.File(first_path, "a") as output:
+        del output["features/values"].attrs["labels"]
+
+    config = _make_config(
+        data_directory,
+        file_format="h5",
+        context_ratio=0.0,
+    )
+    config["model_settings"]["train"]["dataset"]["context_ratio"] = 1.25
+    config["model_settings"]["dataloader"][
+        "dataloader_number_of_workers"
+    ] = -1
+
+    with pytest.raises(DataValidationError) as error:
+        DataLoaderManager(mode="train", config_file=config)
+
+    messages = [str(issue) for issue in error.value.issues]
+    assert len(messages) == 4
+    assert any("context_ratio" in message for message in messages)
+    assert any("dataloader_number_of_workers" in message for message in messages)
+    assert any(str(first_path) in message and "labels" in message for message in messages)
+    assert any(
+        str(second_path) in message and "row counts" in message
+        for message in messages
     )
 
-    with pytest.raises(ValueError, match="Inconsistent row counts"):
+
+def test_preflight_aggregates_hdf5_dimension_and_dtype_issues(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    dimensional_path = data_directory / "part_0.h5"
+    dtype_path = data_directory / "part_1.h5"
+    _write_hdf5(dimensional_path, _make_rows(0))
+    _write_hdf5(dtype_path, _make_rows(6))
+
+    with h5py.File(dimensional_path, "a") as output:
+        del output["features/values"]
+        dataset = output["features"].create_dataset(
+            "values",
+            data=np.zeros((6, 3, 1), dtype=np.float32),
+        )
+        dataset.attrs["labels"] = np.asarray(FEATURE_LABELS, dtype="S")
+    with h5py.File(dtype_path, "a") as output:
+        del output["labels/values"]
+        dataset = output["labels"].create_dataset(
+            "values",
+            data=np.full((6, 1), "signal", dtype="S8"),
+        )
+        dataset.attrs["labels"] = np.asarray(TARGET_LABELS, dtype="S")
+
+    with pytest.raises(DataValidationError) as error:
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(
+                data_directory,
+                file_format="h5",
+                context_ratio=0.0,
+            ),
+        )
+
+    message = str(error.value)
+    assert str(dimensional_path) in message
+    assert "must be 1D or 2D" in message
+    assert str(dtype_path) in message
+    assert "numeric dtype" in message
+
+
+def test_preflight_rejects_invalid_public_mode(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+
+    with pytest.raises(DataValidationError) as error:
+        DataLoaderManager(
+            mode="validate",
+            config_file=_make_config(data_directory, "csv"),
+        )
+
+    message = str(error.value)
+    assert "mode: must be one of" in message
+    assert "path_to_files_validate" in message
+
+
+@pytest.mark.parametrize(
+    ("setup", "file_format", "error_pattern"),
+    [
+        ("missing", "csv", "directory does not exist"),
+        ("empty", "csv", "contains no '\\*\\.csv' files"),
+        ("empty", "parquet", "file_format"),
+    ],
+)
+def test_preflight_rejects_invalid_source_location_or_format(
+    tmp_path,
+    setup,
+    file_format,
+    error_pattern,
+):
+    data_directory = tmp_path / setup
+    if setup == "empty":
+        data_directory.mkdir()
+    config = _make_config(data_directory, file_format)
+
+    with pytest.raises(DataValidationError, match=error_pattern):
+        DataLoaderManager(mode="train", config_file=config)
+
+
+def test_preflight_aggregates_malformed_worker_settings(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(data_directory, "csv")
+    settings = config["model_settings"]["dataloader"]
+    settings["dataloader_number_of_workers"] = "two"
+    settings["dataloader_prefetch_factor"] = 0
+    settings["dataloader_pin_memory"] = 1
+    settings["dataloader_persistent_workers"] = "yes"
+
+    with pytest.raises(DataValidationError) as error:
+        DataLoaderManager(mode="train", config_file=config)
+
+    assert len(error.value.issues) == 4
+    message = str(error.value)
+    assert "dataloader_number_of_workers" in message
+    assert "dataloader_prefetch_factor" in message
+    assert "dataloader_pin_memory" in message
+    assert "dataloader_persistent_workers" in message
+
+
+def test_preflight_rejects_invalid_ratios_and_mixup_settings(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(data_directory, "csv")
+    settings = config["model_settings"]["train"]["dataset"]
+    settings["val_ratio"] = 0.7
+    settings["test_ratio"] = 0.4
+    settings["mixup_ratio"] = -0.1
+    settings["mixup_margin"] = 0.75
+    settings["use_beta"] = [0.0, 1.0]
+    settings["positive_ratio_train"] = [0.2, 1.0]
+    settings["max_positive_reuse"] = -1
+
+    with pytest.raises(DataValidationError) as error:
+        DataLoaderManager(mode="train", config_file=config)
+
+    message = str(error.value)
+    assert "val_ratio + test_ratio" in message
+    assert "mixup_ratio" in message
+    assert "mixup_margin" in message
+    assert "use_beta" in message
+    assert "positive_ratio_train" in message
+    assert "max_positive_reuse" in message
+
+
+def test_preflight_rejects_duplicate_csv_headers(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    (data_directory / "part_0.csv").write_text(
+        "theta_value,theta_value,phi_value,signal\n"
+        "1,2,3,0\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DataValidationError, match="duplicate labels"):
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(data_directory, "csv"),
+        )
+
+
+def test_preflight_does_not_load_csv_values(tmp_path, monkeypatch):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+
+    def fail_if_called(_file_spec):
+        raise AssertionError("value loader ran during preflight")
+
+    monkeypatch.setattr(data_source, "_load_csv_file", fail_if_called)
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "csv"),
+    )
+
+    assert manager.dataset is None
+
+
+def test_csv_value_parse_error_reports_file_row_and_column(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    path = data_directory / "part_0.csv"
+    _write_csv(path, _make_rows(0))
+    rows = path.read_text(encoding="utf-8").splitlines()
+    rows[2] = rows[2].replace("101.0", "not-a-number")
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "csv"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"row 3, column 'phi_value'",
+    ):
         manager.set_dataset()
+
+
+def test_dataset_replacement_revalidates_before_loading(tmp_path, monkeypatch):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(data_directory, "csv")
+    manager = DataLoaderManager(mode="train", config_file=config)
+    manager.set_dataset()
+    original_dataset = manager.dataset
+
+    def fail_if_called(_source):
+        raise AssertionError("replacement loaded invalid data")
+
+    monkeypatch.setattr(
+        data_source.ValidatedDataSource,
+        "load",
+        fail_if_called,
+    )
+    config["model_settings"]["train"]["dataset"]["context_ratio"] = 1.0
+
+    with pytest.raises(DataValidationError, match="context_ratio"):
+        manager.set_dataset()
+
+    assert manager.dataset is original_dataset
+    assert manager.dataset.data is not None
 
 
 @pytest.mark.parametrize("injection", ("constructor", "set_dataset"))

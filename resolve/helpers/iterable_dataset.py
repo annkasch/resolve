@@ -1,12 +1,9 @@
-import os
 import math
-import h5py
-import numpy as np
-import pandas as pd
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
-from typing import List, Optional, Sequence, Tuple, Dict, Union
+from typing import List, Optional, Tuple
 import collections
+from resolve.helpers.data_source import DatasetSettings, ValidatedDataSource
 from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
@@ -30,13 +27,21 @@ class InMemoryIterableData(IterableDataset):
         code: mode for mode, code in _MODE_TO_CODE.items()
     }
 
-    def __init__(self, files: Sequence[str], batch_size: int = 1000,
-                 parameter_config: Dict = None, dataset_config: Dict = None, positive_condition: Optional[List]=None,
+    def __init__(self, data_source: ValidatedDataSource, batch_size: int = 1000,
+                 dataset_config: DatasetSettings = None, positive_condition: Optional[List]=None,
                  normalizer: Optional[Normalizer] = None, mode: Optional[str] = "train") -> None:
         super().__init__()
-        
-        self.files, self.shuffle, self.seed = list(files), dataset_config["shuffle_dataset"], dataset_config["seed"]
-        self.parameter_config, self.dataset_config = (parameter_config or {}), dataset_config
+
+        if not isinstance(data_source, ValidatedDataSource):
+            raise TypeError(
+                "data_source must be a ValidatedDataSource produced by "
+                "preflight_data_loader()."
+            )
+        self.data_source = data_source
+        self.files = [str(path) for path in data_source.paths]
+        self.shuffle = dataset_config.shuffle_dataset
+        self.seed = dataset_config.seed
+        self.dataset_config = dataset_config
         self.batch_size = batch_size
         
         self.mode = mode
@@ -55,7 +60,7 @@ class InMemoryIterableData(IterableDataset):
         ).share_memory_()
 
         # load all data into memory
-        theta, phi, y, fidx = self._load_data_to_mem(self.files, self.parameter_config)
+        theta, phi, y, fidx = self.data_source.load()
         
         self.theta_to_id = self.sampler.get_unique_ids(theta)
 
@@ -70,10 +75,7 @@ class InMemoryIterableData(IterableDataset):
         self,
         normalizer: Optional[Normalizer],
     ) -> Optional[Normalizer]:
-        configured_method = self.dataset_config.get(
-            "use_feature_normalization",
-            None,
-        )
+        configured_method = self.dataset_config.use_feature_normalization
         canonical_method = self._canonical_normalization_method(
             configured_method
         )
@@ -120,17 +122,13 @@ class InMemoryIterableData(IterableDataset):
                 return [torch.empty_like(t) for t in tensors]
     
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
-        self.context_ratio = float(
-            self.dataset_config.get("context_ratio", 1.0 / 3.0)
-        )
+        self.context_ratio = self.dataset_config.context_ratio
         if not 0.0 <= self.context_ratio < 1.0:
             raise ValueError("context_ratio must be in [0, 1).")
         if self.batch_size <= 0:
             raise ValueError("batch_size must be greater than zero.")
 
-        self.context_is_subset = bool(
-            self.dataset_config.get("context_is_subset", True)
-        )
+        self.context_is_subset = self.dataset_config.context_is_subset
         self.batch_size_ctx = math.floor(
             self.batch_size * self.context_ratio
         )
@@ -153,7 +151,7 @@ class InMemoryIterableData(IterableDataset):
         
         if self.mode == "train":
             split_indices = {}
-            val_size = self.dataset_config.get("val_ratio", 0.2)
+            val_size = self.dataset_config.val_ratio
             if val_size > 0.0:
                 idx, split_indices["validate"] = splitter.train_test_split(
                     idx,
@@ -161,7 +159,7 @@ class InMemoryIterableData(IterableDataset):
                     test_size=val_size,
                 )
 
-            configured_test_size = self.dataset_config.get("test_ratio", 0.2)
+            configured_test_size = self.dataset_config.test_ratio
             if configured_test_size > 0.0:
                 remaining_fraction = 1.0 - val_size
                 if remaining_fraction <= 0.0:
@@ -179,7 +177,7 @@ class InMemoryIterableData(IterableDataset):
             # Fit feature transforms on training rows only, then apply them
             # consistently to all partitions.
             self._normalizer = Normalizer(
-                self.dataset_config.get("use_feature_normalization", None)
+                self.dataset_config.use_feature_normalization
             )
             self._normalizer.fit(theta.index_select(0, idx), "theta")
             self._normalizer.fit(phi.index_select(0, idx), "phi")
@@ -198,11 +196,11 @@ class InMemoryIterableData(IterableDataset):
             )
 
             # Apply mixup to training data only.
-            if self.dataset_config and self.dataset_config.get('mixup_ratio', 0.) > 0.0:
+            if self.dataset_config.mixup_ratio > 0.0:
                 theta[idx], phi[idx], y[idx], fidx[idx] = self.sampler.mix_by_file_chunks(
-                            theta[idx], phi[idx], y[idx], fidx[idx],self.dataset_config.get('mixup_ratio'),
-                            use_beta=self.dataset_config.get('use_beta', None),
-                            margin=float(self.dataset_config.get('mixup_margin', 0.0)),
+                            theta[idx], phi[idx], y[idx], fidx[idx], self.dataset_config.mixup_ratio,
+                            use_beta=self.dataset_config.use_beta,
+                            margin=self.dataset_config.mixup_margin,
                             seed=self.seed,
                 )
 
@@ -214,7 +212,7 @@ class InMemoryIterableData(IterableDataset):
                 )
         else:
             if self._canonical_normalization_method(
-                self.dataset_config.get("use_feature_normalization", None)
+                self.dataset_config.use_feature_normalization
             ) is None:
                 self._normalizer.fit(theta, "theta")
                 self._normalizer.fit(phi, "phi")
@@ -258,10 +256,7 @@ class InMemoryIterableData(IterableDataset):
 
     def _indices_for_epoch(self, mode, epoch):
         indices = self._base_indices[mode]
-        positive_ratio = self.dataset_config.get(
-            "positive_ratio_train",
-            None,
-        )
+        positive_ratio = self.dataset_config.positive_ratio_train
         if (
             mode != "train"
             or isinstance(positive_ratio, list)
@@ -274,10 +269,7 @@ class InMemoryIterableData(IterableDataset):
             self.data["data"]["y"].index_select(0, indices),
             indices,
             target_pos_frac=positive_ratio,
-            max_pos_reuse_per_epoch=self.dataset_config.get(
-                "max_positive_reuse",
-                0,
-            ),
+            max_pos_reuse_per_epoch=self.dataset_config.max_positive_reuse,
             sticky_frac=0.25,
             seed=self.seed,
             epoch=epoch,
@@ -390,197 +382,6 @@ class InMemoryIterableData(IterableDataset):
             mode_data["meta"].update(sampling_meta)
             mode_data["meta"]["num_batches"] = len(target_batches)
         self._built_epochs[mode] = plan_epoch
-
-    @staticmethod
-    def _decode_hdf5_labels(dataset, file_path: str, dataset_key: str) -> List[str]:
-        if dataset.ndim not in (1, 2):
-            raise ValueError(
-                f"HDF5 dataset {dataset_key!r} in {file_path!r} must be 1D or "
-                f"2D, got shape {dataset.shape}."
-            )
-        if "labels" not in dataset.attrs:
-            raise ValueError(
-                f"HDF5 dataset {dataset_key!r} in {file_path!r} has no "
-                "'labels' attribute."
-            )
-
-        raw_labels = np.atleast_1d(dataset.attrs["labels"]).tolist()
-        labels = [
-            value.decode("utf-8") if isinstance(value, bytes) else str(value)
-            for value in raw_labels
-        ]
-        expected_labels = 1 if dataset.ndim == 1 else dataset.shape[1]
-        if len(labels) != expected_labels:
-            raise ValueError(
-                f"HDF5 dataset {dataset_key!r} in {file_path!r} has "
-                f"{expected_labels} columns but {len(labels)} labels."
-            )
-
-        duplicate_labels = sorted(
-            {label for label in labels if labels.count(label) > 1}
-        )
-        if duplicate_labels:
-            raise ValueError(
-                f"HDF5 dataset {dataset_key!r} in {file_path!r} has duplicate "
-                f"labels: {duplicate_labels}."
-            )
-        return labels
-
-    @classmethod
-    def _read_hdf5_columns(
-        cls,
-        hdf,
-        file_path: str,
-        parameter_spec: Dict,
-    ) -> np.ndarray:
-        dataset_key = parameter_spec["key"]
-        if dataset_key not in hdf:
-            raise ValueError(
-                f"HDF5 file {file_path!r} is missing dataset {dataset_key!r}."
-            )
-
-        requested_labels = list(parameter_spec["selected_labels"])
-        duplicate_requests = sorted(
-            {
-                label
-                for label in requested_labels
-                if requested_labels.count(label) > 1
-            }
-        )
-        if duplicate_requests:
-            raise ValueError(
-                f"Configured labels for HDF5 dataset {dataset_key!r} contain "
-                f"duplicates: {duplicate_requests}."
-            )
-        if not requested_labels:
-            raise ValueError(
-                f"No labels configured for HDF5 dataset {dataset_key!r}."
-            )
-
-        dataset = hdf[dataset_key]
-        labels = cls._decode_hdf5_labels(dataset, file_path, dataset_key)
-        missing_labels = [
-            label for label in requested_labels if label not in labels
-        ]
-        if missing_labels:
-            raise ValueError(
-                f"HDF5 dataset {dataset_key!r} in {file_path!r} is missing "
-                f"requested labels: {missing_labels}."
-            )
-
-        if dataset.ndim == 1:
-            if len(requested_labels) != 1:
-                raise ValueError(
-                    f"HDF5 dataset {dataset_key!r} in {file_path!r} is 1D "
-                    f"but {len(requested_labels)} labels were requested."
-                )
-            return dataset[:].reshape(-1, 1)
-
-        physical_indices = [labels.index(label) for label in requested_labels]
-        sorted_pairs = sorted(
-            enumerate(physical_indices),
-            key=lambda pair: pair[1],
-        )
-        sorted_indices = [physical_index for _, physical_index in sorted_pairs]
-        values = dataset[:, sorted_indices]
-
-        configured_order = [0] * len(sorted_pairs)
-        for loaded_position, (configured_position, _) in enumerate(sorted_pairs):
-            configured_order[configured_position] = loaded_position
-        return values[:, configured_order]
-
-    @staticmethod
-    def _validate_row_counts(
-        file_path: str,
-        theta,
-        phi,
-        y,
-    ) -> None:
-        row_counts = {
-            "theta": theta.shape[0],
-            "phi": phi.shape[0],
-            "target": y.shape[0],
-        }
-        if len(set(row_counts.values())) != 1:
-            raise ValueError(
-                f"Inconsistent row counts in {file_path!r}: {row_counts}."
-            )
-
-    @classmethod
-    def _read_in_from_file(
-        cls,
-        file_path: str,
-        parameter_config: Dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if file_path.endswith(('.h5', '.hdf5')):
-
-            with h5py.File(file_path, 'r') as hdf:
-                phi = cls._read_hdf5_columns(
-                    hdf,
-                    file_path,
-                    parameter_config["phi"],
-                )
-                theta = cls._read_hdf5_columns(
-                    hdf,
-                    file_path,
-                    parameter_config["theta"],
-                )
-                y = cls._read_hdf5_columns(
-                    hdf,
-                    file_path,
-                    parameter_config["target"],
-                )
-
-            phi = torch.from_numpy(phi)
-            theta = torch.from_numpy(theta)
-            y = torch.from_numpy(y)
-
-        elif file_path.endswith('.csv'):
-            # --- CSV reading using column names (selected_labels) ---
-            df = pd.read_csv(file_path)
-
-            def select_labels(df: pd.DataFrame, labels: Union[str, List[str]]) -> pd.DataFrame:
-                """Select one or multiple columns by name."""
-                if isinstance(labels, str):
-                    return df[[labels]]
-                elif isinstance(labels, list):
-                    return df[labels]
-                else:
-                    raise ValueError(f"Invalid label type: {type(labels)}")
-
-            # Extract φ, θ, and y by column labels
-            phi = select_labels(df, parameter_config['phi']['selected_labels'])
-            theta = select_labels(df, parameter_config['theta']['selected_labels'])
-            y = select_labels(df, parameter_config['target']['selected_labels'])
-
-            # Convert to torch tensors
-            phi = torch.tensor(phi.values, dtype=torch.float32)
-            theta = torch.tensor(theta.values, dtype=torch.float32)
-            y = torch.tensor(y.values, dtype=torch.float32)
-
-            # Ensure y has shape (N, 1)
-            if y.ndim == 1:
-                y = y.unsqueeze(1)
-        else:
-            raise ValueError(f"Unsupported file format: {file_path}")
-
-        cls._validate_row_counts(file_path, theta, phi, y)
-
-        # ensure float32 on CPU
-        phi = phi.contiguous().to(torch.float32)
-        theta = theta.contiguous().to(torch.float32)
-        y = y.contiguous().to(torch.float32)
-        return theta, phi, y
-
-    def _load_data_to_mem(self, files: Sequence[str], cfg: Dict) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        Thetas, Phis, ys, file_inds = [], [], [], []
-        for i, fp in enumerate(files):
-            if not os.path.exists(fp): raise FileNotFoundError(fp)
-            Thetai, Phii, yi = self._read_in_from_file(fp, cfg)
-            Thetas.append(Thetai); Phis.append(Phii); ys.append(yi)
-            file_inds.append(torch.full((Phii.size(0),), i, dtype=torch.long))
-        Theta, Phi, y, fidx = torch.cat(Thetas, 0).contiguous(), torch.cat(Phis, 0).contiguous(), torch.cat(ys, 0).contiguous(),torch.cat(file_inds, 0).contiguous()
-        return Theta, Phi, y, fidx
 
     def set_mode(self, mode):
         if mode not in self._MODE_TO_CODE:

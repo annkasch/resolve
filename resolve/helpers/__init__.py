@@ -4,6 +4,7 @@ from importlib import import_module
 _EXPORTS = {
     "Trainer": ".training_wrapper",
     "DataLoaderManager": ".dataloader_manager",
+    "DataValidationError": ".data_source",
     "AsymmetricFocalWithFPPenalty": ".losses",
     "bce_with_logits": ".losses",
     "gaussian_nll": ".losses",

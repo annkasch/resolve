@@ -1,59 +1,55 @@
-from pathlib import Path
 import collections
+
 from torch.utils.data import DataLoader
+from resolve.helpers.data_source import preflight_data_loader
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
 
 
 ContextSet = collections.namedtuple("ContextSet", ("theta", "phi", "y"))
-QuerySet   = collections.namedtuple("QuerySet",   ("theta", "phi"))
-
+QuerySet = collections.namedtuple("QuerySet", ("theta", "phi"))
 BatchCollection = collections.namedtuple(
     "BatchCollection",
-    ("context", "query", "target_y")
+    ("context", "query", "target_y"),
 )
+
 
 def running_average(batch_sum, batch_count, mean, I):
     mean = mean + (batch_sum - batch_count * mean) / (I + batch_count)
     I += batch_count
     return mean
 
+
 class DataLoaderManager:
     def __init__(self, mode, config_file, normalizer=None):
         self.mode = mode
         self.config_file = config_file
-        
-        self.files = self._get_hdf5_files(Path(self.config_file["path_settings"][f"path_to_files_{self.mode}"]))
         self.dataloader = None
         self._normalizer = None
-
-        # base parameter spec
-        sim = config_file["simulation_settings"]
-
-        self.parameters = {
-            "phi": {
-                "key": "features/values",
-                "selected_labels": sim["phi_labels"],
-            },
-            "theta": {
-                "key": "features/values",
-                "selected_labels": sim["theta_labels"],
-            },
-            "target": {
-                "key": "labels/values",
-                "selected_labels": sim["target_labels"],
-            },
-        }
-
-        self.positive_condition  = self.config_file["simulation_settings"]["signal_condition"]
-
         self.dataset = None
+        self._preflight()
         if normalizer is not None:
             self._store_external_normalizer(normalizer)
 
     # ------------- helpers -------------
-    def _get_hdf5_files(self, path_to_files):
-        return sorted(str(p) for p in path_to_files.glob(f"*.{self.config_file['simulation_settings']['file_format']}"))
+    def _preflight(self):
+        self._specification, self._data_source = preflight_data_loader(
+            self.mode,
+            self.config_file,
+        )
+        self.files = [
+            str(path) for path in self._data_source.paths
+        ]
+        self.parameters = {
+            parameter.name: {
+                "key": parameter.dataset_key,
+                "selected_labels": list(parameter.selected_labels),
+            }
+            for parameter in self._specification.parameters
+        }
+        self.positive_condition = list(
+            self._specification.positive_condition
+        )
 
     @staticmethod
     def _canonical_normalization_method(method):
@@ -64,10 +60,7 @@ class DataLoaderManager:
         return self._normalizer
 
     def _configured_normalization_method(self):
-        return self.config_file["model_settings"]["train"]["dataset"].get(
-            "use_feature_normalization",
-            None,
-        )
+        return self._specification.dataset.use_feature_normalization
 
     def _store_external_normalizer(self, normalizer):
         if self.mode == "train":
@@ -91,9 +84,11 @@ class DataLoaderManager:
         self._normalizer = normalizer
 
     def set_dataset(self, normalizer=None):
-        dataset_config = self.config_file["model_settings"]["train"]["dataset"]
+        self._preflight()
         if normalizer is not None:
             self._store_external_normalizer(normalizer)
+        elif self.mode != "train" and self._normalizer is not None:
+            self._store_external_normalizer(self._normalizer)
 
         configured_method = self._configured_normalization_method()
         if (
@@ -112,11 +107,10 @@ class DataLoaderManager:
 
         self._dispose_loader(close_dataset=True)
         self.dataset = InMemoryIterableData(
-                files=self.files,
-                batch_size=self.config_file["model_settings"]["train"]["batch_size"],
-                parameter_config=self.parameters,
-                dataset_config=dataset_config,
-                positive_condition=self.positive_condition,
+                data_source=self._data_source,
+                batch_size=self._specification.batch_size,
+                dataset_config=self._specification.dataset,
+                positive_condition=self._specification.positive_condition,
                 normalizer=(
                     None if self.mode == "train" else self._normalizer
                 ),
@@ -125,35 +119,21 @@ class DataLoaderManager:
         self._normalizer = self.dataset._normalizer
 
     def _loader_options(self):
-        settings = self.config_file["model_settings"]["dataloader"]
-        num_workers = int(settings["dataloader_number_of_workers"])
-        if num_workers < 0:
-            raise ValueError(
-                "dataloader_number_of_workers must be non-negative."
-            )
+        settings = self._specification.loader
+        num_workers = settings.num_workers
 
         options = {
             "batch_size": None,
             "num_workers": num_workers,
-            "pin_memory": bool(
-                settings.get("dataloader_pin_memory", False)
-            ),
+            "pin_memory": settings.pin_memory,
             "persistent_workers": (
-                bool(
-                    settings.get(
-                        "dataloader_persistent_workers",
-                        False,
-                    )
-                )
+                settings.persistent_workers
                 if num_workers > 0
                 else False
             ),
         }
         if num_workers > 0:
-            options["prefetch_factor"] = settings.get(
-                "dataloader_prefetch_factor",
-                None,
-            )
+            options["prefetch_factor"] = settings.prefetch_factor
         return options
 
     def _dispose_loader(self, close_dataset=False):

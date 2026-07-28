@@ -405,13 +405,21 @@ class Sampler():
                         '<': operator.lt
                     }
 
-            for op in ops:
-                if op in condition_str:
-                    value_str = condition_str.split(op)[1].strip()
+            for symbol, comparison in ops.items():
+                if symbol in condition_str:
+                    value_str = condition_str.split(symbol, 1)[1].strip()
                     break
-            value = float(value_str) if '.' in value_str else int(value_str)
-            
-            return functools.partial(self._compare, op=ops[op], value=value)
+            else:
+                raise ValueError(
+                    f"Unsupported positive condition: {condition_str!r}."
+                )
+            value = float(value_str)
+
+            return functools.partial(
+                self._compare,
+                op=comparison,
+                value=value,
+            )
 
     def get_positive_indices(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             y2 = y if y.ndim > 1 else y.unsqueeze(1)
@@ -530,7 +538,11 @@ class Sampler():
             pos_samples = pos_idx[pos_choices]
             
             # Generate mixing coefficients
-            if use_beta and isinstance(use_beta, list) and len(use_beta) == 2:
+            if (
+                use_beta
+                and isinstance(use_beta, (list, tuple))
+                and len(use_beta) == 2
+            ):
                 beta_rng = np.random.default_rng(seed + 3)
                 a = torch.as_tensor(
                     beta_rng.beta(
