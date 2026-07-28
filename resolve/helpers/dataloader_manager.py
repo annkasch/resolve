@@ -1,4 +1,3 @@
-import h5py
 from pathlib import Path
 import collections
 import torch
@@ -34,17 +33,19 @@ class DataLoaderManager:
         sim = config_file["simulation_settings"]
 
         self.parameters = {
-            "phi":    {"key": "features/values",  "selected_labels": sim["phi_labels"],    "size": len(sim["phi_labels"]),    "selected_indices": None},
-            "theta":  {"key": "features/values",  "selected_labels": sim["theta_labels"],  "size": len(sim["theta_labels"]),  "selected_indices": None},
-            "target": {"key": "labels/values",    "selected_labels": sim["target_labels"], "size": len(sim["target_labels"]), "selected_indices": None},
+            "phi": {
+                "key": "features/values",
+                "selected_labels": sim["phi_labels"],
+            },
+            "theta": {
+                "key": "features/values",
+                "selected_labels": sim["theta_labels"],
+            },
+            "target": {
+                "key": "labels/values",
+                "selected_labels": sim["target_labels"],
+            },
         }
-
-        if self.files[0].endswith(('.h5', '.hdf5')):
-            with h5py.File(self.files[0], "r") as f:
-                for k in self.parameters:
-                    labels= f[self.parameters[k]["key"]].attrs["labels"].astype(str)
-                    indices = [labels.tolist().index(name) for name in self.parameters[k]["selected_labels"]]
-                    self.parameters[k]["selected_indices"] = indices
 
         self.positive_condition  = self.config_file["simulation_settings"]["signal_condition"]
 

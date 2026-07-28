@@ -1,6 +1,7 @@
 import os
 import math
 import h5py
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -185,18 +186,144 @@ class InMemoryIterableData(IterableDataset):
         print(meta, " unused", self.data["train"][key]["unused"].shape[0])
 
     @staticmethod
-    def _read_in_from_file(file_path: str, parameter_config: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _decode_hdf5_labels(dataset, file_path: str, dataset_key: str) -> List[str]:
+        if dataset.ndim not in (1, 2):
+            raise ValueError(
+                f"HDF5 dataset {dataset_key!r} in {file_path!r} must be 1D or "
+                f"2D, got shape {dataset.shape}."
+            )
+        if "labels" not in dataset.attrs:
+            raise ValueError(
+                f"HDF5 dataset {dataset_key!r} in {file_path!r} has no "
+                "'labels' attribute."
+            )
+
+        raw_labels = np.atleast_1d(dataset.attrs["labels"]).tolist()
+        labels = [
+            value.decode("utf-8") if isinstance(value, bytes) else str(value)
+            for value in raw_labels
+        ]
+        expected_labels = 1 if dataset.ndim == 1 else dataset.shape[1]
+        if len(labels) != expected_labels:
+            raise ValueError(
+                f"HDF5 dataset {dataset_key!r} in {file_path!r} has "
+                f"{expected_labels} columns but {len(labels)} labels."
+            )
+
+        duplicate_labels = sorted(
+            {label for label in labels if labels.count(label) > 1}
+        )
+        if duplicate_labels:
+            raise ValueError(
+                f"HDF5 dataset {dataset_key!r} in {file_path!r} has duplicate "
+                f"labels: {duplicate_labels}."
+            )
+        return labels
+
+    @classmethod
+    def _read_hdf5_columns(
+        cls,
+        hdf,
+        file_path: str,
+        parameter_spec: Dict,
+    ) -> np.ndarray:
+        dataset_key = parameter_spec["key"]
+        if dataset_key not in hdf:
+            raise ValueError(
+                f"HDF5 file {file_path!r} is missing dataset {dataset_key!r}."
+            )
+
+        requested_labels = list(parameter_spec["selected_labels"])
+        duplicate_requests = sorted(
+            {
+                label
+                for label in requested_labels
+                if requested_labels.count(label) > 1
+            }
+        )
+        if duplicate_requests:
+            raise ValueError(
+                f"Configured labels for HDF5 dataset {dataset_key!r} contain "
+                f"duplicates: {duplicate_requests}."
+            )
+        if not requested_labels:
+            raise ValueError(
+                f"No labels configured for HDF5 dataset {dataset_key!r}."
+            )
+
+        dataset = hdf[dataset_key]
+        labels = cls._decode_hdf5_labels(dataset, file_path, dataset_key)
+        missing_labels = [
+            label for label in requested_labels if label not in labels
+        ]
+        if missing_labels:
+            raise ValueError(
+                f"HDF5 dataset {dataset_key!r} in {file_path!r} is missing "
+                f"requested labels: {missing_labels}."
+            )
+
+        if dataset.ndim == 1:
+            if len(requested_labels) != 1:
+                raise ValueError(
+                    f"HDF5 dataset {dataset_key!r} in {file_path!r} is 1D "
+                    f"but {len(requested_labels)} labels were requested."
+                )
+            return dataset[:].reshape(-1, 1)
+
+        physical_indices = [labels.index(label) for label in requested_labels]
+        sorted_pairs = sorted(
+            enumerate(physical_indices),
+            key=lambda pair: pair[1],
+        )
+        sorted_indices = [physical_index for _, physical_index in sorted_pairs]
+        values = dataset[:, sorted_indices]
+
+        configured_order = [0] * len(sorted_pairs)
+        for loaded_position, (configured_position, _) in enumerate(sorted_pairs):
+            configured_order[configured_position] = loaded_position
+        return values[:, configured_order]
+
+    @staticmethod
+    def _validate_row_counts(
+        file_path: str,
+        theta,
+        phi,
+        y,
+    ) -> None:
+        row_counts = {
+            "theta": theta.shape[0],
+            "phi": phi.shape[0],
+            "target": y.shape[0],
+        }
+        if len(set(row_counts.values())) != 1:
+            raise ValueError(
+                f"Inconsistent row counts in {file_path!r}: {row_counts}."
+            )
+
+    @classmethod
+    def _read_in_from_file(
+        cls,
+        file_path: str,
+        parameter_config: Dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if file_path.endswith(('.h5', '.hdf5')):
 
             with h5py.File(file_path, 'r') as hdf:
-                phi = hdf[parameter_config['phi']['key']][:,parameter_config['phi']['selected_indices']]
-                theta = hdf[parameter_config['theta']['key']][:,parameter_config['theta']['selected_indices']]
-
-                tgt_ds = hdf[parameter_config['target']['key']]
-                if tgt_ds.ndim > 1 and parameter_config['target']['selected_indices'] != None:
-                    y = tgt_ds[:, parameter_config['target']['selected_indices']]
-                else:
-                    y = tgt_ds[:].reshape(-1, 1)
+                phi = cls._read_hdf5_columns(
+                    hdf,
+                    file_path,
+                    parameter_config["phi"],
+                )
+                theta = cls._read_hdf5_columns(
+                    hdf,
+                    file_path,
+                    parameter_config["theta"],
+                )
+                y = cls._read_hdf5_columns(
+                    hdf,
+                    file_path,
+                    parameter_config["target"],
+                )
 
             phi = torch.from_numpy(phi)
             theta = torch.from_numpy(theta)
@@ -230,6 +357,8 @@ class InMemoryIterableData(IterableDataset):
                 y = y.unsqueeze(1)
         else:
             raise ValueError(f"Unsupported file format: {file_path}")
+
+        cls._validate_row_counts(file_path, theta, phi, y)
 
         # ensure float32 on CPU
         phi = phi.contiguous().to(torch.float32)

@@ -35,15 +35,24 @@ def _write_csv(path: Path, rows):
         writer.writerows(rows)
 
 
-def _write_hdf5(path: Path, rows, feature_labels=FEATURE_LABELS):
+def _write_hdf5(
+    path: Path,
+    rows,
+    feature_labels=FEATURE_LABELS,
+    target_rows=None,
+    target_ndim=2,
+):
+    target_rows = rows if target_rows is None else target_rows
     feature_values = np.asarray(
         [[row[label] for label in feature_labels] for row in rows],
         dtype=np.float32,
     )
     target_values = np.asarray(
-        [[row[label] for label in TARGET_LABELS] for row in rows],
+        [[row[label] for label in TARGET_LABELS] for row in target_rows],
         dtype=np.float32,
     )
+    if target_ndim == 1:
+        target_values = target_values[:, 0]
 
     with h5py.File(path, "w") as output:
         features = output.create_group("features")
@@ -278,10 +287,6 @@ def test_normalizer_is_fit_only_on_training_rows(tmp_path):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="HDF5 column indices are currently resolved from only the first file",
-)
 def test_hdf5_resolves_columns_by_label_in_each_file(tmp_path):
     data_directory = tmp_path / "h5"
     data_directory.mkdir()
@@ -319,6 +324,185 @@ def test_hdf5_resolves_columns_by_label_in_each_file(tmp_path):
 
     torch.testing.assert_close(manager.dataset.data["data"]["theta"], expected_theta)
     torch.testing.assert_close(manager.dataset.data["data"]["phi"], expected_phi)
+
+
+def test_hdf5_returns_columns_in_configured_order(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0)
+    for row_id, row in enumerate(rows):
+        row["theta_second"] = float(1_000 + row_id)
+    _write_hdf5(
+        data_directory / "part_0.h5",
+        rows,
+        feature_labels=(
+            "theta_value",
+            "theta_second",
+            "phi_value",
+            "unused",
+        ),
+    )
+    config = _make_config(
+        data_directory,
+        file_format="h5",
+        context_ratio=0.0,
+    )
+    config["simulation_settings"]["theta_labels"] = [
+        "theta_second",
+        "theta_value",
+    ]
+
+    manager = DataLoaderManager(mode="train", config_file=config)
+    manager.set_dataset()
+
+    expected_theta = torch.tensor(
+        [
+            [row["theta_second"], row["theta_value"]]
+            for row in rows
+        ],
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(
+        manager.dataset.data["data"]["theta"],
+        expected_theta,
+    )
+
+
+@pytest.mark.parametrize(
+    ("configured_labels", "error_pattern"),
+    [
+        (["missing"], "missing requested labels"),
+        (["theta_value", "theta_value"], "contain duplicates"),
+    ],
+)
+def test_hdf5_rejects_invalid_configured_labels(
+    tmp_path,
+    configured_labels,
+    error_pattern,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="h5",
+        context_ratio=0.0,
+    )
+    config["simulation_settings"]["theta_labels"] = configured_labels
+
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    with pytest.raises(ValueError, match=error_pattern):
+        manager.set_dataset()
+
+
+def test_hdf5_rejects_duplicate_schema_labels(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(
+        data_directory / "part_0.h5",
+        _make_rows(0),
+        feature_labels=("theta_value", "theta_value", "phi_value"),
+    )
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(
+            data_directory,
+            file_format="h5",
+            context_ratio=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="has duplicate labels"):
+        manager.set_dataset()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_pattern"),
+    [
+        ("remove_labels", "has no 'labels' attribute"),
+        ("remove_dataset", "is missing dataset"),
+    ],
+)
+def test_hdf5_rejects_missing_schema_metadata(
+    tmp_path,
+    mutation,
+    error_pattern,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    file_path = data_directory / "part_0.h5"
+    _write_hdf5(file_path, _make_rows(0))
+    with h5py.File(file_path, "a") as output:
+        if mutation == "remove_labels":
+            del output["features/values"].attrs["labels"]
+        else:
+            del output["labels"]
+
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(
+            data_directory,
+            file_format="h5",
+            context_ratio=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match=error_pattern):
+        manager.set_dataset()
+
+
+def test_hdf5_reads_one_dimensional_targets_as_columns(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0)
+    _write_hdf5(
+        data_directory / "part_0.h5",
+        rows,
+        target_ndim=1,
+    )
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(
+            data_directory,
+            file_format="h5",
+            context_ratio=0.0,
+        ),
+    )
+
+    manager.set_dataset()
+
+    expected_targets = torch.tensor(
+        [[row["signal"]] for row in rows],
+        dtype=torch.float32,
+    )
+    assert manager.dataset.data["data"]["y"].shape == (len(rows), 1)
+    torch.testing.assert_close(
+        manager.dataset.data["data"]["y"],
+        expected_targets,
+    )
+
+
+def test_hdf5_rejects_inconsistent_row_counts(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0)
+    _write_hdf5(
+        data_directory / "part_0.h5",
+        rows,
+        target_rows=rows[:-1],
+    )
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(
+            data_directory,
+            file_format="h5",
+            context_ratio=0.0,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Inconsistent row counts"):
+        manager.set_dataset()
 
 
 @pytest.mark.xfail(
