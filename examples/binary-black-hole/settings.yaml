@@ -169,8 +169,8 @@ model_settings:
         n_flow_layers: 4
 
   dataloader:
-    dataloader_number_of_workers: 1
-    dataloader_prefetch_factor: 4
+    dataloader_number_of_workers: 0
+    dataloader_prefetch_factor: null
     dataloader_pin_memory: false
     dataloader_persistent_workers: false
   train:

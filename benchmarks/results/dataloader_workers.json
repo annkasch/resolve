@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-28T17:13:04.042951+00:00",
+  "platform": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.11.13",
+    "torch": "2.9.0",
+    "numpy": "1.26.4",
+    "cpu_count": 10
+  },
+  "workload": {
+    "rows": 250000,
+    "features": 14,
+    "targets": 1,
+    "batch_size": 1000,
+    "warmup_epochs": 2,
+    "measured_epochs": 7,
+    "consumer_delay_ms": 5.0,
+    "seed": 42
+  },
+  "cases": [
+    {
+      "num_workers": 0,
+      "persistent_workers": false,
+      "prefetch_factor": null,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.1838836670503952,
+          "cold_start_seconds": 0.0009887909982353449,
+          "epoch_seconds": [
+            0.014542250020895153,
+            0.01421074999962002,
+            0.013930541987065226,
+            0.013794041995424777,
+            0.01385133300209418,
+            0.013394207984674722,
+            0.013968458981253207
+          ],
+          "total_measured_epoch_seconds": 0.09769158397102728,
+          "median_epoch_seconds": 0.013930541987065226,
+          "median_batches_per_second": 17946.178995198447,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 624.796875,
+          "child_peak_rss_mb": 0.0
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.2612500420073047,
+          "cold_start_seconds": 0.0009847920155152678,
+          "epoch_seconds": [
+            1.600228999974206,
+            1.6137452090042643,
+            1.6017664590035565,
+            1.6132887909770943,
+            1.586392583034467,
+            1.6003217499819584,
+            1.5958477079984732
+          ],
+          "total_measured_epoch_seconds": 11.21159149997402,
+          "median_epoch_seconds": 1.6003217499819584,
+          "median_batches_per_second": 156.2185854205996,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 611.46875,
+          "child_peak_rss_mb": 0.0
+        }
+      }
+    },
+    {
+      "num_workers": 1,
+      "persistent_workers": false,
+      "prefetch_factor": 2,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.226984957989771,
+          "cold_start_seconds": 2.5027100419974886,
+          "epoch_seconds": [
+            2.905399584036786,
+            2.8748790829558857,
+            2.8832393329939805,
+            2.7826112089678645,
+            2.8908730830298737,
+            2.9167234590277076,
+            2.90754524996737
+          ],
+          "total_measured_epoch_seconds": 20.16127100097947,
+          "median_epoch_seconds": 2.8908730830298737,
+          "median_batches_per_second": 86.47906456618959,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 612.921875,
+          "child_peak_rss_mb": 415.75
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.205124625004828,
+          "cold_start_seconds": 2.4701110419700854,
+          "epoch_seconds": [
+            4.690918375039473,
+            4.772923666983843,
+            4.718165832979139,
+            4.633123292005621,
+            4.787279958021827,
+            4.692361749999691,
+            4.805114666989539
+          ],
+          "total_measured_epoch_seconds": 33.09988754201913,
+          "median_epoch_seconds": 4.718165832979139,
+          "median_batches_per_second": 52.98669204302751,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 618.484375,
+          "child_peak_rss_mb": 417.203125
+        }
+      }
+    },
+    {
+      "num_workers": 1,
+      "persistent_workers": true,
+      "prefetch_factor": 2,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.2309665000066161,
+          "cold_start_seconds": 2.437999832967762,
+          "epoch_seconds": [
+            0.13142074999632314,
+            0.13038500002585351,
+            0.13078995799878612,
+            0.13068641698919237,
+            0.13164254103321582,
+            0.13086316699627787,
+            0.12982958398060873
+          ],
+          "total_measured_epoch_seconds": 0.9156174170202576,
+          "median_epoch_seconds": 0.13078995799878612,
+          "median_batches_per_second": 1911.4617347175865,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 616.46875,
+          "child_peak_rss_mb": 420.640625
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.218928791990038,
+          "cold_start_seconds": 2.457403999986127,
+          "epoch_seconds": [
+            1.8903787499875762,
+            1.8661506660282612,
+            1.8710343750426546,
+            1.9139275000197813,
+            1.864473374967929,
+            1.8932602920103818,
+            1.9087859999854118
+          ],
+          "total_measured_epoch_seconds": 13.208010958041996,
+          "median_epoch_seconds": 1.8903787499875762,
+          "median_batches_per_second": 132.24863007037243,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 614.59375,
+          "child_peak_rss_mb": 423.234375
+        }
+      }
+    },
+    {
+      "num_workers": 2,
+      "persistent_workers": false,
+      "prefetch_factor": 2,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.1738416249863803,
+          "cold_start_seconds": 4.879430833039805,
+          "epoch_seconds": [
+            5.320623540959787,
+            5.281085707945749,
+            5.281549207982607,
+            5.2761457079905085,
+            5.369897708995268,
+            5.5014820419601165,
+            5.546646833012346
+          ],
+          "total_measured_epoch_seconds": 37.57743074884638,
+          "median_epoch_seconds": 5.320623540959787,
+          "median_batches_per_second": 46.9869740032204,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 607.484375,
+          "child_peak_rss_mb": 408.671875
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.126551124965772,
+          "cold_start_seconds": 4.953921500011347,
+          "epoch_seconds": [
+            7.186490082996897,
+            7.110164374986198,
+            7.1541326669976115,
+            7.109552458976395,
+            7.0988704589544795,
+            7.169448375003412,
+            7.0369365839869715
+          ],
+          "total_measured_epoch_seconds": 49.865595001901966,
+          "median_epoch_seconds": 7.110164374986198,
+          "median_batches_per_second": 35.16093114239504,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 615.921875,
+          "child_peak_rss_mb": 408.734375
+        }
+      }
+    },
+    {
+      "num_workers": 2,
+      "persistent_workers": true,
+      "prefetch_factor": 2,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.2174800420179963,
+          "cold_start_seconds": 4.980236582981888,
+          "epoch_seconds": [
+            0.10067529196385294,
+            0.10053512500599027,
+            0.10000724997371435,
+            0.10038679098943248,
+            0.09938837500521913,
+            0.09912708296906203,
+            0.0994126659934409
+          ],
+          "total_measured_epoch_seconds": 0.6995325819007121,
+          "median_epoch_seconds": 0.10000724997371435,
+          "median_batches_per_second": 2499.8187637967185,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 606.21875,
+          "child_peak_rss_mb": 413.03125
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.3322833749698475,
+          "cold_start_seconds": 5.067835166992154,
+          "epoch_seconds": [
+            1.8035513330250978,
+            1.8738392920349725,
+            1.88861620798707,
+            1.8785743339685723,
+            1.8825736250146292,
+            1.8198096249834634,
+            1.8841547920019366
+          ],
+          "total_measured_epoch_seconds": 13.031119209015742,
+          "median_epoch_seconds": 1.8785743339685723,
+          "median_batches_per_second": 133.07964208787195,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 607.078125,
+          "child_peak_rss_mb": 416.453125
+        }
+      }
+    },
+    {
+      "num_workers": 4,
+      "persistent_workers": false,
+      "prefetch_factor": 2,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.2061770420405082,
+          "cold_start_seconds": 9.75007520802319,
+          "epoch_seconds": [
+            10.316850083996542,
+            10.63920945796417,
+            11.455364166002255,
+            10.997176875011064,
+            10.436005749972537,
+            10.26284379203571,
+            10.386155334010255
+          ],
+          "total_measured_epoch_seconds": 74.49360545899253,
+          "median_epoch_seconds": 10.436005749972537,
+          "median_batches_per_second": 23.95552532161626,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 611.3125,
+          "child_peak_rss_mb": 404.609375
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.1953336669830605,
+          "cold_start_seconds": 9.781027582997922,
+          "epoch_seconds": [
+            12.61404750001384,
+            13.060184750007465,
+            12.116668000002392,
+            12.015672333014663,
+            12.117845333996229,
+            12.319447625020985,
+            12.252321666979697
+          ],
+          "total_measured_epoch_seconds": 86.49618720903527,
+          "median_epoch_seconds": 12.252321666979697,
+          "median_batches_per_second": 20.404296164844908,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 603.890625,
+          "child_peak_rss_mb": 405.390625
+        }
+      }
+    },
+    {
+      "num_workers": 4,
+      "persistent_workers": true,
+      "prefetch_factor": 2,
+      "workloads": {
+        "loader_only": {
+          "dataset_preparation_seconds": 1.2114207500126213,
+          "cold_start_seconds": 9.620356125000399,
+          "epoch_seconds": [
+            0.10411583399400115,
+            0.1049603329738602,
+            0.10387783299665898,
+            0.10370133398100734,
+            0.10305970895569772,
+            0.10344383399933577,
+            0.1032788340235129
+          ],
+          "total_measured_epoch_seconds": 0.726437710924074,
+          "median_epoch_seconds": 0.10370133398100734,
+          "median_batches_per_second": 2410.7693739579754,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 608.390625,
+          "child_peak_rss_mb": 411.234375
+        },
+        "consumer_5ms": {
+          "dataset_preparation_seconds": 1.209561208030209,
+          "cold_start_seconds": 9.570870708033908,
+          "epoch_seconds": [
+            1.9078290410107002,
+            1.8744564580265433,
+            1.9589785420102999,
+            1.8947817499865778,
+            1.8538568750373088,
+            1.8803583330009133,
+            1.8931964159710333
+          ],
+          "total_measured_epoch_seconds": 13.263457415043376,
+          "median_epoch_seconds": 1.8931964159710333,
+          "median_batches_per_second": 132.05180291437077,
+          "batches_per_epoch": 250,
+          "parent_peak_rss_mb": 614.71875,
+          "child_peak_rss_mb": 417.703125
+        }
+      }
+    }
+  ],
+  "recommended_defaults": {
+    "num_workers": 0,
+    "persistent_workers": false,
+    "prefetch_factor": null,
+    "baseline_batches_per_second": 156.2185854205996,
+    "fastest_persistent_batches_per_second": 133.07964208787195,
+    "minimum_required_improvement_percent": 10.0,
+    "selection_window_percent": 5.0
+  }
+}
