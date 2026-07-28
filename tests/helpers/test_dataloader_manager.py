@@ -696,10 +696,6 @@ def test_external_loader_without_normalization_initializes_automatically(tmp_pat
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Context ratio precision is derived from the batch-size magnitude",
-)
 def test_context_ratio_is_preserved_for_small_batches(tmp_path):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()
@@ -717,3 +713,152 @@ def test_context_ratio_is_preserved_for_small_batches(tmp_path):
 
     assert manager.dataset.context_ratio == 0.5
     assert all(batch.context.idx.numel() > 0 for batch in batches)
+
+
+def _index_plan(manager, epoch, mode="train"):
+    return [
+        (
+            batch.context.idx.tolist(),
+            batch.query.idx.tolist(),
+        )
+        for batch in manager.set_loader(epoch=epoch, mode=mode)
+    ]
+
+
+def test_epoch_plan_depends_only_on_seed_and_requested_epoch(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=30))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.3,
+    )
+    config["model_settings"]["train"]["batch_size"] = 8
+    config["model_settings"]["train"]["dataset"]["shuffle_dataset"] = "global"
+
+    sequential = DataLoaderManager(mode="train", config_file=config)
+    _index_plan(sequential, 0)
+    _index_plan(sequential, 1)
+    expected = _index_plan(sequential, 5)
+
+    resumed = DataLoaderManager(mode="train", config_file=config)
+    direct = _index_plan(resumed, 5)
+
+    assert direct == expected
+    assert _index_plan(resumed, 5) == direct
+    assert _index_plan(resumed, 4) != direct
+
+
+@pytest.mark.parametrize("mode", ("validate", "test"))
+def test_evaluation_batch_plan_is_fixed_across_training_epochs(tmp_path, mode):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=40))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.25,
+    )
+    dataset_config = config["model_settings"]["train"]["dataset"]
+    dataset_config["shuffle_dataset"] = "global"
+    dataset_config["val_ratio"] = 0.2
+    dataset_config["test_ratio"] = 0.2
+
+    manager = DataLoaderManager(mode="train", config_file=config)
+    _index_plan(manager, 0, "train")
+    expected = _index_plan(manager, 0, mode)
+    _index_plan(manager, 7, "train")
+
+    assert _index_plan(manager, 7, mode) == expected
+
+
+@pytest.mark.parametrize("shuffle", ("global", "batch_wise", False))
+def test_paired_batches_cover_uneven_dataset_without_drops(
+    tmp_path,
+    shuffle,
+):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=23)
+    _write_csv(data_directory / "part_0.csv", rows)
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.25,
+    )
+    config["model_settings"]["train"]["batch_size"] = 8
+    config["model_settings"]["train"]["dataset"]["shuffle_dataset"] = shuffle
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    batches = list(manager.set_loader(epoch=3, mode="train"))
+
+    assert len(manager.dataset.data["train"]["context"]["batches"]) == len(
+        manager.dataset.data["train"]["target"]["batches"]
+    )
+    assert all(batch.context.idx.numel() > 0 for batch in batches)
+    assert all(batch.query.idx.numel() > 0 for batch in batches)
+
+    context_indices = torch.cat([batch.context.idx for batch in batches])
+    query_indices = torch.cat([batch.query.idx for batch in batches])
+    assert set(context_indices.tolist()).isdisjoint(query_indices.tolist())
+    assert sorted(
+        torch.cat((context_indices, query_indices)).tolist()
+    ) == list(range(len(rows)))
+
+
+def test_context_is_subset_of_query_when_configured(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=12)
+    _write_csv(data_directory / "part_0.csv", rows)
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.5,
+    )
+    config["model_settings"]["train"]["dataset"]["context_is_subset"] = True
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    batches = list(manager.set_loader(epoch=0, mode="train"))
+
+    for batch in batches:
+        assert set(batch.context.idx.tolist()).issubset(
+            batch.query.idx.tolist()
+        )
+        torch.testing.assert_close(
+            batch.target_y,
+            manager.dataset.data["data"]["y"]
+            .index_select(0, batch.query.idx)
+            .unsqueeze(0),
+        )
+
+    query_indices = torch.cat([batch.query.idx for batch in batches])
+    assert sorted(query_indices.tolist()) == list(range(len(rows)))
+
+
+def test_positive_sampling_plan_is_resume_deterministic(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=40)
+    for row_id, row in enumerate(rows):
+        row["signal"] = float(row_id % 10 == 0)
+    _write_csv(data_directory / "part_0.csv", rows)
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.2,
+    )
+    dataset_config = config["model_settings"]["train"]["dataset"]
+    dataset_config["shuffle_dataset"] = "global"
+    dataset_config["positive_ratio_train"] = 0.25
+    dataset_config["max_positive_reuse"] = 2
+
+    sequential = DataLoaderManager(mode="train", config_file=config)
+    _index_plan(sequential, 0)
+    _index_plan(sequential, 1)
+    expected = _index_plan(sequential, 4)
+
+    resumed = DataLoaderManager(mode="train", config_file=config)
+    assert _index_plan(resumed, 4) == expected
+    assert _index_plan(resumed, 3) != expected

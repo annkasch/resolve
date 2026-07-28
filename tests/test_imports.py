@@ -1,7 +1,10 @@
 import importlib
+import random
 import sys
 
+import numpy as np
 import pytest
+import torch
 
 
 @pytest.mark.parametrize(
@@ -35,3 +38,33 @@ def test_network_namespace_does_not_eagerly_import_optional_backends():
     importlib.reload(importlib.import_module("resolve.network_architectures"))
 
     assert optional_modules.isdisjoint(sys.modules)
+
+
+def test_importing_dataloader_manager_does_not_change_global_rng_state():
+    def next_values():
+        return (
+            random.random(),
+            np.random.random(),
+            torch.rand(1),
+        )
+
+    random.seed(731)
+    np.random.seed(731)
+    torch.manual_seed(731)
+    expected = next_values()
+
+    random.seed(731)
+    np.random.seed(731)
+    torch.manual_seed(731)
+    deterministic = torch.backends.cudnn.deterministic
+    benchmark = torch.backends.cudnn.benchmark
+
+    importlib.reload(
+        importlib.import_module("resolve.helpers.dataloader_manager")
+    )
+    actual = next_values()
+
+    assert actual[:2] == expected[:2]
+    torch.testing.assert_close(actual[2], expected[2])
+    assert torch.backends.cudnn.deterministic == deterministic
+    assert torch.backends.cudnn.benchmark == benchmark

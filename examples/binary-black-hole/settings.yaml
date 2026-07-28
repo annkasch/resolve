@@ -182,7 +182,7 @@ model_settings:
       mixup_ratio: 0.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0
-      context_is_subset: false # if true, context points are a subset of target points; if false, context and target points are drawn independently
+      context_is_subset: false # if true, context points are a subset of target points; if false, context and target points are disjoint
       context_ratio: 0. # ratio of context points to total points if context_is_subset is true
       use_feature_normalization: zscore # following normalizing methods are supported: "none", "zscore", "minmax"
       use_schedule: false
