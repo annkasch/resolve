@@ -72,3 +72,38 @@ def test_transform_and_inverse_transform_preserve_tensor_metadata(dtype):
     assert restored.dtype == values.dtype
     assert restored.device == values.device
     torch.testing.assert_close(restored, values)
+
+
+@pytest.mark.parametrize("method", ("zscore", "minmax", None))
+def test_chunked_fit_matches_single_tensor_fit(method):
+    values = torch.tensor(
+        [
+            [1.0, 100.0],
+            [2.0, 50.0],
+            [7.0, -20.0],
+            [9.0, 10.0],
+            [12.0, 5.0],
+        ],
+        dtype=torch.float32,
+    )
+    labels = ("first", "second")
+    direct = Normalizer(method)
+    direct.fit(values, "features", labels)
+    chunked = Normalizer(method)
+    chunked.fit_chunks(
+        torch.split(values, (2, 1, 2)),
+        "features",
+        labels,
+    )
+
+    torch.testing.assert_close(
+        chunked.transform(values, "features"),
+        direct.transform(values, "features"),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert chunked.feature_labels["features"] == labels
+    assert (
+        chunked.scalers["features"].n_samples_seen_
+        == values.shape[0]
+    )

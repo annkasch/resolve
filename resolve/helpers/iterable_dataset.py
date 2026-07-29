@@ -9,7 +9,11 @@ from resolve.helpers.data_source import (
     ValidatedDataSource,
     ValidationIssue,
 )
-from resolve.helpers.data_store import InMemoryDataStore
+from resolve.helpers.data_store import (
+    DataStore,
+    InMemoryDataStore,
+    StreamingMaterializationError,
+)
 from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
@@ -27,7 +31,8 @@ class InMemoryIterableData(IterableDataset):
 
     def __init__(self, data_source: ValidatedDataSource, batch_size: int = 1000,
                  dataset_config: DatasetSettings = None, positive_condition: Optional[Sequence[str]]=None,
-                 normalizer: Optional[Normalizer] = None, mode: Optional[str] = "train") -> None:
+                 normalizer: Optional[Normalizer] = None, mode: Optional[str] = "train",
+                 data_store: Optional[DataStore] = None) -> None:
         super().__init__()
 
         if not isinstance(data_source, ValidatedDataSource):
@@ -56,21 +61,34 @@ class InMemoryIterableData(IterableDataset):
             dtype=torch.int64,
         ).share_memory_()
 
-        self.store = InMemoryDataStore.from_source(
-            self.data_source,
-            chunk_rows=self.dataset_config.stream_chunk_rows,
+        self.store = (
+            InMemoryDataStore.from_source(
+                self.data_source,
+                chunk_rows=self.dataset_config.stream_chunk_rows,
+            )
+            if data_store is None
+            else data_store
         )
-        theta, phi, y, fidx = self.store.materialize()
+        if not isinstance(self.store, DataStore):
+            raise TypeError("data_store must implement the DataStore contract.")
+        if self.store.backend == "memory":
+            theta, phi, y, fidx = self.store.materialize()
+        else:
+            theta = None
+            phi = None
+            y = self.store.metadata_targets
+            fidx = self.store.metadata_file_indices
         self._validate_loaded_data(theta, phi, y, fidx)
 
         self.data = self._set_data(theta, phi, y, fidx)
-        stored = self.data["data"]
-        self.store.replace_tensors(
-            stored["theta"],
-            stored["phi"],
-            stored["y"],
-            stored["file_indices"],
-        )
+        if self.store.backend == "memory":
+            stored = self.data["data"]
+            self.store.replace_tensors(
+                stored["theta"],
+                stored["phi"],
+                stored["y"],
+                stored["file_indices"],
+            )
         self.build_batches(0)
 
     @staticmethod
@@ -134,10 +152,13 @@ class InMemoryIterableData(IterableDataset):
 
     def _validate_loaded_data(self, theta, phi, y, fidx):
         row_counts = {
-            "theta": theta.shape[0],
-            "phi": phi.shape[0],
+            "store": self.store.num_samples,
             "file_indices": fidx.shape[0],
         }
+        if theta is not None:
+            row_counts["theta"] = theta.shape[0]
+        if phi is not None:
+            row_counts["phi"] = phi.shape[0]
         if y is not None:
             row_counts["target"] = y.shape[0]
         issues = []
@@ -148,7 +169,7 @@ class InMemoryIterableData(IterableDataset):
                     f"has inconsistent row counts: {row_counts}",
                 )
             )
-        if not row_counts["phi"]:
+        if not row_counts["store"]:
             issues.append(
                 ValidationIssue(
                     "loaded data",
@@ -215,7 +236,28 @@ class InMemoryIterableData(IterableDataset):
         if issues:
             raise DataValidationError(issues)
         
-    def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
+    def _fit_normalizer_on_indices(self, normalizer, indices):
+        chunk_rows = self.dataset_config.stream_chunk_rows
+
+        def chunks(feature_group):
+            for index_chunk in torch.split(indices, chunk_rows):
+                theta, phi, _target, _file_indices = self.store.read_rows(
+                    index_chunk
+                )
+                yield theta if feature_group == "theta" else phi
+
+        normalizer.fit_chunks(
+            chunks("theta"),
+            "theta",
+            self.data_source.selected_labels("theta"),
+        )
+        normalizer.fit_chunks(
+            chunks("phi"),
+            "phi",
+            self.data_source.selected_labels("phi"),
+        )
+
+    def _set_data(self, theta, phi, y, fidx):
         self.context_ratio = self.dataset_config.context_ratio
         if not 0.0 <= self.context_ratio < 1.0:
             raise ValueError("context_ratio must be in [0, 1).")
@@ -252,7 +294,7 @@ class InMemoryIterableData(IterableDataset):
         else:
             positive_ratio_data = None
         splitter = Splitter(self.shuffle, seed=self.seed)
-        idx = torch.arange(phi.shape[0])
+        idx = torch.arange(self.store.num_samples)
         data = {}
         
         if self.mode == "train":
@@ -262,7 +304,11 @@ class InMemoryIterableData(IterableDataset):
                 idx, split_indices["validate"] = self._split_or_raise(
                     splitter,
                     idx,
-                    theta[idx],
+                    (
+                        theta[idx]
+                        if theta is not None
+                        else fidx.index_select(0, idx)
+                    ),
                     val_size,
                     "validate",
                 )
@@ -278,7 +324,11 @@ class InMemoryIterableData(IterableDataset):
                 idx, split_indices["test"] = self._split_or_raise(
                     splitter,
                     idx,
-                    theta[idx],
+                    (
+                        theta[idx]
+                        if theta is not None
+                        else fidx.index_select(0, idx)
+                    ),
                     configured_test_size / remaining_fraction,
                     "test",
                 )
@@ -290,18 +340,20 @@ class InMemoryIterableData(IterableDataset):
             self._normalizer = Normalizer(
                 self.dataset_config.use_feature_normalization
             )
-            self._normalizer.fit(
-                theta.index_select(0, idx),
-                "theta",
-                self.data_source.selected_labels("theta"),
-            )
-            self._normalizer.fit(
-                phi.index_select(0, idx),
-                "phi",
-                self.data_source.selected_labels("phi"),
-            )
-            theta = self._normalizer.transform(theta, "theta").float().contiguous()
-            phi = self._normalizer.transform(phi, "phi").float().contiguous()
+            self._fit_normalizer_on_indices(self._normalizer, idx)
+            if theta is not None:
+                theta = (
+                    self._normalizer.transform(theta, "theta")
+                    .float()
+                    .contiguous()
+                )
+                phi = (
+                    self._normalizer.transform(phi, "phi")
+                    .float()
+                    .contiguous()
+                )
+            else:
+                self.store.set_normalizer(self._normalizer)
 
             data.update(
                 {
@@ -316,6 +368,11 @@ class InMemoryIterableData(IterableDataset):
 
             # Apply mixup to training data only.
             if self.dataset_config.mixup_ratio > 0.0:
+                if self.store.backend != "memory":
+                    raise ValueError(
+                        "Streaming mixup is applied through batch-local plans "
+                        "and is not available in this implementation stage."
+                    )
                 theta[idx], phi[idx], y[idx], fidx[idx] = self.sampler.mix_by_file_chunks(
                             theta[idx], phi[idx], y[idx], fidx[idx], self.dataset_config.mixup_ratio,
                             use_beta=self.dataset_config.use_beta,
@@ -334,11 +391,20 @@ class InMemoryIterableData(IterableDataset):
             if self._canonical_normalization_method(
                 self.dataset_config.use_feature_normalization
             ) is None:
-                self._normalizer.fit(theta, "theta")
-                self._normalizer.fit(phi, "phi")
-            theta = self._normalizer.transform(x=theta, feature_grp="theta")
-            phi = self._normalizer.transform(x=phi, feature_grp="phi")
-            theta = theta.float().contiguous(); phi = phi.float().contiguous()
+                self._fit_normalizer_on_indices(self._normalizer, idx)
+            if theta is not None:
+                theta = self._normalizer.transform(
+                    x=theta,
+                    feature_grp="theta",
+                )
+                phi = self._normalizer.transform(
+                    x=phi,
+                    feature_grp="phi",
+                )
+                theta = theta.float().contiguous()
+                phi = phi.float().contiguous()
+            else:
+                self.store.set_normalizer(self._normalizer)
             self._base_indices[self.mode] = idx.clone()
             data = {
                 "data": {
@@ -534,42 +600,53 @@ class InMemoryIterableData(IterableDataset):
         b_start, b_end = self._compute_worker_slice(total_batches)  # reuse same helper; it just slices a range
         if b_start >= b_end:
             return iter(())
-        theta = self.data["data"]["theta"]
-        phi   = self.data["data"]["phi"]
-        y = self.data["data"]["y"]
-        file_indices = self.data["data"]["file_indices"]
-
         for b in range(b_start, b_end):
             idx_tgt = self.data[mode]["target"]["batches"][b]
-            b_phi_tgt = phi.index_select(0, idx_tgt).unsqueeze(0)
-            b_theta_tgt = theta.index_select(0, idx_tgt).unsqueeze(0)
+            (
+                b_theta_tgt,
+                b_phi_tgt,
+                b_y_tgt,
+                b_file_idx_tgt,
+            ) = self.store.read_rows(idx_tgt)
+            b_phi_tgt = b_phi_tgt.unsqueeze(0)
+            b_theta_tgt = b_theta_tgt.unsqueeze(0)
             b_y_tgt = (
-                y.index_select(0, idx_tgt).unsqueeze(0)
-                if y is not None
+                b_y_tgt.unsqueeze(0)
+                if b_y_tgt is not None
                 else None
             )
-            b_file_idx_tgt = file_indices.index_select(0, idx_tgt).unsqueeze(0)
+            b_file_idx_tgt = b_file_idx_tgt.unsqueeze(0)
 
             if self.context_ratio > 0.:
                 idx_ctx = self.data[mode]["context"]["batches"][b]
-                b_phi_ctx = phi.index_select(0, idx_ctx).unsqueeze(0)
-                b_theta_ctx = theta.index_select(0, idx_ctx).unsqueeze(0)
+                (
+                    b_theta_ctx,
+                    b_phi_ctx,
+                    b_y_ctx,
+                    b_file_idx_ctx,
+                ) = self.store.read_rows(idx_ctx)
+                b_phi_ctx = b_phi_ctx.unsqueeze(0)
+                b_theta_ctx = b_theta_ctx.unsqueeze(0)
                 b_y_ctx = (
-                    y.index_select(0, idx_ctx).unsqueeze(0)
-                    if y is not None
+                    b_y_ctx.unsqueeze(0)
+                    if b_y_ctx is not None
                     else None
                 )
-                b_file_idx_ctx = file_indices.index_select(0, idx_ctx).unsqueeze(0)
+                b_file_idx_ctx = b_file_idx_ctx.unsqueeze(0)
             else:
-                b_theta_ctx = theta.new_empty((1, 0, theta.shape[-1]))
-                b_phi_ctx = phi.new_empty((1, 0, phi.shape[-1]))
+                b_theta_ctx = b_theta_tgt.new_empty(
+                    (1, 0, b_theta_tgt.shape[-1])
+                )
+                b_phi_ctx = b_phi_tgt.new_empty(
+                    (1, 0, b_phi_tgt.shape[-1])
+                )
                 b_y_ctx = (
-                    y.new_empty((1, 0, y.shape[-1]))
-                    if y is not None
+                    b_y_tgt.new_empty((1, 0, b_y_tgt.shape[-1]))
+                    if b_y_tgt is not None
                     else None
                 )
                 idx_ctx = idx_tgt.new_empty((0,))
-                b_file_idx_ctx = file_indices.new_empty((1, 0))
+                b_file_idx_ctx = b_file_idx_tgt.new_empty((1, 0))
 
 
             batch = BatchCollection(
@@ -616,13 +693,18 @@ class InMemoryIterableData(IterableDataset):
         return self.data[self.mode]["meta"]["num_batches"]
     
     def num_samples(self) -> int:
-        return self.data["data"]["phi"].shape[-2]
+        return self.store.num_samples
     
     def get_data(
         self,
         key: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Get all data tensors for a given key ('train','test', 'validate')."""
+        if self.store.backend != "memory":
+            raise StreamingMaterializationError(
+                "get_data() requires complete tensors. Set "
+                "storage_mode='memory' for this model path."
+            )
         if key not in self.data.keys():
             raise ValueError(f"Invalid key: {key}. Must be one of {list(self.data.keys())}.")
         

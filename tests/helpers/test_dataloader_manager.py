@@ -22,6 +22,8 @@ from resolve.helpers.dataloader_manager import DataLoaderManager
 from resolve.helpers.data_store import (
     DataStore,
     InMemoryDataStore,
+    StreamingDataStore,
+    StreamingMaterializationError,
     select_storage_backend,
 )
 from resolve.helpers.iterable_dataset import InMemoryIterableData
@@ -1239,6 +1241,318 @@ def test_in_memory_store_implements_shared_data_store_contract(loader_case):
     assert first.start == 0
     assert first.stop == 3
     assert first.theta.shape[0] == 3
+
+
+def _collect_batches(manager, epoch, mode):
+    return [
+        {
+            "context_idx": batch.context.idx.clone(),
+            "query_idx": batch.query.idx.clone(),
+            "context_theta": batch.context.theta.clone(),
+            "context_phi": batch.context.phi.clone(),
+            "context_y": (
+                batch.context.y.clone()
+                if batch.context.y is not None
+                else None
+            ),
+            "query_theta": batch.query.theta.clone(),
+            "query_phi": batch.query.phi.clone(),
+            "target_y": (
+                batch.target_y.clone()
+                if batch.target_y is not None
+                else None
+            ),
+            "context_files": batch.context.file_indices.clone(),
+            "query_files": batch.query.file_indices.clone(),
+        }
+        for batch in manager.set_loader(epoch=epoch, mode=mode)
+    ]
+
+
+def _assert_batch_sequences_equal(first, second):
+    assert len(first) == len(second)
+    for left, right in zip(first, second):
+        assert left.keys() == right.keys()
+        for key in left:
+            if left[key] is None:
+                assert right[key] is None
+            else:
+                torch.testing.assert_close(left[key], right[key])
+
+
+@pytest.mark.parametrize("file_format", ("h5", "csv"))
+@pytest.mark.parametrize("normalization", (None, "zscore", "minmax"))
+def test_streaming_and_memory_backends_emit_identical_batches(
+    tmp_path,
+    file_format,
+    normalization,
+):
+    data_directory = tmp_path / file_format
+    data_directory.mkdir()
+    rows = _make_rows(0, count=24)
+    extension = "h5" if file_format == "h5" else "csv"
+    writer = _write_hdf5 if file_format == "h5" else _write_csv
+    writer(data_directory / f"part_0.{extension}", rows[:11])
+    writer(data_directory / f"part_1.{extension}", rows[11:])
+    base = _make_config(data_directory, file_format, context_ratio=0.3)
+    dataset = base["model_settings"]["train"]["dataset"]
+    dataset["shuffle_dataset"] = "global"
+    dataset["val_ratio"] = 0.2
+    dataset["test_ratio"] = 0.2
+    dataset["use_feature_normalization"] = normalization
+    dataset["stream_chunk_rows"] = 4
+    dataset["cache_directory"] = str(tmp_path / "cache")
+
+    memory_config = copy.deepcopy(base)
+    memory_config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "memory"
+    streaming_config = copy.deepcopy(base)
+    streaming_config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "streaming"
+    memory = DataLoaderManager("train", memory_config)
+    streaming = DataLoaderManager("train", streaming_config)
+
+    for mode in ("train", "validate", "test"):
+        memory_batches = _collect_batches(memory, 3, mode)
+        streaming_batches = _collect_batches(streaming, 3, mode)
+        _assert_batch_sequences_equal(memory_batches, streaming_batches)
+
+    assert memory.normalizer.feature_labels == streaming.normalizer.feature_labels
+    for feature_group in ("theta", "phi"):
+        left = memory.normalizer.scalers[feature_group]
+        right = streaming.normalizer.scalers[feature_group]
+        if normalization == "zscore":
+            np.testing.assert_allclose(left.mean_, right.mean_)
+            np.testing.assert_allclose(left.var_, right.var_)
+        elif normalization == "minmax":
+            np.testing.assert_allclose(left.data_min_, right.data_min_)
+            np.testing.assert_allclose(left.data_max_, right.data_max_)
+
+
+def test_csv_streaming_cache_is_reused_and_invalidated(tmp_path):
+    data_directory = tmp_path / "csv"
+    cache_directory = tmp_path / "cache"
+    data_directory.mkdir()
+    source_path = data_directory / "part_0.csv"
+    _write_csv(source_path, _make_rows(0))
+    config = _make_config(data_directory, "csv", context_ratio=0.0)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "streaming"
+    dataset["cache_directory"] = str(cache_directory)
+    dataset["stream_chunk_rows"] = 2
+
+    first = DataLoaderManager("train", config)
+    first.set_dataset()
+    first_path = first.dataset.store.cache_path
+    first_stat = first_path.stat()
+    first.close_loader()
+
+    second = DataLoaderManager("train", config)
+    second.set_dataset()
+    second_path = second.dataset.store.cache_path
+
+    assert second_path == first_path
+    assert second_path.stat().st_mtime_ns == first_stat.st_mtime_ns
+    assert not list(cache_directory.glob("*.tmp"))
+    second.close_loader()
+
+    _write_csv(source_path, _make_rows(0, count=7))
+    third = DataLoaderManager("train", config)
+    third.set_dataset()
+
+    assert third.dataset.store.cache_path != first_path
+    assert third.dataset.store.cache_path.exists()
+
+
+def test_streaming_store_refuses_full_materialization(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "streaming"
+    manager = DataLoaderManager("train", config)
+    manager.set_dataset()
+
+    assert isinstance(manager.dataset.store, StreamingDataStore)
+    with pytest.raises(StreamingMaterializationError, match="complete dataset"):
+        manager.dataset.store.materialize()
+    with pytest.raises(StreamingMaterializationError, match="get_data"):
+        manager.dataset.get_data("train")
+
+
+def test_streaming_native_hdf5_reads_are_bounded_by_chunk_size(
+    tmp_path,
+    monkeypatch,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0, count=20))
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "streaming"
+    dataset["stream_chunk_rows"] = 4
+    manager = DataLoaderManager("train", config)
+    manager.set_dataset()
+    spans = []
+    original = manager.dataset.store._read_bounded_rows
+
+    def tracked(dataset, rows, columns):
+        if len(rows):
+            buckets = rows // manager.dataset.store.chunk_rows
+            for bucket in np.unique(buckets):
+                selected = rows[buckets == bucket]
+                spans.append(int(selected[-1] - selected[0] + 1))
+        return original(dataset, rows, columns)
+
+    monkeypatch.setattr(
+        manager.dataset.store,
+        "_read_bounded_rows",
+        tracked,
+    )
+    manager.dataset.store.read_rows(
+        torch.tensor([19, 0, 7, 8, 3, 7], dtype=torch.long)
+    )
+
+    assert spans
+    assert max(spans) <= 4
+
+
+def test_auto_backend_uses_streaming_when_budget_is_exceeded(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    config["model_settings"]["train"]["dataset"][
+        "memory_budget_bytes"
+    ] = 1
+    manager = DataLoaderManager("train", config)
+
+    batches = list(manager.set_loader(0, "train"))
+
+    assert manager.storage_selection.backend == "streaming"
+    assert manager.dataset.store.backend == "streaming"
+    assert batches
+
+
+def test_streaming_external_loader_uses_training_normalizer(tmp_path):
+    train_directory = tmp_path / "train"
+    test_directory = tmp_path / "test"
+    train_directory.mkdir()
+    test_directory.mkdir()
+    _write_hdf5(train_directory / "part_0.h5", _make_rows(0))
+    test_rows = _make_rows(6)
+    _write_hdf5(test_directory / "part_0.h5", test_rows)
+    config = _make_config(train_directory, "h5", context_ratio=0.0)
+    config["path_settings"]["path_to_files_test"] = str(test_directory)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["use_feature_normalization"] = "zscore"
+    dataset["storage_mode"] = "streaming"
+
+    training = DataLoaderManager("train", config)
+    training.set_dataset()
+    external = DataLoaderManager(
+        "test",
+        config,
+        normalizer=training.normalizer,
+    )
+    batch = next(iter(external.set_loader(0)))
+    expected_theta = (
+        torch.tensor(
+            [[row["theta_value"]] for row in test_rows],
+            dtype=torch.float32,
+        )
+        - 12.5
+    ) / torch.tensor([1.707825127659933])
+
+    torch.testing.assert_close(
+        batch.query.theta.squeeze(0),
+        expected_theta,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("file_format", ("h5", "csv"))
+def test_streaming_inference_supports_unlabeled_sources(
+    tmp_path,
+    file_format,
+):
+    data_directory = tmp_path / file_format
+    data_directory.mkdir()
+    rows = _make_rows(0)
+    if file_format == "h5":
+        path = data_directory / "part_0.h5"
+        feature_values = np.asarray(
+            [[row[label] for label in FEATURE_LABELS] for row in rows],
+            dtype=np.float32,
+        )
+        with h5py.File(path, "w") as output:
+            dataset = output.create_group("features").create_dataset(
+                "values",
+                data=feature_values,
+            )
+            dataset.attrs["labels"] = np.asarray(FEATURE_LABELS, dtype="S")
+    else:
+        path = data_directory / "part_0.csv"
+        with path.open("w", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=FEATURE_LABELS)
+            writer.writeheader()
+            writer.writerows(
+                {label: row[label] for label in FEATURE_LABELS}
+                for row in rows
+            )
+    config = _make_config(data_directory, file_format, context_ratio=0.0)
+    del config["simulation_settings"]["target_labels"]
+    del config["simulation_settings"]["signal_condition"]
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "streaming"
+    dataset["cache_directory"] = str(tmp_path / "cache")
+    manager = DataLoaderManager("inference", config)
+
+    batch = next(iter(manager.set_loader(0)))
+
+    assert batch.target_y is None
+    assert batch.context.y is None
+    assert batch.query.theta.shape == (1, len(rows), 1)
+
+
+def test_streaming_hdf5_reports_malformed_feature_on_indexed_read(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    path = data_directory / "part_0.h5"
+    _write_hdf5(path, _make_rows(0))
+    with h5py.File(path, "a") as output:
+        output["features/values"][2, 0] = np.inf
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "streaming"
+    manager = DataLoaderManager("train", config)
+
+    with pytest.raises(ValueError, match="Non-finite numeric value"):
+        manager.set_dataset()
+
+
+def test_default_csv_cache_uses_model_output_directory(tmp_path):
+    data_directory = tmp_path / "csv"
+    output_directory = tmp_path / "model-output"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(data_directory, "csv", context_ratio=0.0)
+    config["path_settings"]["path_out_model"] = str(output_directory)
+    config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "streaming"
+    manager = DataLoaderManager("train", config)
+    manager.set_dataset()
+
+    assert manager.dataset.store.cache_path.parent == (
+        output_directory / ".resolve-cache"
+    )
 
 
 @pytest.mark.parametrize("injection", ("constructor", "set_dataset"))

@@ -1,6 +1,7 @@
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
 from sklearn.exceptions import NotFittedError
 from sklearn.utils.validation import check_is_fitted
+import numpy as np
 import torch
 
 
@@ -118,6 +119,92 @@ class Normalizer:
     ):
         self._bind_feature_schema(x, feature_grp, feature_labels)
         self._get_scaler(feature_grp).fit(self._to_numpy(x))
+
+    def fit_chunks(
+        self,
+        chunks,
+        feature_grp: str,
+        feature_labels=None,
+    ):
+        """Incrementally fit one feature group from bounded-size chunks."""
+        scaler = self._get_scaler(feature_grp)
+        count = 0
+        mean = None
+        squared_deviation = None
+        data_min = None
+        data_max = None
+        for chunk in chunks:
+            if chunk.shape[0] == 0:
+                continue
+            self._bind_feature_schema(
+                chunk,
+                feature_grp,
+                feature_labels if count == 0 else None,
+            )
+            values = np.asarray(self._to_numpy(chunk), dtype=np.float64)
+            if values.ndim == 1:
+                values = values.reshape(-1, 1)
+            if self.method == "zscore":
+                chunk_count = values.shape[0]
+                chunk_mean = values.mean(axis=0)
+                centered = values - chunk_mean
+                chunk_squared_deviation = np.square(centered).sum(axis=0)
+                if count == 0:
+                    mean = chunk_mean
+                    squared_deviation = chunk_squared_deviation
+                    count = chunk_count
+                else:
+                    delta = chunk_mean - mean
+                    combined_count = count + chunk_count
+                    mean = mean + delta * chunk_count / combined_count
+                    squared_deviation = (
+                        squared_deviation
+                        + chunk_squared_deviation
+                        + np.square(delta)
+                        * count
+                        * chunk_count
+                        / combined_count
+                    )
+                    count = combined_count
+            elif self.method == "minmax":
+                chunk_min = values.min(axis=0)
+                chunk_max = values.max(axis=0)
+                data_min = (
+                    chunk_min
+                    if data_min is None
+                    else np.minimum(data_min, chunk_min)
+                )
+                data_max = (
+                    chunk_max
+                    if data_max is None
+                    else np.maximum(data_max, chunk_max)
+                )
+                count += values.shape[0]
+            else:
+                scaler.partial_fit(values)
+                count += values.shape[0]
+        if count == 0:
+            raise ValueError(
+                f"Cannot fit feature group {feature_grp!r} from no samples."
+            )
+        if self.method == "zscore":
+            scaler.mean_ = mean
+            scaler.var_ = squared_deviation / count
+            scaler.scale_ = np.sqrt(scaler.var_)
+            scaler.scale_[scaler.scale_ == 0.0] = 1.0
+            scaler.n_samples_seen_ = count
+            scaler.n_features_in_ = mean.shape[0]
+        elif self.method == "minmax":
+            scaler.data_min_ = data_min
+            scaler.data_max_ = data_max
+            scaler.data_range_ = data_max - data_min
+            denominator = scaler.data_range_.copy()
+            denominator[denominator == 0.0] = 1.0
+            feature_min, feature_max = scaler.feature_range
+            scaler.scale_ = (feature_max - feature_min) / denominator
+            scaler.min_ = feature_min - data_min * scaler.scale_
+            scaler.n_samples_seen_ = count
+            scaler.n_features_in_ = data_min.shape[0]
     
     def fit_transform(
         self,

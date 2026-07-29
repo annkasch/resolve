@@ -1,9 +1,13 @@
 import logging
 import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from resolve.helpers.data_source import preflight_data_loader
-from resolve.helpers.data_store import select_storage_backend
+from resolve.helpers.data_store import (
+    StreamingDataStore,
+    select_storage_backend,
+)
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.loader_lifecycle import (
     ReusableDataLoader,
@@ -198,12 +202,6 @@ class DataLoaderManager:
             storage_selection.memory_budget_bytes / 1024**2,
             storage_selection.reason,
         )
-        if storage_selection.backend != "memory":
-            raise ValueError(
-                "The streaming backend was selected but is not available in "
-                "this storage implementation. Set storage_mode='memory' or "
-                "increase the configured memory budget."
-            )
         external_normalizer = (
             normalizer if normalizer is not None else self._normalizer
         )
@@ -231,16 +229,42 @@ class DataLoaderManager:
                 "set_dataset(normalizer=...)."
             )
 
-        replacement = InMemoryIterableData(
-                data_source=data_source,
-                batch_size=specification.batch_size,
-                dataset_config=specification.dataset,
-                positive_condition=specification.positive_condition,
-                normalizer=(
-                    None if self.mode == "train" else external_normalizer
-                ),
-                mode=self.mode
+        cache_directory = specification.dataset.cache_directory
+        if cache_directory is None:
+            configured_output = self.config_file.get(
+                "path_settings",
+                {},
+            ).get("path_out_model")
+            cache_directory = (
+                Path(configured_output).expanduser() / ".resolve-cache"
+                if configured_output
+                else Path.home() / ".cache" / "resolve"
             )
+        data_store = (
+            StreamingDataStore(
+                data_source,
+                chunk_rows=specification.dataset.stream_chunk_rows,
+                cache_directory=cache_directory,
+            )
+            if storage_selection.backend == "streaming"
+            else None
+        )
+        try:
+            replacement = InMemoryIterableData(
+                    data_source=data_source,
+                    batch_size=specification.batch_size,
+                    dataset_config=specification.dataset,
+                    positive_condition=specification.positive_condition,
+                    normalizer=(
+                        None if self.mode == "train" else external_normalizer
+                    ),
+                    mode=self.mode,
+                    data_store=data_store,
+                )
+        except Exception:
+            if data_store is not None:
+                data_store.close()
+            raise
         self._dispose_loader(close_dataset=True)
         self._install_preflight(specification, data_source)
         self.dataset = replacement
