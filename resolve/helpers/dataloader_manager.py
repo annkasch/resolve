@@ -1,3 +1,6 @@
+import os
+from collections.abc import Mapping, Sequence
+
 from resolve.helpers.data_source import preflight_data_loader
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.loader_lifecycle import (
@@ -5,6 +8,33 @@ from resolve.helpers.loader_lifecycle import (
     shutdown_loader,
 )
 from resolve.helpers.normalizer import Normalizer
+
+
+def _freeze_signature(value):
+    if isinstance(value, Mapping):
+        return (
+            "mapping",
+            tuple(
+                sorted(
+                    (
+                        repr(key),
+                        _freeze_signature(item),
+                    )
+                    for key, item in value.items()
+                )
+            ),
+        )
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        (str, bytes, bytearray),
+    ):
+        return (
+            type(value).__qualname__,
+            tuple(_freeze_signature(item) for item in value),
+        )
+    if isinstance(value, os.PathLike):
+        return ("path", os.fspath(value))
+    return (type(value).__qualname__, repr(value))
 
 
 class DataLoaderManager:
@@ -35,6 +65,8 @@ class DataLoaderManager:
     def _install_preflight(self, specification, data_source):
         self._specification = specification
         self._data_source = data_source
+        self._configuration_signature = _freeze_signature(self.config_file)
+        self._source_signature = self._source_manifest(specification)
         self.files = [
             str(path) for path in self._data_source.paths
         ]
@@ -47,6 +79,48 @@ class DataLoaderManager:
         }
         self.positive_condition = list(
             self._specification.positive_condition
+        )
+
+    @staticmethod
+    def _source_manifest(specification):
+        paths = sorted(
+            specification.data_directory.glob(
+                f"*.{specification.file_format}"
+            )
+        )
+        manifest = []
+        for path in paths:
+            try:
+                stat = path.stat()
+            except OSError:
+                manifest.append((str(path), None))
+                continue
+            manifest.append(
+                (
+                    str(path),
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            )
+        return tuple(manifest)
+
+    def _preflight_is_current(self):
+        return (
+            _freeze_signature(self.config_file)
+            == self._configuration_signature
+            and self._source_manifest(self._specification)
+            == self._source_signature
+        )
+
+    def _current_preflight(self):
+        if self._preflight_is_current():
+            return self._specification, self._data_source
+        return preflight_data_loader(
+            self.mode,
+            self.config_file,
         )
 
     @staticmethod
@@ -109,10 +183,7 @@ class DataLoaderManager:
         self._normalizer = normalizer
 
     def set_dataset(self, normalizer=None):
-        specification, data_source = preflight_data_loader(
-            self.mode,
-            self.config_file,
-        )
+        specification, data_source = self._current_preflight()
         external_normalizer = (
             normalizer if normalizer is not None else self._normalizer
         )

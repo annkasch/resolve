@@ -771,6 +771,90 @@ def test_preflight_does_not_load_csv_values(tmp_path, monkeypatch):
     assert manager.dataset is None
 
 
+def test_unchanged_dataset_setup_reuses_preflight_schema(
+    tmp_path,
+    monkeypatch,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "h5"),
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("unchanged schema was inspected again")
+
+    monkeypatch.setattr(
+        dataloader_manager_module,
+        "preflight_data_loader",
+        fail_if_called,
+    )
+
+    manager.set_dataset()
+
+    assert manager.dataset.num_samples() == 6
+
+
+def test_configuration_change_invalidates_cached_preflight(
+    tmp_path,
+    monkeypatch,
+):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(data_directory, "csv")
+    manager = DataLoaderManager(mode="train", config_file=config)
+    original_preflight = dataloader_manager_module.preflight_data_loader
+    calls = []
+
+    def tracked_preflight(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dataloader_manager_module,
+        "preflight_data_loader",
+        tracked_preflight,
+    )
+    config["model_settings"]["train"]["dataset"]["context_ratio"] = 1.0
+
+    with pytest.raises(DataValidationError, match="context_ratio"):
+        manager.set_dataset()
+
+    assert len(calls) == 1
+
+
+def test_source_change_invalidates_cached_preflight(tmp_path, monkeypatch):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    path = data_directory / "part_0.csv"
+    _write_csv(path, _make_rows(0))
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "csv"),
+    )
+    original_preflight = dataloader_manager_module.preflight_data_loader
+    calls = []
+
+    def tracked_preflight(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original_preflight(*args, **kwargs)
+
+    monkeypatch.setattr(
+        dataloader_manager_module,
+        "preflight_data_loader",
+        tracked_preflight,
+    )
+    _write_csv(path, _make_rows(0, count=7))
+
+    manager.set_dataset()
+
+    assert len(calls) == 1
+    assert manager.dataset.num_samples() == 7
+
+
 def test_csv_value_parse_error_reports_file_row_and_column(tmp_path):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()
