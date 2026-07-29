@@ -8,6 +8,33 @@ import torch
 from resolve.helpers.data_schema import DataFileSpec, ValidatedDataSource
 
 
+def _as_finite_float32(
+    values: np.ndarray,
+    file_spec: DataFileSpec,
+    selection,
+    *,
+    row_offset: int,
+) -> np.ndarray:
+    if np.iscomplexobj(values):
+        raise ValueError(
+            f"Complex values are not supported in {str(file_spec.path)!r}, "
+            f"column {selection.selected_labels[0]!r}."
+        )
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.asarray(values, dtype=np.float32)
+    invalid = ~np.isfinite(converted)
+    if invalid.any():
+        row, column = np.argwhere(invalid)[0]
+        label = selection.selected_labels[column]
+        value = np.asarray(values)[row, column]
+        raise ValueError(
+            f"Non-finite numeric value {value!r} in "
+            f"{str(file_spec.path)!r}, row {row + row_offset}, "
+            f"column {label!r}."
+        )
+    return converted
+
+
 def load_data_source(
     source: ValidatedDataSource,
 ) -> tuple[
@@ -81,7 +108,12 @@ def _load_hdf5_file(file_spec: DataFileSpec) -> dict[str, np.ndarray]:
                 else:
                     values = dataset[:, list(selection.physical_indices)]
                     values = values[:, selection.configured_order]
-                arrays[selection.name] = np.asarray(values)
+                arrays[selection.name] = _as_finite_float32(
+                    np.asarray(values),
+                    file_spec,
+                    selection,
+                    row_offset=1,
+                )
     except (OSError, ValueError, TypeError) as error:
         raise ValueError(
             f"Failed to load HDF5 values from {str(file_spec.path)!r}: "
@@ -99,7 +131,11 @@ def _load_csv_file(file_spec: DataFileSpec) -> dict[str, np.ndarray]:
         }
     )
     try:
-        frame = pd.read_csv(file_spec.path, usecols=physical_indices)
+        frame = pd.read_csv(
+            file_spec.path,
+            usecols=physical_indices,
+            skip_blank_lines=False,
+        )
     except Exception as error:
         raise ValueError(
             f"Failed to load CSV values from {str(file_spec.path)!r}: {error}"
@@ -117,17 +153,27 @@ def _load_csv_file(file_spec: DataFileSpec) -> dict[str, np.ndarray]:
         ]
         selected = frame.iloc[:, loaded_indices]
         numeric = selected.apply(pd.to_numeric, errors="coerce")
-        invalid = numeric.isna() & ~selected.isna()
-        if invalid.to_numpy().any():
-            row, column = np.argwhere(invalid.to_numpy())[0]
+        missing_or_invalid = numeric.isna()
+        if missing_or_invalid.to_numpy().any():
+            row, column = np.argwhere(missing_or_invalid.to_numpy())[0]
             label = selected.columns[column]
             value = selected.iat[row, column]
+            description = (
+                "Missing numeric value"
+                if pd.isna(value)
+                else f"Failed to parse numeric value {value!r}"
+            )
             raise ValueError(
-                f"Failed to parse numeric value {value!r} in "
-                f"{str(file_spec.path)!r}, row {row + 2}, column {label!r}."
+                f"{description} in {str(file_spec.path)!r}, "
+                f"row {row + 2}, column {label!r}."
             )
         values = numeric.to_numpy()[:, selection.configured_order]
-        arrays[selection.name] = values
+        arrays[selection.name] = _as_finite_float32(
+            values,
+            file_spec,
+            selection,
+            row_offset=2,
+        )
     return arrays
 
 

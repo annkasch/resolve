@@ -295,11 +295,15 @@ def _inspect_hdf5_file(
                             "contains no data rows",
                         )
                     )
-                if not np.issubdtype(dataset.dtype, np.number):
+                if (
+                    not np.issubdtype(dataset.dtype, np.number)
+                    or np.issubdtype(dataset.dtype, np.complexfloating)
+                ):
                     issues.append(
                         ValidationIssue(
                             f"{path}:{dataset_key}",
-                            f"must have a numeric dtype, got {dataset.dtype}",
+                            "must have a real numeric dtype, "
+                            f"got {dataset.dtype}",
                         )
                     )
                 labels = _decode_hdf5_labels(

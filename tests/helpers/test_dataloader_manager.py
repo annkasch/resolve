@@ -791,6 +791,99 @@ def test_csv_value_parse_error_reports_file_row_and_column(tmp_path):
         manager.set_dataset()
 
 
+@pytest.mark.parametrize("value", ("", "nan"))
+def test_csv_missing_value_reports_file_row_and_column(tmp_path, value):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    path = data_directory / "part_0.csv"
+    _write_csv(path, _make_rows(0))
+    rows = path.read_text(encoding="utf-8").splitlines()
+    rows[2] = rows[2].replace("101.0", value)
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "csv"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Missing numeric value.*row 3, column 'phi_value'",
+    ):
+        manager.set_dataset()
+
+
+@pytest.mark.parametrize("value", ("inf", "-inf", "1e300"))
+def test_csv_nonfinite_value_reports_file_row_and_column(tmp_path, value):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    path = data_directory / "part_0.csv"
+    _write_csv(path, _make_rows(0))
+    rows = path.read_text(encoding="utf-8").splitlines()
+    rows[2] = rows[2].replace("101.0", value)
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "csv"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Non-finite numeric value.*row 3, column 'phi_value'",
+    ):
+        manager.set_dataset()
+
+
+@pytest.mark.parametrize("value", (np.nan, np.inf, -np.inf, 1e300))
+def test_hdf5_nonfinite_value_reports_file_row_and_column(tmp_path, value):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    path = data_directory / "part_0.h5"
+    _write_hdf5(path, _make_rows(0))
+    with h5py.File(path, "a") as output:
+        if np.isfinite(value):
+            values = output["features/values"][:].astype(np.float64)
+            values[1, 1] = value
+            del output["features/values"]
+            dataset = output["features"].create_dataset(
+                "values",
+                data=values,
+            )
+            dataset.attrs["labels"] = np.asarray(
+                FEATURE_LABELS,
+                dtype="S",
+            )
+        else:
+            output["features/values"][1, 1] = value
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "h5"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"Non-finite numeric value.*row 2, column 'phi_value'",
+    ):
+        manager.set_dataset()
+
+
+def test_hdf5_preflight_rejects_complex_dtype(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    path = data_directory / "part_0.h5"
+    _write_hdf5(path, _make_rows(0))
+    with h5py.File(path, "a") as output:
+        values = output["features/values"][:].astype(np.complex64)
+        del output["features/values"]
+        dataset = output["features"].create_dataset("values", data=values)
+        dataset.attrs["labels"] = np.asarray(FEATURE_LABELS, dtype="S")
+
+    with pytest.raises(DataValidationError, match="real numeric dtype"):
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(data_directory, "h5"),
+        )
+
+
 def test_dataset_replacement_revalidates_before_loading(tmp_path, monkeypatch):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()
