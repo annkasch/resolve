@@ -274,6 +274,17 @@ class StreamingDataStore(DataStore):
             self._handles = {}
             self._handle_pid = current_pid
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_handles"] = {}
+        state["_handle_pid"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._handles = {}
+        self._handle_pid = os.getpid()
+
     def _handle(self, path):
         self._ensure_process_handles()
         key = str(path)

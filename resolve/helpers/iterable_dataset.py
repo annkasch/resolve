@@ -1,7 +1,8 @@
 import math
 import torch
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import Dataset
 from typing import Optional, Sequence, Tuple
+from resolve.helpers.batch_requests import BatchRequest, BatchSpan
 from resolve.helpers.batch_types import BatchCollection, ContextSet, QuerySet
 from resolve.helpers.data_source import (
     DataValidationError,
@@ -18,7 +19,7 @@ from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
 
-class InMemoryIterableData(IterableDataset):
+class InMemoryIterableData(Dataset):
     _MODE_TO_CODE = {
         "train": 0,
         "validate": 1,
@@ -52,6 +53,10 @@ class InMemoryIterableData(IterableDataset):
         self.sampler = Sampler(positive_condition, shuffle=self.shuffle, seed=self.seed)
         self._base_indices = {}
         self._built_epochs = {}
+        self._batch_plan_build_count = torch.tensor(
+            0,
+            dtype=torch.int64,
+        ).share_memory_()
         self._iteration_mode = torch.tensor(
             self._MODE_TO_CODE[self.mode],
             dtype=torch.int64,
@@ -419,17 +424,14 @@ class InMemoryIterableData(IterableDataset):
         return data
 
     def _empty_mode_plan(self, positive_ratio):
-        empty = torch.empty(0, dtype=torch.long)
         return {
+            "order": torch.empty(0, dtype=torch.long),
+            "spans": (),
             "context": {
-                "indices": empty,
-                "batches": (),
                 "batch_size": self.batch_size_ctx,
                 "ratio": self.context_ratio,
             },
             "target": {
-                "indices": empty,
-                "batches": (),
                 "batch_size": self.batch_size_tgt,
                 "ratio": 1.0 - self.context_ratio,
             },
@@ -512,6 +514,7 @@ class InMemoryIterableData(IterableDataset):
         if self._built_epochs.get(mode) == plan_epoch:
             return
 
+        self._batch_plan_build_count.add_(1)
         indices, sampling_meta = self._indices_for_epoch(mode, plan_epoch)
         combined_batches, _, _ = self.sampler.build_batches(
             indices,
@@ -520,8 +523,9 @@ class InMemoryIterableData(IterableDataset):
         )
         combined_batches = self._rebalance_singleton_batch(combined_batches)
 
-        context_batches = []
-        target_batches = []
+        ordered_batches = []
+        spans = []
+        start = 0
         for combined_batch in combined_batches:
             if self.context_ratio > 0.0:
                 if combined_batch.numel() < 2:
@@ -538,35 +542,31 @@ class InMemoryIterableData(IterableDataset):
                         ),
                     ),
                 )
-                context_batch = combined_batch[:context_size]
             else:
-                context_batch = combined_batch.new_empty((0,))
-
-            if self.context_is_subset:
-                target_batch = combined_batch
-            else:
-                target_batch = combined_batch[context_batch.numel():]
-
-            context_batches.append(context_batch)
-            target_batches.append(target_batch)
+                context_size = 0
+            stop = start + combined_batch.numel()
+            ordered_batches.append(combined_batch)
+            spans.append(
+                BatchSpan(
+                    start=start,
+                    stop=stop,
+                    context_size=context_size,
+                    context_is_subset=self.context_is_subset,
+                )
+            )
+            start = stop
 
         mode_data = self.data[mode]
-        mode_data["context"]["batches"] = tuple(context_batches)
-        mode_data["target"]["batches"] = tuple(target_batches)
-        mode_data["context"]["indices"] = (
-            torch.cat(context_batches)
-            if context_batches
+        mode_data["order"] = (
+            torch.cat(ordered_batches)
+            if ordered_batches
             else torch.empty(0, dtype=torch.long)
         )
-        mode_data["target"]["indices"] = (
-            torch.cat(target_batches)
-            if target_batches
-            else torch.empty(0, dtype=torch.long)
-        )
-        mode_data["meta"]["num_batches"] = len(target_batches)
+        mode_data["spans"] = tuple(spans)
+        mode_data["meta"]["num_batches"] = len(spans)
         if sampling_meta is not None:
             mode_data["meta"].update(sampling_meta)
-            mode_data["meta"]["num_batches"] = len(target_batches)
+            mode_data["meta"]["num_batches"] = len(spans)
         self._built_epochs[mode] = plan_epoch
 
     def set_mode(self, mode):
@@ -583,92 +583,93 @@ class InMemoryIterableData(IterableDataset):
         self.set_mode(mode)
         self._iteration_epoch.fill_(int(epoch))
     
-    def _compute_worker_slice(self, n: int) -> Tuple[int, int]:
-        info = get_worker_info()
-        if info is None: return 0, n
-        per = int(math.ceil(n / info.num_workers)); s = info.id * per; e = min(s + per, n); return s, e
+    def batch_plan(self, mode):
+        return self.data[mode]["order"], self.data[mode]["spans"]
 
-    def __iter__(self):
-        """Iterator for train/validate/test. Uses precomputed batch-index plans if present."""
-        mode = self._CODE_TO_MODE[int(self._iteration_mode.item())]
-        epoch = int(self._iteration_epoch.item())
-        self.mode = mode
-        self.build_batches(epoch, mode=mode)
+    def context_indices(self, mode):
+        order, spans = self.batch_plan(mode)
+        pieces = [
+            order[span.start:span.start + span.context_size]
+            for span in spans
+        ]
+        return (
+            torch.cat(pieces)
+            if pieces
+            else torch.empty(0, dtype=torch.long)
+        )
 
-        batches_tgt = self.data[mode]["target"].get("batches", None)
-        total_batches = len(batches_tgt)
-        b_start, b_end = self._compute_worker_slice(total_batches)  # reuse same helper; it just slices a range
-        if b_start >= b_end:
-            return iter(())
-        for b in range(b_start, b_end):
-            idx_tgt = self.data[mode]["target"]["batches"][b]
-            (
-                b_theta_tgt,
-                b_phi_tgt,
-                b_y_tgt,
-                b_file_idx_tgt,
-            ) = self.store.read_rows(idx_tgt)
-            b_phi_tgt = b_phi_tgt.unsqueeze(0)
-            b_theta_tgt = b_theta_tgt.unsqueeze(0)
-            b_y_tgt = (
-                b_y_tgt.unsqueeze(0)
-                if b_y_tgt is not None
-                else None
-            )
-            b_file_idx_tgt = b_file_idx_tgt.unsqueeze(0)
+    def query_indices(self, mode):
+        order, spans = self.batch_plan(mode)
+        pieces = [
+            order[
+                span.start
+                if span.context_is_subset
+                else span.start + span.context_size
+                :span.stop
+            ]
+            for span in spans
+        ]
+        return (
+            torch.cat(pieces)
+            if pieces
+            else torch.empty(0, dtype=torch.long)
+        )
 
-            if self.context_ratio > 0.:
-                idx_ctx = self.data[mode]["context"]["batches"][b]
-                (
-                    b_theta_ctx,
-                    b_phi_ctx,
-                    b_y_ctx,
-                    b_file_idx_ctx,
-                ) = self.store.read_rows(idx_ctx)
-                b_phi_ctx = b_phi_ctx.unsqueeze(0)
-                b_theta_ctx = b_theta_ctx.unsqueeze(0)
-                b_y_ctx = (
-                    b_y_ctx.unsqueeze(0)
+    def __getitem__(self, request):
+        if not isinstance(request, BatchRequest):
+            raise TypeError("Dataset indices must be BatchRequest objects.")
+        (
+            theta,
+            phi,
+            target,
+            file_indices,
+        ) = self.store.read_rows(request.indices)
+        context_size = request.context_size
+        idx_ctx = request.indices[:context_size]
+        query_start = 0 if request.context_is_subset else context_size
+        idx_tgt = request.indices[query_start:]
+
+        b_theta_ctx = theta[:context_size].unsqueeze(0)
+        b_phi_ctx = phi[:context_size].unsqueeze(0)
+        b_y_ctx = (
+            target[:context_size].unsqueeze(0)
+            if target is not None
+            else None
+        )
+        b_file_idx_ctx = file_indices[:context_size].unsqueeze(0)
+        b_theta_tgt = theta[query_start:].unsqueeze(0)
+        b_phi_tgt = phi[query_start:].unsqueeze(0)
+        b_y_tgt = (
+            target[query_start:].unsqueeze(0)
+            if target is not None
+            else None
+        )
+        b_file_idx_tgt = file_indices[query_start:].unsqueeze(0)
+
+        return BatchCollection(
+            context=ContextSet(
+                theta=b_theta_ctx.contiguous(),
+                phi=b_phi_ctx.contiguous(),
+                y=(
+                    b_y_ctx.contiguous()
                     if b_y_ctx is not None
                     else None
-                )
-                b_file_idx_ctx = b_file_idx_ctx.unsqueeze(0)
-            else:
-                b_theta_ctx = b_theta_tgt.new_empty(
-                    (1, 0, b_theta_tgt.shape[-1])
-                )
-                b_phi_ctx = b_phi_tgt.new_empty(
-                    (1, 0, b_phi_tgt.shape[-1])
-                )
-                b_y_ctx = (
-                    b_y_tgt.new_empty((1, 0, b_y_tgt.shape[-1]))
-                    if b_y_tgt is not None
-                    else None
-                )
-                idx_ctx = idx_tgt.new_empty((0,))
-                b_file_idx_ctx = b_file_idx_tgt.new_empty((1, 0))
-
-
-            batch = BatchCollection(
-                context=ContextSet(
-                    theta=b_theta_ctx.contiguous(),
-                    phi=b_phi_ctx.contiguous(),
-                    y=(
-                        b_y_ctx.contiguous()
-                        if b_y_ctx is not None
-                        else None
-                    ),
-                    idx=idx_ctx,
-                    file_indices=b_file_idx_ctx,
                 ),
-                query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt, file_indices=b_file_idx_tgt),
-                target_y=(
-                    b_y_tgt.contiguous()
-                    if b_y_tgt is not None
-                    else None
-                ),
-            )
-            yield batch
+                idx=idx_ctx,
+                file_indices=b_file_idx_ctx,
+            ),
+            query=QuerySet(
+                theta=b_theta_tgt.contiguous(),
+                phi=b_phi_tgt.contiguous(),
+                idx=idx_tgt,
+                file_indices=b_file_idx_tgt,
+            ),
+            target_y=(
+                b_y_tgt.contiguous()
+                if b_y_tgt is not None
+                else None
+            ),
+        )
 
     def close(self):
         """Delete all tensors and arrays from memory to free up resources."""
@@ -708,15 +709,7 @@ class InMemoryIterableData(IterableDataset):
         if key not in self.data.keys():
             raise ValueError(f"Invalid key: {key}. Must be one of {list(self.data.keys())}.")
         
-        if self.context_is_subset or self.context_ratio == 0.0:
-            idx = self.data[key]["target"]["indices"]
-        else:
-            idx = torch.cat(
-                (
-                    self.data[key]["context"]["indices"],
-                    self.data[key]["target"]["indices"],
-                )
-            )
+        idx = self.data[key]["order"]
         theta = self.data["data"]["theta"]
         phi = self.data["data"]["phi"]
         y = self.data["data"]["y"]

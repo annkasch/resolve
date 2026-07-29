@@ -3,6 +3,7 @@ import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from resolve.helpers.batch_requests import BatchRequestSampler
 from resolve.helpers.data_source import preflight_data_loader
 from resolve.helpers.data_store import (
     StreamingDataStore,
@@ -56,6 +57,7 @@ class DataLoaderManager:
         self.dataloader = None
         self._normalizer = None
         self.dataset = None
+        self._request_sampler = None
         self._preflight()
         if normalizer is not None:
             self._store_external_normalizer(normalizer)
@@ -270,6 +272,7 @@ class DataLoaderManager:
         self.dataset = replacement
         self.storage_selection = storage_selection
         self._normalizer = self.dataset._normalizer
+        self._request_sampler = None
 
     def _loader_options(self):
         settings = self._specification.loader
@@ -301,6 +304,7 @@ class DataLoaderManager:
             dataset.close()
             if self.dataset is dataset:
                 self.dataset = None
+            self._request_sampler = None
 
     def set_loader(self, epoch, mode=None, shuffle=True):
         """Return the cached loader configured for one complete iteration.
@@ -332,12 +336,16 @@ class DataLoaderManager:
         )
         self.dataset.build_batches(plan_epoch, mode=mode)
         self.dataset.set_iteration(mode, plan_epoch)
+        order, spans = self.dataset.batch_plan(mode)
 
         if self.dataloader is None:
+            self._request_sampler = BatchRequestSampler()
             self.dataloader = ReusableDataLoader(
                 self.dataset,
+                sampler=self._request_sampler,
                 **self._loader_options(),
             )
+        self._request_sampler.set_plan(order, spans)
 
         return self.dataloader
     

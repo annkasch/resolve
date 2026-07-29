@@ -12,6 +12,7 @@ import resolve.helpers.data_readers as data_readers
 import resolve.helpers.data_source as data_source
 import resolve.helpers.dataloader_manager as dataloader_manager_module
 import resolve.helpers.iterable_dataset as iterable_dataset_module
+from resolve.helpers.batch_requests import BatchRequest, BatchRequestSampler
 from resolve.helpers import (
     BatchCollection,
     ContextSet,
@@ -247,8 +248,8 @@ def test_loader_emits_expected_values_and_batch_contract(loader_case):
 
     context_indices = torch.cat([batch.context.idx for batch in batches])
     query_indices = torch.cat([batch.query.idx for batch in batches])
-    expected_context_indices = manager.dataset.data["train"]["context"]["indices"]
-    expected_query_indices = manager.dataset.data["train"]["target"]["indices"]
+    expected_context_indices = manager.dataset.context_indices("train")
+    expected_query_indices = manager.dataset.query_indices("train")
 
     assert sorted(context_indices.tolist()) == sorted(
         expected_context_indices.tolist()
@@ -282,7 +283,7 @@ def test_normalizer_is_fit_only_on_training_rows(tmp_path):
     manager = DataLoaderManager(mode="train", config_file=config)
     manager.set_dataset()
 
-    train_indices = manager.dataset.data["train"]["target"]["indices"]
+    train_indices = manager.dataset.query_indices("train")
     raw_theta = np.asarray([row["theta_value"] for row in rows])
     raw_phi = np.asarray([row["phi_value"] for row in rows])
     expected_theta_mean = raw_theta[train_indices.tolist()].mean()
@@ -1043,7 +1044,7 @@ def test_warmup_ratio_schedule_remains_deferred_until_scalar_phase(tmp_path):
     manager.set_dataset()
 
     assert manager.dataset.dataset_config.positive_ratio_train == (0.2, 0.1)
-    assert manager.dataset.data["train"]["target"]["indices"].numel() == len(
+    assert manager.dataset.query_indices("train").numel() == len(
         rows
     )
 
@@ -1064,7 +1065,8 @@ def test_loader_batch_types_are_canonical_and_dead_apis_are_removed(
     assert not hasattr(dataloader_manager_module, "running_average")
 
     assert "make_empty_like" not in InMemoryIterableData.__dict__
-    assert "__getitem__" not in InMemoryIterableData.__dict__
+    assert "__iter__" not in InMemoryIterableData.__dict__
+    assert "__getitem__" in InMemoryIterableData.__dict__
     assert "set_normalizer" not in InMemoryIterableData.__dict__
     assert not hasattr(manager.dataset, "theta_to_id")
     assert not hasattr(manager.dataset, "nepochs")
@@ -1555,6 +1557,116 @@ def test_default_csv_cache_uses_model_output_directory(tmp_path):
     )
 
 
+def test_main_process_sampler_sends_one_combined_request_per_batch(
+    loader_case,
+    monkeypatch,
+):
+    manager, _rows = loader_case
+    loader = manager.set_loader(epoch=0, mode="train")
+    assert isinstance(loader.sampler, BatchRequestSampler)
+    requests = tuple(loader.sampler)
+    assert requests
+    assert all(isinstance(request, BatchRequest) for request in requests)
+    mode_plan = manager.dataset.data["train"]
+    assert set(mode_plan).issuperset({"order", "spans", "context", "target"})
+    assert "indices" not in mode_plan["context"]
+    assert "batches" not in mode_plan["context"]
+    assert "indices" not in mode_plan["target"]
+    assert "batches" not in mode_plan["target"]
+    assert all(
+        request.indices.untyped_storage().data_ptr()
+        == mode_plan["order"].untyped_storage().data_ptr()
+        for request in requests
+    )
+
+    calls = []
+    original = manager.dataset.store.read_rows
+
+    def tracked(indices):
+        calls.append(indices.clone())
+        return original(indices)
+
+    monkeypatch.setattr(manager.dataset.store, "read_rows", tracked)
+    batches = list(loader)
+
+    assert len(calls) == len(batches) == len(requests)
+    for call, request, batch in zip(calls, requests, batches):
+        torch.testing.assert_close(call, request.indices)
+        assert request.context_size == batch.context.idx.numel()
+        if request.context_is_subset:
+            torch.testing.assert_close(request.indices, batch.query.idx)
+        else:
+            torch.testing.assert_close(
+                request.indices,
+                torch.cat((batch.context.idx, batch.query.idx)),
+            )
+
+
+def test_workers_do_not_rebuild_epoch_plans(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0, count=30))
+    config = _make_config(data_directory, "h5", context_ratio=0.25)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "streaming"
+    dataset["shuffle_dataset"] = "global"
+    dataloader = config["model_settings"]["dataloader"]
+    dataloader["dataloader_number_of_workers"] = 1
+    dataloader["dataloader_prefetch_factor"] = 2
+    dataloader["dataloader_persistent_workers"] = True
+    manager = DataLoaderManager("train", config)
+    loader = manager.set_loader(4, "train")
+    builds_before_iteration = int(
+        manager.dataset._batch_plan_build_count.item()
+    )
+
+    batches = list(loader)
+
+    assert batches
+    assert int(manager.dataset._batch_plan_build_count.item()) == (
+        builds_before_iteration
+    )
+
+
+def test_streaming_persistent_workers_match_zero_worker_order_and_values(
+    tmp_path,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=40)
+    _write_hdf5(data_directory / "part_0.h5", rows[:17])
+    _write_hdf5(data_directory / "part_1.h5", rows[17:])
+    base = _make_config(data_directory, "h5", context_ratio=0.25)
+    dataset = base["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "streaming"
+    dataset["shuffle_dataset"] = "global"
+    dataset["use_feature_normalization"] = "zscore"
+    dataset["stream_chunk_rows"] = 8
+
+    zero_config = copy.deepcopy(base)
+    workers_config = copy.deepcopy(base)
+    worker_settings = workers_config["model_settings"]["dataloader"]
+    worker_settings["dataloader_number_of_workers"] = 1
+    worker_settings["dataloader_prefetch_factor"] = 2
+    worker_settings["dataloader_persistent_workers"] = True
+    zero = DataLoaderManager("train", zero_config)
+    workers = DataLoaderManager("train", workers_config)
+
+    for epoch in (0, 3):
+        expected = _collect_batches(zero, epoch, "train")
+        actual = _collect_batches(workers, epoch, "train")
+        _assert_batch_sequences_equal(expected, actual)
+
+    loader = workers.dataloader
+    worker_processes = tuple(loader._iterator._workers)
+    worker_pids = [worker.pid for worker in worker_processes]
+    _collect_batches(workers, 5, "train")
+
+    assert [worker.pid for worker in loader._iterator._workers] == worker_pids
+    workers.close_loader()
+    assert all(not worker.is_alive() for worker in worker_processes)
+
+
 @pytest.mark.parametrize("injection", ("constructor", "set_dataset"))
 def test_external_loader_uses_fitted_training_normalizer(tmp_path, injection):
     train_directory = tmp_path / "train"
@@ -2036,9 +2148,7 @@ def test_paired_batches_cover_uneven_dataset_without_drops(
 
     batches = list(manager.set_loader(epoch=3, mode="train"))
 
-    assert len(manager.dataset.data["train"]["context"]["batches"]) == len(
-        manager.dataset.data["train"]["target"]["batches"]
-    )
+    assert len(manager.dataset.data["train"]["spans"]) == len(batches)
     assert all(batch.context.idx.numel() > 0 for batch in batches)
     assert all(batch.query.idx.numel() > 0 for batch in batches)
 
