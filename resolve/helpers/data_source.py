@@ -813,7 +813,9 @@ def _inspect_csv_file(
     start = len(issues)
     try:
         with path.open("r", newline="", encoding="utf-8-sig") as input_file:
-            labels = next(csv.reader(input_file), None)
+            reader = csv.reader(input_file)
+            labels = next(reader, None)
+            has_data_row = any(row for row in reader)
     except (OSError, UnicodeError, csv.Error) as error:
         issues.append(ValidationIssue(str(path), f"cannot read header: {error}"))
         return None
@@ -821,6 +823,8 @@ def _inspect_csv_file(
     if not labels:
         issues.append(ValidationIssue(str(path), "has no CSV header"))
         return None
+    if not has_data_row:
+        issues.append(ValidationIssue(str(path), "contains no data rows"))
     duplicates = _duplicate_labels(labels)
     if duplicates:
         issues.append(
@@ -946,6 +950,13 @@ def _inspect_hdf5_file(
                         )
                     )
                     continue
+                if dataset.shape[0] == 0:
+                    issues.append(
+                        ValidationIssue(
+                            f"{path}:{dataset_key}",
+                            "contains no data rows",
+                        )
+                    )
                 if not np.issubdtype(dataset.dtype, np.number):
                     issues.append(
                         ValidationIssue(

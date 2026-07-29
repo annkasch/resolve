@@ -3,7 +3,12 @@ import torch
 from torch.utils.data import IterableDataset, get_worker_info
 from typing import Optional, Sequence, Tuple
 from resolve.helpers.batch_types import BatchCollection, ContextSet, QuerySet
-from resolve.helpers.data_source import DatasetSettings, ValidatedDataSource
+from resolve.helpers.data_source import (
+    DataValidationError,
+    DatasetSettings,
+    ValidatedDataSource,
+    ValidationIssue,
+)
 from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
@@ -52,6 +57,7 @@ class InMemoryIterableData(IterableDataset):
 
         # load all data into memory
         theta, phi, y, fidx = self.data_source.load()
+        self._validate_loaded_data(theta, phi, y, fidx)
 
         self.data = self._set_data(theta, phi, y, fidx)
         self.build_batches(0)
@@ -114,6 +120,88 @@ class InMemoryIterableData(IterableDataset):
                 self.data_source.selected_labels("phi"),
             )
         return normalizer
+
+    def _validate_loaded_data(self, theta, phi, y, fidx):
+        row_counts = {
+            "theta": theta.shape[0],
+            "phi": phi.shape[0],
+            "target": y.shape[0],
+            "file_indices": fidx.shape[0],
+        }
+        issues = []
+        if len(set(row_counts.values())) != 1:
+            issues.append(
+                ValidationIssue(
+                    "loaded data",
+                    f"has inconsistent row counts: {row_counts}",
+                )
+            )
+        if not row_counts["target"]:
+            issues.append(
+                ValidationIssue(
+                    "loaded data",
+                    "contains no samples",
+                )
+            )
+        if issues:
+            raise DataValidationError(issues)
+
+    @staticmethod
+    def _split_or_raise(
+        splitter,
+        indices,
+        groups,
+        test_size,
+        split_name,
+    ):
+        try:
+            remaining, held_out = splitter.train_test_split(
+                indices,
+                groups=groups,
+                test_size=test_size,
+            )
+        except ValueError as error:
+            raise DataValidationError(
+                (
+                    ValidationIssue(
+                        f"dataset split.{split_name}",
+                        f"cannot be created: {error}",
+                    ),
+                )
+            ) from error
+
+        issues = []
+        if remaining.numel() == 0:
+            issues.append(
+                ValidationIssue(
+                    f"dataset split.{split_name}",
+                    "leaves no samples for subsequent training splits",
+                )
+            )
+        if held_out.numel() == 0:
+            issues.append(
+                ValidationIssue(
+                    f"dataset split.{split_name}",
+                    "contains no samples",
+                )
+            )
+        if issues:
+            raise DataValidationError(issues)
+        return remaining, held_out
+
+    def _validate_partition_sizes(self, split_indices):
+        if self.context_ratio == 0.0:
+            return
+        issues = [
+            ValidationIssue(
+                f"dataset split.{mode}",
+                "requires at least two samples when context_ratio is positive",
+            )
+            for mode, indices in split_indices.items()
+            if indices.numel() < 2
+        ]
+        if issues:
+            raise DataValidationError(issues)
         
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
         self.context_ratio = self.dataset_config.context_ratio
@@ -147,10 +235,12 @@ class InMemoryIterableData(IterableDataset):
             split_indices = {}
             val_size = self.dataset_config.val_ratio
             if val_size > 0.0:
-                idx, split_indices["validate"] = splitter.train_test_split(
+                idx, split_indices["validate"] = self._split_or_raise(
+                    splitter,
                     idx,
-                    groups=theta[idx],
-                    test_size=val_size,
+                    theta[idx],
+                    val_size,
+                    "validate",
                 )
 
             configured_test_size = self.dataset_config.test_ratio
@@ -161,12 +251,15 @@ class InMemoryIterableData(IterableDataset):
                         "val_ratio must leave data available for training "
                         "and testing."
                     )
-                idx, split_indices["test"] = splitter.train_test_split(
+                idx, split_indices["test"] = self._split_or_raise(
+                    splitter,
                     idx,
-                    groups=theta[idx],
-                    test_size=configured_test_size / remaining_fraction,
+                    theta[idx],
+                    configured_test_size / remaining_fraction,
+                    "test",
                 )
             split_indices["train"] = idx
+            self._validate_partition_sizes(split_indices)
 
             # Fit feature transforms on training rows only, then apply them
             # consistently to all partitions.
@@ -213,6 +306,7 @@ class InMemoryIterableData(IterableDataset):
                     positive_ratio_data
                 )
         else:
+            self._validate_partition_sizes({self.mode: idx})
             if self._canonical_normalization_method(
                 self.dataset_config.use_feature_normalization
             ) is None:

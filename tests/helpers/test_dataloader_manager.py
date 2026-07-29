@@ -697,6 +697,62 @@ def test_preflight_rejects_duplicate_csv_headers(tmp_path):
         )
 
 
+@pytest.mark.parametrize("file_format", ("csv", "h5"))
+def test_preflight_rejects_files_without_data_rows(tmp_path, file_format):
+    data_directory = tmp_path / file_format
+    data_directory.mkdir()
+    if file_format == "csv":
+        (data_directory / "part_0.csv").write_text(
+            "theta_value,phi_value,unused,signal\n",
+            encoding="utf-8",
+        )
+    else:
+        with h5py.File(data_directory / "part_0.h5", "w") as output:
+            features = output.create_group("features").create_dataset(
+                "values",
+                shape=(0, len(FEATURE_LABELS)),
+                dtype=np.float32,
+            )
+            features.attrs["labels"] = np.asarray(
+                FEATURE_LABELS,
+                dtype="S",
+            )
+            targets = output.create_group("labels").create_dataset(
+                "values",
+                shape=(0, len(TARGET_LABELS)),
+                dtype=np.float32,
+            )
+            targets.attrs["labels"] = np.asarray(
+                TARGET_LABELS,
+                dtype="S",
+            )
+
+    with pytest.raises(DataValidationError, match="contains no data rows"):
+        DataLoaderManager(
+            mode="train",
+            config_file=_make_config(data_directory, file_format),
+        )
+
+
+def test_dataset_rejects_split_that_cannot_leave_training_rows(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=1))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    config["model_settings"]["train"]["dataset"]["val_ratio"] = 0.5
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    with pytest.raises(
+        DataValidationError,
+        match=r"dataset split\.validate.*cannot be created",
+    ):
+        manager.set_dataset()
+
+
 def test_preflight_does_not_load_csv_values(tmp_path, monkeypatch):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()
@@ -758,6 +814,34 @@ def test_dataset_replacement_revalidates_before_loading(tmp_path, monkeypatch):
 
     assert manager.dataset is original_dataset
     assert manager.dataset.data is not None
+
+
+def test_dataset_replacement_preserves_working_loader_on_load_failure(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    path = data_directory / "part_0.csv"
+    _write_csv(path, _make_rows(0))
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(
+            data_directory,
+            file_format="csv",
+            context_ratio=0.0,
+        ),
+    )
+    original_loader = manager.set_loader(epoch=0)
+    original_dataset = manager.dataset
+    rows = path.read_text(encoding="utf-8").splitlines()
+    rows[2] = rows[2].replace("101.0", "not-a-number")
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Failed to parse numeric value"):
+        manager.set_dataset()
+
+    assert manager.dataloader is original_loader
+    assert manager.dataset is original_dataset
+    assert manager.dataset.data is not None
+    assert list(manager.dataloader)
 
 
 def test_warmup_ratio_schedule_remains_deferred_until_scalar_phase(tmp_path):

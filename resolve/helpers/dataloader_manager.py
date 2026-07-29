@@ -17,10 +17,15 @@ class DataLoaderManager:
 
     # ------------- helpers -------------
     def _preflight(self):
-        self._specification, self._data_source = preflight_data_loader(
+        specification, data_source = preflight_data_loader(
             self.mode,
             self.config_file,
         )
+        self._install_preflight(specification, data_source)
+
+    def _install_preflight(self, specification, data_source):
+        self._specification = specification
+        self._data_source = data_source
         self.files = [
             str(path) for path in self._data_source.paths
         ]
@@ -43,10 +48,20 @@ class DataLoaderManager:
     def normalizer(self):
         return self._normalizer
 
-    def _configured_normalization_method(self):
-        return self._specification.dataset.use_feature_normalization
+    def _configured_normalization_method(self, specification=None):
+        specification = (
+            self._specification
+            if specification is None
+            else specification
+        )
+        return specification.dataset.use_feature_normalization
 
-    def _store_external_normalizer(self, normalizer):
+    def _validate_external_normalizer(
+        self,
+        normalizer,
+        specification,
+        data_source,
+    ):
         if self.mode == "train":
             raise ValueError(
                 "Training managers create and fit their own normalizer; do "
@@ -55,7 +70,9 @@ class DataLoaderManager:
         if not isinstance(normalizer, Normalizer):
             raise TypeError("normalizer must be a Normalizer instance.")
 
-        configured_method = self._configured_normalization_method()
+        configured_method = self._configured_normalization_method(
+            specification
+        )
         if self._canonical_normalization_method(
             normalizer.method
         ) != self._canonical_normalization_method(configured_method):
@@ -67,27 +84,44 @@ class DataLoaderManager:
             normalizer.validate_fitted()
             normalizer.validate_schema(
                 "theta",
-                self._data_source.selected_labels("theta"),
+                data_source.selected_labels("theta"),
             )
             normalizer.validate_schema(
                 "phi",
-                self._data_source.selected_labels("phi"),
+                data_source.selected_labels("phi"),
             )
+
+    def _store_external_normalizer(self, normalizer):
+        self._validate_external_normalizer(
+            normalizer,
+            self._specification,
+            self._data_source,
+        )
         self._normalizer = normalizer
 
     def set_dataset(self, normalizer=None):
-        self._preflight()
-        if normalizer is not None:
-            self._store_external_normalizer(normalizer)
-        elif self.mode != "train" and self._normalizer is not None:
-            self._store_external_normalizer(self._normalizer)
+        specification, data_source = preflight_data_loader(
+            self.mode,
+            self.config_file,
+        )
+        external_normalizer = (
+            normalizer if normalizer is not None else self._normalizer
+        )
+        if self.mode != "train" and external_normalizer is not None:
+            self._validate_external_normalizer(
+                external_normalizer,
+                specification,
+                data_source,
+            )
 
-        configured_method = self._configured_normalization_method()
+        configured_method = self._configured_normalization_method(
+            specification
+        )
         if (
             self.mode != "train"
             and self._canonical_normalization_method(configured_method)
             is not None
-            and self._normalizer is None
+            and external_normalizer is None
         ):
             raise ValueError(
                 f"{self.mode.capitalize()} data using "
@@ -97,17 +131,19 @@ class DataLoaderManager:
                 "set_dataset(normalizer=...)."
             )
 
-        self._dispose_loader(close_dataset=True)
-        self.dataset = InMemoryIterableData(
-                data_source=self._data_source,
-                batch_size=self._specification.batch_size,
-                dataset_config=self._specification.dataset,
-                positive_condition=self._specification.positive_condition,
+        replacement = InMemoryIterableData(
+                data_source=data_source,
+                batch_size=specification.batch_size,
+                dataset_config=specification.dataset,
+                positive_condition=specification.positive_condition,
                 normalizer=(
-                    None if self.mode == "train" else self._normalizer
+                    None if self.mode == "train" else external_normalizer
                 ),
                 mode=self.mode
             )
+        self._dispose_loader(close_dataset=True)
+        self._install_preflight(specification, data_source)
+        self.dataset = replacement
         self._normalizer = self.dataset._normalizer
 
     def _loader_options(self):
