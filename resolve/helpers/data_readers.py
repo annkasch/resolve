@@ -1,0 +1,140 @@
+from __future__ import annotations
+
+import h5py
+import numpy as np
+import pandas as pd
+import torch
+
+from resolve.helpers.data_schema import DataFileSpec, ValidatedDataSource
+
+
+def load_data_source(
+    source: ValidatedDataSource,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+]:
+    theta_parts = []
+    phi_parts = []
+    target_parts = []
+    file_indices = []
+
+    for file_index, file_spec in enumerate(source.files):
+        arrays = (
+            _load_csv_file(file_spec)
+            if source.file_format == "csv"
+            else _load_hdf5_file(file_spec)
+        )
+        theta = _as_float_tensor(arrays["theta"])
+        phi = _as_float_tensor(arrays["phi"])
+        target = (
+            _as_float_tensor(arrays["target"])
+            if "target" in arrays
+            else None
+        )
+        row_counts = {
+            "theta": theta.shape[0],
+            "phi": phi.shape[0],
+        }
+        if target is not None:
+            row_counts["target"] = target.shape[0]
+        if len(set(row_counts.values())) != 1:
+            raise ValueError(
+                f"Inconsistent row counts while loading "
+                f"{str(file_spec.path)!r}: {row_counts}."
+            )
+
+        theta_parts.append(theta)
+        phi_parts.append(phi)
+        if target is not None:
+            target_parts.append(target)
+        file_indices.append(
+            torch.full(
+                (phi.shape[0],),
+                file_index,
+                dtype=torch.long,
+            )
+        )
+
+    return (
+        torch.cat(theta_parts, dim=0).contiguous(),
+        torch.cat(phi_parts, dim=0).contiguous(),
+        (
+            torch.cat(target_parts, dim=0).contiguous()
+            if target_parts
+            else None
+        ),
+        torch.cat(file_indices, dim=0).contiguous(),
+    )
+
+
+def _load_hdf5_file(file_spec: DataFileSpec) -> dict[str, np.ndarray]:
+    arrays = {}
+    try:
+        with h5py.File(file_spec.path, "r") as hdf:
+            for selection in file_spec.columns:
+                dataset = hdf[selection.dataset_key]
+                if selection.source_ndim == 1:
+                    values = dataset[:].reshape(-1, 1)
+                else:
+                    values = dataset[:, list(selection.physical_indices)]
+                    values = values[:, selection.configured_order]
+                arrays[selection.name] = np.asarray(values)
+    except (OSError, ValueError, TypeError) as error:
+        raise ValueError(
+            f"Failed to load HDF5 values from {str(file_spec.path)!r}: "
+            f"{error}"
+        ) from error
+    return arrays
+
+
+def _load_csv_file(file_spec: DataFileSpec) -> dict[str, np.ndarray]:
+    physical_indices = sorted(
+        {
+            index
+            for selection in file_spec.columns
+            for index in selection.physical_indices
+        }
+    )
+    try:
+        frame = pd.read_csv(file_spec.path, usecols=physical_indices)
+    except Exception as error:
+        raise ValueError(
+            f"Failed to load CSV values from {str(file_spec.path)!r}: {error}"
+        ) from error
+
+    absolute_to_loaded = {
+        absolute: loaded
+        for loaded, absolute in enumerate(physical_indices)
+    }
+    arrays = {}
+    for selection in file_spec.columns:
+        loaded_indices = [
+            absolute_to_loaded[index]
+            for index in selection.physical_indices
+        ]
+        selected = frame.iloc[:, loaded_indices]
+        numeric = selected.apply(pd.to_numeric, errors="coerce")
+        invalid = numeric.isna() & ~selected.isna()
+        if invalid.to_numpy().any():
+            row, column = np.argwhere(invalid.to_numpy())[0]
+            label = selected.columns[column]
+            value = selected.iat[row, column]
+            raise ValueError(
+                f"Failed to parse numeric value {value!r} in "
+                f"{str(file_spec.path)!r}, row {row + 2}, column {label!r}."
+            )
+        values = numeric.to_numpy()[:, selection.configured_order]
+        arrays[selection.name] = values
+    return arrays
+
+
+def _as_float_tensor(values: np.ndarray) -> torch.Tensor:
+    if values.ndim == 1:
+        values = values.reshape(-1, 1)
+    return torch.as_tensor(
+        np.asarray(values, dtype=np.float32),
+        dtype=torch.float32,
+    ).contiguous()

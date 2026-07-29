@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import resolve.helpers.data_readers as data_readers
 import resolve.helpers.data_source as data_source
 import resolve.helpers.dataloader_manager as dataloader_manager_module
 import resolve.helpers.iterable_dataset as iterable_dataset_module
@@ -761,7 +762,7 @@ def test_preflight_does_not_load_csv_values(tmp_path, monkeypatch):
     def fail_if_called(_file_spec):
         raise AssertionError("value loader ran during preflight")
 
-    monkeypatch.setattr(data_source, "_load_csv_file", fail_if_called)
+    monkeypatch.setattr(data_readers, "_load_csv_file", fail_if_called)
     manager = DataLoaderManager(
         mode="train",
         config_file=_make_config(data_directory, "csv"),
