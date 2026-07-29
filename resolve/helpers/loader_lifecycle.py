@@ -5,6 +5,12 @@ import weakref
 from torch.utils.data import DataLoader
 
 
+def _shutdown_iterator(iterator):
+    shutdown = getattr(iterator, "_shutdown_workers", None)
+    if callable(shutdown):
+        shutdown()
+
+
 class _TrackedDataLoaderIterator:
     def __init__(self, iterator, owner):
         self._iterator = iterator
@@ -27,9 +33,13 @@ class _TrackedDataLoaderIterator:
         if self._closed:
             return
         self._closed = True
+        iterator = self._iterator
+        self._iterator = None
         owner = self._owner()
         if owner is not None:
             owner._iteration_finished(self)
+        if owner is None or not owner.persistent_workers:
+            _shutdown_iterator(iterator)
 
     def __del__(self):
         self.close()
@@ -96,8 +106,6 @@ def shutdown_loader(loader):
         close_active()
 
     iterator = getattr(loader, "_iterator", None)
-    shutdown = getattr(iterator, "_shutdown_workers", None)
-    if callable(shutdown):
-        shutdown()
+    _shutdown_iterator(iterator)
     if hasattr(loader, "_iterator"):
         loader._iterator = None

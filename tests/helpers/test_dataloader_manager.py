@@ -1705,6 +1705,46 @@ def test_persistent_worker_observes_epoch_and_mode_updates(tmp_path):
     manager.close_loader()
 
 
+def test_closing_nonpersistent_iterator_stops_its_workers(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0, count=40))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    dataloader_config = config["model_settings"]["dataloader"]
+    dataloader_config["dataloader_number_of_workers"] = 1
+    dataloader_config["dataloader_prefetch_factor"] = 2
+    dataloader_config["dataloader_persistent_workers"] = False
+    manager = DataLoaderManager(mode="train", config_file=config)
+    loader = manager.set_loader(epoch=0, mode="train")
+    iterator = iter(loader)
+    next(iterator)
+    inner_iterator = iterator._iterator
+    workers = tuple(inner_iterator._workers)
+
+    assert all(worker.is_alive() for worker in workers)
+
+    iterator.close()
+
+    assert iterator._iterator is None
+    assert loader.iteration_active is False
+    assert all(not worker.is_alive() for worker in workers)
+
+    next_iterator = iter(manager.set_loader(epoch=1, mode="train"))
+    next(next_iterator)
+    next_workers = tuple(next_iterator._iterator._workers)
+    assert {worker.pid for worker in next_workers}.isdisjoint(
+        worker.pid for worker in workers
+    )
+
+    next_iterator.close()
+    manager.close_loader()
+    assert all(not worker.is_alive() for worker in next_workers)
+
+
 def test_replacing_dataset_invalidates_cached_loader(tmp_path):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()
