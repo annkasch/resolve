@@ -19,6 +19,11 @@ from resolve.helpers import (
     QuerySet,
 )
 from resolve.helpers.dataloader_manager import DataLoaderManager
+from resolve.helpers.data_store import (
+    DataStore,
+    InMemoryDataStore,
+    select_storage_backend,
+)
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
@@ -1079,6 +1084,161 @@ def test_loader_batch_types_are_canonical_and_dead_apis_are_removed(
 def test_low_level_dataset_requires_validated_data_source():
     with pytest.raises(TypeError, match="ValidatedDataSource"):
         InMemoryIterableData(data_source=[])
+
+
+def test_storage_configuration_defaults_to_automatic_memory_selection(
+    tmp_path,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(data_directory, "h5", context_ratio=0.0),
+    )
+
+    settings = manager._specification.dataset
+    selection = select_storage_backend(manager._data_source, settings)
+
+    assert settings.storage_mode == "auto"
+    assert settings.memory_budget_bytes is None
+    assert settings.memory_budget_fraction == 0.25
+    assert settings.stream_chunk_rows == 65_536
+    assert settings.cache_directory is None
+    assert selection.backend == "memory"
+    assert selection.estimated_peak_bytes > 0
+    assert selection.memory_budget_bytes > selection.estimated_peak_bytes
+
+
+def test_automatic_storage_selection_uses_configured_memory_budget(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    config["model_settings"]["train"]["dataset"][
+        "memory_budget_bytes"
+    ] = 1
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    selection = select_storage_backend(
+        manager._data_source,
+        manager._specification.dataset,
+    )
+
+    assert selection.backend == "streaming"
+    assert selection.memory_budget_bytes == 1
+    assert "exceeds" in selection.reason
+
+
+def test_batch_wise_storage_rejects_streaming_selection(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0))
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["shuffle_dataset"] = "batch_wise"
+    dataset["memory_budget_bytes"] = 1
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    with pytest.raises(ValueError, match="requires storage_mode='memory'"):
+        manager.set_dataset()
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "pattern"),
+    [
+        ("storage_mode", "disk", "storage_mode"),
+        ("memory_budget_bytes", 0, "memory_budget_bytes"),
+        ("memory_budget_fraction", 0.0, "memory_budget_fraction"),
+        ("stream_chunk_rows", 0, "stream_chunk_rows"),
+        ("cache_directory", 12, "cache_directory"),
+    ],
+)
+def test_preflight_rejects_invalid_storage_configuration(
+    tmp_path,
+    key,
+    value,
+    pattern,
+):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(data_directory, "csv")
+    config["model_settings"]["train"]["dataset"][key] = value
+
+    with pytest.raises(DataValidationError, match=pattern):
+        DataLoaderManager(mode="train", config_file=config)
+
+
+@pytest.mark.parametrize("file_format", ("h5", "csv"))
+def test_preallocated_reader_loads_bounded_chunks_without_tensor_cat(
+    tmp_path,
+    monkeypatch,
+    file_format,
+):
+    data_directory = tmp_path / file_format
+    data_directory.mkdir()
+    rows = _make_rows(0, count=7)
+    extension = "h5" if file_format == "h5" else "csv"
+    writer = _write_hdf5 if file_format == "h5" else _write_csv
+    writer(data_directory / f"part_0.{extension}", rows)
+    config = _make_config(data_directory, file_format, context_ratio=0.0)
+    config["model_settings"]["train"]["dataset"]["stream_chunk_rows"] = 2
+    manager = DataLoaderManager(mode="train", config_file=config)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("preallocated source loading must not concatenate")
+
+    monkeypatch.setattr(data_readers.torch, "cat", fail_if_called)
+    theta, phi, target, file_indices = manager._data_source.load(
+        chunk_rows=2
+    )
+
+    assert theta.shape == (7, 1)
+    assert phi.shape == (7, 1)
+    assert target.shape == (7, 1)
+    assert file_indices.shape == (7,)
+    torch.testing.assert_close(
+        theta[:, 0],
+        torch.tensor([row["theta_value"] for row in rows]),
+    )
+
+
+def test_hdf5_reader_reads_shared_feature_dataset_once_per_chunk(
+    tmp_path,
+    monkeypatch,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    _write_hdf5(data_directory / "part_0.h5", _make_rows(0, count=6))
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    manager = DataLoaderManager(mode="train", config_file=config)
+    original_getitem = h5py.Dataset.__getitem__
+    feature_reads = []
+
+    def record_getitem(dataset, selection):
+        if dataset.name == "/features/values":
+            feature_reads.append(selection)
+        return original_getitem(dataset, selection)
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", record_getitem)
+    manager._data_source.load(chunk_rows=2)
+
+    assert len(feature_reads) == 3
+
+
+def test_in_memory_store_implements_shared_data_store_contract(loader_case):
+    manager, _rows = loader_case
+    manager.set_dataset()
+
+    assert isinstance(manager.dataset.store, DataStore)
+    assert isinstance(manager.dataset.store, InMemoryDataStore)
+    assert manager.dataset.store.backend == "memory"
+    assert manager.dataset.store.num_samples == manager.dataset.num_samples()
+    first = next(manager.dataset.store.iter_chunks(3))
+    assert first.start == 0
+    assert first.stop == 3
+    assert first.theta.shape[0] == 3
 
 
 @pytest.mark.parametrize("injection", ("constructor", "set_dataset"))

@@ -9,6 +9,7 @@ from resolve.helpers.data_source import (
     ValidatedDataSource,
     ValidationIssue,
 )
+from resolve.helpers.data_store import InMemoryDataStore
 from resolve.helpers.normalizer import Normalizer
 from resolve.helpers.sampler import Sampler
 from resolve.helpers.splitter import Splitter
@@ -55,11 +56,21 @@ class InMemoryIterableData(IterableDataset):
             dtype=torch.int64,
         ).share_memory_()
 
-        # load all data into memory
-        theta, phi, y, fidx = self.data_source.load()
+        self.store = InMemoryDataStore.from_source(
+            self.data_source,
+            chunk_rows=self.dataset_config.stream_chunk_rows,
+        )
+        theta, phi, y, fidx = self.store.materialize()
         self._validate_loaded_data(theta, phi, y, fidx)
 
         self.data = self._set_data(theta, phi, y, fidx)
+        stored = self.data["data"]
+        self.store.replace_tensors(
+            stored["theta"],
+            stored["phi"],
+            stored["y"],
+            stored["file_indices"],
+        )
         self.build_batches(0)
 
     @staticmethod
@@ -584,6 +595,9 @@ class InMemoryIterableData(IterableDataset):
 
     def close(self):
         """Delete all tensors and arrays from memory to free up resources."""
+        if getattr(self, "store", None) is not None:
+            self.store.close()
+            self.store = None
         # Clear main data dictionary
         if hasattr(self, 'data'):
             for mode in self.data:

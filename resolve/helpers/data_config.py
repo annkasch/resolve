@@ -57,6 +57,11 @@ class DatasetSettings:
     positive_ratio_train: float | tuple[float, ...] | None
     max_positive_reuse: int
     use_feature_normalization: str | None
+    storage_mode: str
+    memory_budget_bytes: int | None
+    memory_budget_fraction: float
+    stream_chunk_rows: int
+    cache_directory: Path | None
 
 
 @dataclass(frozen=True)
@@ -484,6 +489,77 @@ def _validate_dataset_settings(mode, dataset, target_spec, issues):
             )
         )
 
+    storage_mode = (
+        dataset.get("storage_mode", "auto")
+        if dataset is not None
+        else None
+    )
+    storage_mode_valid = storage_mode in ("auto", "memory", "streaming")
+    if not storage_mode_valid:
+        issues.append(
+            ValidationIssue(
+                "model_settings.train.dataset.storage_mode",
+                "must be 'auto', 'memory', or 'streaming'",
+            )
+        )
+
+    raw_memory_budget = (
+        dataset.get("memory_budget_bytes")
+        if dataset is not None
+        else None
+    )
+    memory_budget_bytes = None
+    if raw_memory_budget is not None:
+        memory_budget_bytes = _integer(
+            raw_memory_budget,
+            "model_settings.train.dataset.memory_budget_bytes",
+            issues,
+            minimum=1,
+        )
+
+    memory_budget_fraction = _number(
+        dataset.get("memory_budget_fraction", 0.25)
+        if dataset is not None
+        else None,
+        "model_settings.train.dataset.memory_budget_fraction",
+        issues,
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if memory_budget_fraction == 0.0:
+        issues.append(
+            ValidationIssue(
+                "model_settings.train.dataset.memory_budget_fraction",
+                "must be greater than 0",
+            )
+        )
+
+    stream_chunk_rows = _integer(
+        dataset.get("stream_chunk_rows", 65_536)
+        if dataset is not None
+        else None,
+        "model_settings.train.dataset.stream_chunk_rows",
+        issues,
+        minimum=1,
+    )
+
+    raw_cache_directory = (
+        dataset.get("cache_directory")
+        if dataset is not None
+        else None
+    )
+    cache_directory = None
+    if raw_cache_directory is not None:
+        if not isinstance(raw_cache_directory, (str, os.PathLike)):
+            issues.append(
+                ValidationIssue(
+                    "model_settings.train.dataset.cache_directory",
+                    "must be null or a filesystem path",
+                )
+            )
+        else:
+            cache_directory = Path(raw_cache_directory).expanduser()
+
     valid = all(
         (
             seed is not None,
@@ -496,6 +572,12 @@ def _validate_dataset_settings(mode, dataset, target_spec, issues):
             mixup_margin is not None,
             max_positive_reuse is not None,
             normalization_valid,
+            storage_mode_valid,
+            memory_budget_fraction is not None
+            and memory_budget_fraction > 0.0,
+            stream_chunk_rows is not None,
+            raw_memory_budget is None or memory_budget_bytes is not None,
+            raw_cache_directory is None or cache_directory is not None,
         )
     )
     if not valid:
@@ -513,6 +595,11 @@ def _validate_dataset_settings(mode, dataset, target_spec, issues):
         positive_ratio_train=positive_ratio,
         max_positive_reuse=max_positive_reuse,
         use_feature_normalization=normalization,
+        storage_mode=storage_mode,
+        memory_budget_bytes=memory_budget_bytes,
+        memory_budget_fraction=memory_budget_fraction,
+        stream_chunk_rows=stream_chunk_rows,
+        cache_directory=cache_directory,
     )
 
 

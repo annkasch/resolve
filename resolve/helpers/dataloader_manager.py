@@ -1,7 +1,9 @@
+import logging
 import os
 from collections.abc import Mapping, Sequence
 
 from resolve.helpers.data_source import preflight_data_loader
+from resolve.helpers.data_store import select_storage_backend
 from resolve.helpers.iterable_dataset import InMemoryIterableData
 from resolve.helpers.loader_lifecycle import (
     ReusableDataLoader,
@@ -184,6 +186,24 @@ class DataLoaderManager:
 
     def set_dataset(self, normalizer=None):
         specification, data_source = self._current_preflight()
+        storage_selection = select_storage_backend(
+            data_source,
+            specification.dataset,
+        )
+        logging.getLogger(__name__).info(
+            "Selected %s dataloader backend (estimated peak %.1f MiB, "
+            "budget %.1f MiB): %s.",
+            storage_selection.backend,
+            storage_selection.estimated_peak_bytes / 1024**2,
+            storage_selection.memory_budget_bytes / 1024**2,
+            storage_selection.reason,
+        )
+        if storage_selection.backend != "memory":
+            raise ValueError(
+                "The streaming backend was selected but is not available in "
+                "this storage implementation. Set storage_mode='memory' or "
+                "increase the configured memory budget."
+            )
         external_normalizer = (
             normalizer if normalizer is not None else self._normalizer
         )
@@ -224,6 +244,7 @@ class DataLoaderManager:
         self._dispose_loader(close_dataset=True)
         self._install_preflight(specification, data_source)
         self.dataset = replacement
+        self.storage_selection = storage_selection
         self._normalizer = self.dataset._normalizer
 
     def _loader_options(self):

@@ -46,6 +46,18 @@ class ValidatedDataSource:
     def paths(self) -> tuple[Path, ...]:
         return tuple(item.path for item in self.files)
 
+    @property
+    def num_samples(self) -> int:
+        row_counts = [item.row_count for item in self.files]
+        if any(row_count is None for row_count in row_counts):
+            raise ValueError(
+                "Validated data source is missing a file row count."
+            )
+        return sum(row_counts)
+
+    def feature_count(self, name: str) -> int:
+        return len(self.selected_labels(name))
+
     def selected_labels(self, name: str) -> tuple[str, ...]:
         if not self.files:
             raise ValueError("Cannot resolve labels from an empty data source.")
@@ -63,6 +75,8 @@ class ValidatedDataSource:
 
     def load(
         self,
+        *,
+        chunk_rows: int = 65_536,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -71,7 +85,7 @@ class ValidatedDataSource:
     ]:
         from resolve.helpers.data_readers import load_data_source
 
-        return load_data_source(self)
+        return load_data_source(self, chunk_rows=chunk_rows)
 
 
 def inspect_data_source(
@@ -149,7 +163,7 @@ def _inspect_csv_file(
         with path.open("r", newline="", encoding="utf-8-sig") as input_file:
             reader = csv.reader(input_file)
             labels = next(reader, None)
-            has_data_row = any(row for row in reader)
+            row_count = sum(1 for _row in reader)
     except (OSError, UnicodeError, csv.Error) as error:
         issues.append(
             ValidationIssue(str(path), f"cannot read header: {error}")
@@ -159,7 +173,7 @@ def _inspect_csv_file(
     if not labels:
         issues.append(ValidationIssue(str(path), "has no CSV header"))
         return None
-    if not has_data_row:
+    if row_count == 0:
         issues.append(ValidationIssue(str(path), "contains no data rows"))
     duplicates = _duplicate_labels(labels)
     if duplicates:
@@ -196,7 +210,7 @@ def _inspect_csv_file(
 
     if len(issues) != start:
         return None
-    return DataFileSpec(path, None, tuple(columns))
+    return DataFileSpec(path, row_count, tuple(columns))
 
 
 def _decode_hdf5_labels(

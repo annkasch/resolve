@@ -19,6 +19,15 @@ from resolve.helpers.data_schema import (
     ValidatedDataSource,
     inspect_data_source,
 )
+from resolve.helpers.data_store import (
+    DataChunk,
+    DataStore,
+    InMemoryDataStore,
+    StorageSelection,
+    estimate_in_memory_peak_bytes,
+    memory_budget_bytes,
+    select_storage_backend,
+)
 
 
 def preflight_data_loader(
@@ -42,13 +51,20 @@ def preflight_data_loader(
 
 __all__ = [
     "ColumnSelection",
+    "DataChunk",
+    "DataStore",
     "DataFileSpec",
     "DataValidationError",
     "DatasetSettings",
+    "InMemoryDataStore",
     "LoaderSettings",
     "LoaderSpecification",
     "ParameterSpec",
+    "StorageSelection",
     "ValidatedDataSource",
     "ValidationIssue",
+    "estimate_in_memory_peak_bytes",
+    "memory_budget_bytes",
     "preflight_data_loader",
+    "select_storage_backend",
 ]
