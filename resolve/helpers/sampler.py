@@ -4,6 +4,103 @@ import operator
 import functools
 import numpy as np
 import math
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class PositiveGroupPool:
+    group: int
+    positives: torch.Tensor
+    negatives: torch.Tensor
+    fixed_negative_order: torch.Tensor
+
+
+@dataclass(frozen=True)
+class PositiveSamplingPools:
+    groups: tuple[PositiveGroupPool, ...]
+
+
+@dataclass(frozen=True)
+class MixupPlan:
+    destinations: torch.Tensor
+    negative_sources: torch.Tensor
+    positive_sources: torch.Tensor
+    coefficients: torch.Tensor
+
+    @classmethod
+    def empty(cls):
+        return cls(
+            destinations=torch.empty(0, dtype=torch.long),
+            negative_sources=torch.empty(0, dtype=torch.long),
+            positive_sources=torch.empty(0, dtype=torch.long),
+            coefficients=torch.empty((0, 1), dtype=torch.float32),
+        )
+
+    def apply(self, requested_indices, theta, phi, target, store):
+        if self.destinations.numel() == 0 or requested_indices.numel() == 0:
+            return theta, phi, target
+        positions = torch.searchsorted(
+            self.destinations,
+            requested_indices,
+        )
+        valid = positions < self.destinations.numel()
+        matches = torch.zeros_like(valid)
+        matches[valid] = (
+            self.destinations.index_select(0, positions[valid])
+            == requested_indices[valid]
+        )
+        batch_positions = torch.nonzero(
+            matches,
+            as_tuple=False,
+        ).view(-1)
+        if batch_positions.numel() == 0:
+            return theta, phi, target
+
+        plan_positions = positions.index_select(0, batch_positions)
+        negative_sources = self.negative_sources.index_select(
+            0,
+            plan_positions,
+        )
+        positive_sources = self.positive_sources.index_select(
+            0,
+            plan_positions,
+        )
+        source_indices = torch.cat(
+            (negative_sources, positive_sources)
+        )
+        (
+            source_theta,
+            source_phi,
+            source_target,
+            _source_files,
+        ) = store.read_rows(source_indices)
+        count = batch_positions.numel()
+        coefficients = self.coefficients.index_select(
+            0,
+            plan_positions,
+        ).to(dtype=theta.dtype)
+        theta = theta.clone()
+        phi = phi.clone()
+        target = target.clone()
+        theta.index_copy_(
+            0,
+            batch_positions,
+            coefficients * source_theta[count:]
+            + (1.0 - coefficients) * source_theta[:count],
+        )
+        phi.index_copy_(
+            0,
+            batch_positions,
+            coefficients * source_phi[count:]
+            + (1.0 - coefficients) * source_phi[:count],
+        )
+        target.index_copy_(
+            0,
+            batch_positions,
+            coefficients * source_target[count:]
+            + (1.0 - coefficients) * source_target[:count],
+        )
+        return theta, phi, target
 
 class Sampler():
     def __init__(self, positive_condition: str, seed, shuffle="global"):
@@ -97,6 +194,7 @@ class Sampler():
 
         negatives_needed = max(0, n - pos_pool.numel())
         negative_count = min(negatives_needed, neg_idx.numel())
+        fixed_order = neg_idx
         if negative_count:
             fixed_order = neg_idx[
                 torch.randperm(
@@ -120,80 +218,166 @@ class Sampler():
         else:
             neg_plan = neg_idx.new_empty((0,), dtype=torch.long)
 
-        remaining_negatives = neg_idx[~torch.isin(neg_idx, neg_plan)]
+        remaining_mask = torch.ones(
+            fixed_order.numel(),
+            dtype=torch.bool,
+        )
+        if negative_count:
+            remaining_mask[positions] = False
+        remaining_negatives = fixed_order[remaining_mask]
         return pos_pool, neg_plan, remaining_negatives
 
-    def groupaware_pos_sampling(
+    def prepare_positive_pools(
         self,
-        theta: torch.Tensor,                     # shape [N] or [N, d]
-        y: torch.Tensor,  
-        idx: torch.Tensor,
+        groups: torch.Tensor,
+        y: torch.Tensor,
+        indices: torch.Tensor,
+        *,
+        seed: int | None = None,
+    ) -> PositiveSamplingPools:
+        base_seed = self.seed if seed is None else seed
+        local_sampler = self if base_seed == self.seed else Sampler(
+            positive_condition=None,
+            seed=base_seed,
+            shuffle=self.shuffle,
+        )
+        positive = self.get_positive_indices(y)
+        pools = []
+        if groups.ndim == 1:
+            _unique_groups, inverse = torch.unique(
+                groups,
+                sorted=True,
+                return_inverse=True,
+            )
+        else:
+            _unique_groups, inverse = torch.unique(
+                groups,
+                dim=0,
+                sorted=True,
+                return_inverse=True,
+            )
+        for group_number in range(_unique_groups.shape[0]):
+            group_mask = inverse == group_number
+            group_indices = indices[group_mask]
+            group_positive = positive[group_mask]
+            positives = group_indices[group_positive]
+            negatives = group_indices[~group_positive]
+            fixed_negative_order = (
+                negatives[
+                    torch.randperm(
+                        negatives.numel(),
+                        generator=local_sampler._generator(
+                            0,
+                            stream=11,
+                            group=group_number,
+                        ),
+                    )
+                ]
+                if negatives.numel() > 1
+                else negatives
+            )
+            pools.append(
+                PositiveGroupPool(
+                    group=group_number,
+                    positives=positives,
+                    negatives=negatives,
+                    fixed_negative_order=fixed_negative_order,
+                )
+            )
+        return PositiveSamplingPools(tuple(pools))
+
+    def sample_prepared_positive_pools(
+        self,
+        pools: PositiveSamplingPools,
         target_pos_frac: float,
         max_pos_reuse_per_epoch: int = 0,
         sticky_frac: float = 0.25,
-        seed=None,
         epoch: int = 0,
     ):
         if not 0.0 <= target_pos_frac < 1.0:
             raise ValueError("target_pos_frac must be in [0, 1).")
-        if idx.numel() == 0:
-            empty = idx.new_empty((0,), dtype=torch.long)
-            meta = {
+        if not pools.groups:
+            empty = torch.empty(0, dtype=torch.long)
+            return empty, 0, empty, {
                 "num_epochs": 1,
                 "pos_frac": 0.0,
                 "num_batches": 0,
             }
-            return empty, self.seed, empty, meta
-
-        # precompute inverse once
-        if theta.ndim == 1:
-            _, inverse = torch.unique(theta, return_inverse=True)
-        else:
-            _, inverse = torch.unique(theta, dim=0, return_inverse=True)
-
-        num_groups = inverse.max().item() + 1
-
-        pos = self.get_positive_indices(y)
-        pos_idx = pos.nonzero(as_tuple=False).view(-1)
-        neg_idx = (~pos).nonzero(as_tuple=False).view(-1)
-
-        pos_gid = inverse[pos_idx]
-        neg_gid = inverse[neg_idx]
 
         reuse = max(1, max_pos_reuse_per_epoch)
-        n_tmp = pos_idx.numel()*reuse/target_pos_frac if target_pos_frac > 0. else neg_idx.numel()
-        n = int(round(n_tmp/num_groups))
-        nN_min = max(2, min(4, int(0.05 * n))) 
-        group_size = n+nN_min
+        total_positives = sum(
+            pool.positives.numel() for pool in pools.groups
+        )
+        total_negatives = sum(
+            pool.negatives.numel() for pool in pools.groups
+        )
+        estimate = (
+            total_positives * reuse / target_pos_frac
+            if target_pos_frac > 0.0
+            else total_negatives
+        )
+        per_group = int(round(estimate / len(pools.groups)))
+        minimum_negatives = max(2, min(4, int(0.05 * per_group)))
+        group_size = per_group + minimum_negatives
+        selected_groups = []
+        unused_groups = []
+        selected_positive_count = 0
+        selected_negative_count = 0
 
-        all_indices = []
-        unused = []
-
-        nP_tot = 0
-        nN_tot = 0
-        for gi in range(num_groups):
-            pos_g = pos_idx[pos_gid == gi]
-            neg_g = neg_idx[neg_gid == gi]
-
-            nP_max = min(pos_g.numel()*reuse, n) if target_pos_frac > 0. else 0
-            nP_tot += nP_max
-
-            pos_pool_idx, neg_plan_idx, rem_idx = self.sample_positives_negatives(
-                pos_idx=pos_g, neg_idx=neg_g,
-                n=group_size, nP_tot=nP_max,
-                max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,
-                sticky_frac=sticky_frac,
-                seed=seed,
-                epoch=epoch,
-                group=gi,
+        for group_number, pool in enumerate(pools.groups):
+            positive_count = (
+                min(pool.positives.numel() * reuse, per_group)
+                if target_pos_frac > 0.0
+                else 0
             )
-            pos_pool = idx[pos_pool_idx]
-            neg_plan = idx[neg_plan_idx]
-            nN_tot += neg_plan.numel()
+            positive_pool = pool.positives.repeat_interleave(reuse)
+            if positive_pool.numel() > 1:
+                positive_pool = positive_pool[
+                    torch.randperm(
+                        positive_pool.numel(),
+                        generator=self._generator(
+                            epoch,
+                            stream=10,
+                            group=group_number,
+                        ),
+                    )
+                ]
+            positive_pool = positive_pool[:positive_count]
 
-            rem = idx[rem_idx]
-            
-            selected = torch.cat([pos_pool, neg_plan])
+            negatives_needed = max(
+                0,
+                group_size - positive_pool.numel(),
+            )
+            negative_count = min(
+                negatives_needed,
+                pool.fixed_negative_order.numel(),
+            )
+            if negative_count:
+                stride = max(
+                    1,
+                    round(negative_count * (1.0 - sticky_frac)),
+                )
+                start = (
+                    int(epoch) * stride
+                ) % pool.fixed_negative_order.numel()
+                positions = (
+                    torch.arange(negative_count, dtype=torch.long) + start
+                ) % pool.fixed_negative_order.numel()
+                negative_plan = pool.fixed_negative_order.index_select(
+                    0,
+                    positions,
+                )
+                unused_mask = torch.ones(
+                    pool.fixed_negative_order.numel(),
+                    dtype=torch.bool,
+                )
+                unused_mask[positions] = False
+                unused = pool.fixed_negative_order[unused_mask]
+            else:
+                negative_plan = pool.negatives.new_empty((0,))
+                unused = pool.negatives
+
+            selected = torch.cat((positive_pool, negative_plan))
             if selected.numel() > 1:
                 selected = selected[
                     torch.randperm(
@@ -201,25 +385,156 @@ class Sampler():
                         generator=self._generator(
                             epoch,
                             stream=12,
-                            group=gi,
+                            group=group_number,
                         ),
                     )
                 ]
+            selected_groups.append(selected)
+            unused_groups.append(unused)
+            selected_positive_count += positive_pool.numel()
+            selected_negative_count += negative_plan.numel()
 
-            unused.append(rem)
-            all_indices.append(selected)
-
-        all_indices = torch.cat(all_indices)
-        pos_frac = nP_tot / max(1, all_indices.shape[0])
-        
-        unused = torch.cat(unused) if unused else neg_idx.new_empty((0,), dtype=torch.long)
-        nepochs = self.epochs_until_full_coverage(
-            unused.shape[0],
-            nN_tot,
+        selected = torch.cat(selected_groups)
+        unused = torch.cat(unused_groups)
+        num_epochs = self.epochs_until_full_coverage(
+            unused.numel(),
+            selected_negative_count,
             sticky_frac,
         )
-        meta = {"num_epochs": nepochs, "pos_frac": pos_frac, "num_batches": {}}
-        return all_indices, group_size, unused, meta
+        return selected, group_size, unused, {
+            "num_epochs": num_epochs,
+            "pos_frac": selected_positive_count / max(1, selected.numel()),
+            "num_batches": {},
+        }
+
+    def groupaware_pos_sampling(
+        self,
+        theta: torch.Tensor,                     # shape [N] or [N, d]
+        y: torch.Tensor,
+        idx: torch.Tensor,
+        target_pos_frac: float,
+        max_pos_reuse_per_epoch: int = 0,
+        sticky_frac: float = 0.25,
+        seed=None,
+        epoch: int = 0,
+    ):
+        pools = self.prepare_positive_pools(
+            theta,
+            y,
+            idx,
+            seed=seed,
+        )
+        return self.sample_prepared_positive_pools(
+            pools,
+            target_pos_frac,
+            max_pos_reuse_per_epoch=max_pos_reuse_per_epoch,
+            sticky_frac=sticky_frac,
+            epoch=epoch,
+        )
+
+    def build_mixup_plan(
+        self,
+        indices,
+        groups,
+        y,
+        mixup_ratio,
+        *,
+        use_beta=(1.0, 1.0),
+        margin=0.0,
+        seed=None,
+    ):
+        if mixup_ratio <= 0.0:
+            return MixupPlan.empty()
+        base_seed = self.seed if seed is None else seed
+        positive = self.get_positive_indices(y)
+        destinations = []
+        negative_sources = []
+        positive_sources = []
+        coefficients = []
+        for group in torch.unique(groups, sorted=True).tolist():
+            group_mask = groups == group
+            group_indices = indices[group_mask]
+            group_positive = positive[group_mask]
+            positives = group_indices[group_positive]
+            negatives = group_indices[~group_positive]
+            if positives.numel() == 0 or negatives.numel() == 0:
+                raise ValueError(
+                    f"Mixup group {group} requires both positive and "
+                    "negative samples."
+                )
+            group_seed = (
+                int(base_seed) + 7_919 * (int(group) + 1)
+            ) % (2**63 - 1)
+            generator = torch.Generator().manual_seed(group_seed)
+            count = int(group_indices.numel() * mixup_ratio)
+            if count == 0:
+                continue
+            destination = group_indices[
+                torch.randperm(
+                    group_indices.numel(),
+                    generator=generator,
+                )[:count]
+            ]
+            negative = negatives[
+                torch.randint(
+                    negatives.numel(),
+                    (count,),
+                    generator=generator,
+                )
+            ]
+            positive_source = positives[
+                torch.randint(
+                    positives.numel(),
+                    (count,),
+                    generator=generator,
+                )
+            ]
+            if use_beta and len(use_beta) == 2:
+                beta_rng = np.random.default_rng(group_seed + 3)
+                coefficient = torch.as_tensor(
+                    beta_rng.beta(
+                        use_beta[0],
+                        use_beta[1],
+                        size=(count, 1),
+                    ),
+                    dtype=torch.float32,
+                )
+            else:
+                coefficient = torch.rand(
+                    (count, 1),
+                    generator=generator,
+                )
+            if margin > 0.0:
+                coefficient = torch.where(
+                    coefficient >= 1.0 - margin,
+                    torch.ones_like(coefficient),
+                    torch.where(
+                        coefficient <= margin,
+                        torch.zeros_like(coefficient),
+                        coefficient,
+                    ),
+                )
+            destinations.append(destination)
+            negative_sources.append(negative)
+            positive_sources.append(positive_source)
+            coefficients.append(coefficient)
+
+        if not destinations:
+            return MixupPlan.empty()
+        destination = torch.cat(destinations)
+        order = torch.argsort(destination)
+        return MixupPlan(
+            destinations=destination.index_select(0, order),
+            negative_sources=torch.cat(negative_sources).index_select(
+                0,
+                order,
+            ),
+            positive_sources=torch.cat(positive_sources).index_select(
+                0,
+                order,
+            ),
+            coefficients=torch.cat(coefficients).index_select(0, order),
+        )
     
     @staticmethod
     def epochs_until_full_coverage(n_unused: int,

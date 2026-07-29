@@ -12,6 +12,7 @@ import resolve.helpers.data_readers as data_readers
 import resolve.helpers.data_source as data_source
 import resolve.helpers.dataloader_manager as dataloader_manager_module
 import resolve.helpers.iterable_dataset as iterable_dataset_module
+import resolve.helpers.sampler as sampler_module
 from resolve.helpers.batch_requests import BatchRequest, BatchRequestSampler
 from resolve.helpers import (
     BatchCollection,
@@ -1665,6 +1666,126 @@ def test_streaming_persistent_workers_match_zero_worker_order_and_values(
     assert [worker.pid for worker in loader._iterator._workers] == worker_pids
     workers.close_loader()
     assert all(not worker.is_alive() for worker in worker_processes)
+
+
+def test_positive_sampling_reuses_precomputed_group_pools(
+    tmp_path,
+    monkeypatch,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=40)
+    for row_number, row in enumerate(rows):
+        row["signal"] = float(row_number % 10 == 0)
+    _write_hdf5(data_directory / "part_0.h5", rows[:20])
+    _write_hdf5(data_directory / "part_1.h5", rows[20:])
+    config = _make_config(data_directory, "h5", context_ratio=0.2)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "streaming"
+    dataset["positive_ratio_train"] = 0.25
+    dataset["max_positive_reuse"] = 2
+    manager = DataLoaderManager("train", config)
+    manager.set_dataset()
+    prepared = manager.dataset._positive_pools["train"]
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("epoch sampling recomputed group membership")
+
+    monkeypatch.setattr(
+        manager.dataset.sampler,
+        "prepare_positive_pools",
+        fail_if_called,
+    )
+    monkeypatch.setattr(sampler_module.torch, "isin", fail_if_called)
+
+    epoch_two = _index_plan(manager, 2)
+    epoch_three = _index_plan(manager, 3)
+
+    assert manager.dataset._positive_pools["train"] is prepared
+    assert epoch_two != epoch_three
+
+
+@pytest.mark.parametrize("normalization", (None, "zscore", "minmax"))
+def test_batch_local_mixup_matches_memory_and_streaming_backends(
+    tmp_path,
+    normalization,
+):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=40)
+    _write_hdf5(data_directory / "part_0.h5", rows[:20])
+    _write_hdf5(data_directory / "part_1.h5", rows[20:])
+    base = _make_config(data_directory, "h5", context_ratio=0.25)
+    dataset = base["model_settings"]["train"]["dataset"]
+    dataset["shuffle_dataset"] = "global"
+    dataset["mixup_ratio"] = 0.5
+    dataset["mixup_margin"] = 0.05
+    dataset["use_beta"] = [0.4, 0.8]
+    dataset["use_feature_normalization"] = normalization
+    dataset["stream_chunk_rows"] = 7
+
+    memory_config = copy.deepcopy(base)
+    memory_config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "memory"
+    streaming_config = copy.deepcopy(base)
+    streaming_config["model_settings"]["train"]["dataset"][
+        "storage_mode"
+    ] = "streaming"
+    memory = DataLoaderManager("train", memory_config)
+    streaming = DataLoaderManager("train", streaming_config)
+
+    memory_batches = _collect_batches(memory, 4, "train")
+    streaming_batches = _collect_batches(streaming, 4, "train")
+
+    _assert_batch_sequences_equal(memory_batches, streaming_batches)
+    plan = memory.dataset.mixup_plan
+    assert plan.destinations.numel() == 20
+    assert torch.equal(
+        plan.destinations,
+        torch.sort(plan.destinations).values,
+    )
+    file_indices = memory.dataset.data["data"]["file_indices"]
+    torch.testing.assert_close(
+        file_indices.index_select(0, plan.destinations),
+        file_indices.index_select(0, plan.negative_sources),
+    )
+    torch.testing.assert_close(
+        file_indices.index_select(0, plan.destinations),
+        file_indices.index_select(0, plan.positive_sources),
+    )
+
+
+def test_mixup_plan_is_deterministic_and_does_not_rewrite_base_store(tmp_path):
+    data_directory = tmp_path / "h5"
+    data_directory.mkdir()
+    rows = _make_rows(0, count=20)
+    _write_hdf5(data_directory / "part_0.h5", rows)
+    config = _make_config(data_directory, "h5", context_ratio=0.0)
+    dataset = config["model_settings"]["train"]["dataset"]
+    dataset["storage_mode"] = "memory"
+    dataset["shuffle_dataset"] = False
+    dataset["mixup_ratio"] = 0.5
+    manager = DataLoaderManager("train", config)
+    manager.set_dataset()
+    plan = manager.dataset.mixup_plan
+    base_theta = manager.dataset.store.materialize()[0].clone()
+
+    first = _collect_batches(manager, 0, "train")
+    second = _collect_batches(manager, 0, "train")
+
+    _assert_batch_sequences_equal(first, second)
+    torch.testing.assert_close(
+        manager.dataset.store.materialize()[0],
+        base_theta,
+    )
+    mixed_theta = torch.cat(
+        [batch["query_theta"].squeeze(0) for batch in first]
+    )
+    assert not torch.equal(
+        mixed_theta.index_select(0, plan.destinations),
+        base_theta.index_select(0, plan.destinations),
+    )
 
 
 @pytest.mark.parametrize("injection", ("constructor", "set_dataset"))

@@ -762,9 +762,11 @@ def estimate_in_memory_peak_bytes(
         else 0
     )
     mixup_bytes = (
-        rows
-        * (feature_columns + target_columns)
-        * torch.float32.itemsize
+        int(rows * settings.mixup_ratio)
+        * (
+            3 * torch.int64.itemsize
+            + torch.float32.itemsize
+        )
         if settings.mixup_ratio > 0.0
         else 0
     )

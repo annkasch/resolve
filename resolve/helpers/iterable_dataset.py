@@ -16,7 +16,7 @@ from resolve.helpers.data_store import (
     StreamingMaterializationError,
 )
 from resolve.helpers.normalizer import Normalizer
-from resolve.helpers.sampler import Sampler
+from resolve.helpers.sampler import MixupPlan, Sampler
 from resolve.helpers.splitter import Splitter
 
 class InMemoryIterableData(Dataset):
@@ -52,6 +52,8 @@ class InMemoryIterableData(Dataset):
         self._normalizer = self._prepare_normalizer(normalizer)
         self.sampler = Sampler(positive_condition, shuffle=self.shuffle, seed=self.seed)
         self._base_indices = {}
+        self._positive_pools = {}
+        self.mixup_plan = MixupPlan.empty()
         self._built_epochs = {}
         self._batch_plan_build_count = torch.tensor(
             0,
@@ -371,23 +373,34 @@ class InMemoryIterableData(Dataset):
                 }
             )
 
-            # Apply mixup to training data only.
             if self.dataset_config.mixup_ratio > 0.0:
-                if self.store.backend != "memory":
-                    raise ValueError(
-                        "Streaming mixup is applied through batch-local plans "
-                        "and is not available in this implementation stage."
-                    )
-                theta[idx], phi[idx], y[idx], fidx[idx] = self.sampler.mix_by_file_chunks(
-                            theta[idx], phi[idx], y[idx], fidx[idx], self.dataset_config.mixup_ratio,
-                            use_beta=self.dataset_config.use_beta,
-                            margin=self.dataset_config.mixup_margin,
-                            seed=self.seed,
+                self.mixup_plan = self.sampler.build_mixup_plan(
+                    idx,
+                    fidx.index_select(0, idx),
+                    y.index_select(0, idx),
+                    self.dataset_config.mixup_ratio,
+                    use_beta=self.dataset_config.use_beta,
+                    margin=self.dataset_config.mixup_margin,
+                    seed=self.seed,
                 )
 
             data = {"data": data["data"]}
             for split_mode, split_idx in split_indices.items():
                 self._base_indices[split_mode] = split_idx.clone()
+                if (
+                    split_mode == "train"
+                    and isinstance(
+                        self.dataset_config.positive_ratio_train,
+                        float,
+                    )
+                ):
+                    self._positive_pools[split_mode] = (
+                        self.sampler.prepare_positive_pools(
+                            fidx.index_select(0, split_idx),
+                            y.index_select(0, split_idx),
+                            split_idx,
+                        )
+                    )
                 data[split_mode] = self._empty_mode_plan(
                     positive_ratio_data
                 )
@@ -452,15 +465,14 @@ class InMemoryIterableData(Dataset):
         ):
             return indices, None
 
-        selected, _, unused, meta = self.sampler.groupaware_pos_sampling(
-            self.data["data"]["file_indices"].index_select(0, indices),
-            self.data["data"]["y"].index_select(0, indices),
-            indices,
+        selected, _, unused, meta = (
+            self.sampler.sample_prepared_positive_pools(
+            self._positive_pools[mode],
             target_pos_frac=positive_ratio,
             max_pos_reuse_per_epoch=self.dataset_config.max_positive_reuse,
             sticky_frac=0.25,
-            seed=self.seed,
             epoch=epoch,
+            )
         )
         meta["unused"] = unused
         return selected, meta
@@ -624,6 +636,17 @@ class InMemoryIterableData(Dataset):
             target,
             file_indices,
         ) = self.store.read_rows(request.indices)
+        if (
+            target is not None
+            and self.mixup_plan.destinations.numel() > 0
+        ):
+            theta, phi, target = self.mixup_plan.apply(
+                request.indices,
+                theta,
+                phi,
+                target,
+                self.store,
+            )
         context_size = request.context_size
         idx_ctx = request.indices[:context_size]
         query_start = 0 if request.context_is_subset else context_size
