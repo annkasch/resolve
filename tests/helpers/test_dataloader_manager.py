@@ -1416,6 +1416,47 @@ def test_loader_instance_is_reused_across_epochs_and_modes(tmp_path):
     assert validation
 
 
+def test_loader_rejects_plan_changes_during_active_iteration(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(
+        data_directory / "part_0.csv",
+        _make_rows(0, count=30),
+    )
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.25,
+    )
+    config["model_settings"]["train"]["dataset"]["shuffle_dataset"] = "global"
+    manager = DataLoaderManager(mode="train", config_file=config)
+    loader = manager.set_loader(epoch=0)
+    iterator = iter(loader)
+    next(iterator)
+
+    with pytest.raises(RuntimeError, match="iterator is active"):
+        manager.set_loader(epoch=1)
+
+    iterator.close()
+    assert manager.set_loader(epoch=1) is loader
+    assert list(loader)
+
+
+@pytest.mark.parametrize("epoch", (-1, 1.5, "1", True))
+def test_loader_rejects_invalid_epochs(loader_case, epoch):
+    manager, _rows = loader_case
+
+    with pytest.raises(ValueError, match="non-negative integer"):
+        manager.set_loader(epoch=epoch)
+
+
+def test_loader_rejects_non_boolean_shuffle(loader_case):
+    manager, _rows = loader_case
+
+    with pytest.raises(TypeError, match="shuffle must be a boolean"):
+        manager.set_loader(epoch=0, shuffle="yes")
+
+
 def test_shuffle_false_reuses_current_training_plan(tmp_path):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()

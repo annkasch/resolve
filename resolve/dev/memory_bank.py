@@ -57,7 +57,7 @@ class MemoryBank:
     def build_from_loader(self, dataset, dtype=torch.float32):
         assert hasattr(self, "momentum")
         assert hasattr(self, "E")
-        dataloader = dataset.set_loader("train")
+        dataloader = dataset.set_loader(0, "train")
         self.N = len(dataloader.dataset)*dataloader.dataset.batch_size_tgt
         self.E = torch.empty(self.N, self.d, dtype=torch.float32)
         

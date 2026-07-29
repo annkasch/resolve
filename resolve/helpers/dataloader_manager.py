@@ -1,10 +1,19 @@
-from torch.utils.data import DataLoader
 from resolve.helpers.data_source import preflight_data_loader
 from resolve.helpers.iterable_dataset import InMemoryIterableData
+from resolve.helpers.loader_lifecycle import (
+    ReusableDataLoader,
+    shutdown_loader,
+)
 from resolve.helpers.normalizer import Normalizer
 
 
 class DataLoaderManager:
+    """Own validated data, deterministic batch plans, and one reusable loader.
+
+    A returned loader must be fully consumed, or its iterator explicitly
+    closed, before requesting another epoch or mode from this manager.
+    """
+
     def __init__(self, mode, config_file, normalizer=None):
         self.mode = mode
         self.config_file = config_file
@@ -168,10 +177,7 @@ class DataLoaderManager:
         loader = self.dataloader
         dataset = self.dataset
         if loader is not None:
-            iterator = getattr(loader, "_iterator", None)
-            if iterator is not None:
-                iterator._shutdown_workers()
-                loader._iterator = None
+            shutdown_loader(loader)
             dataset = loader.dataset
             self.dataloader = None
 
@@ -181,6 +187,24 @@ class DataLoaderManager:
                 self.dataset = None
 
     def set_loader(self, epoch, mode=None, shuffle=True):
+        """Return the cached loader configured for one complete iteration.
+
+        Finish or close the current iterator before changing epoch or mode.
+        Evaluation plans always use epoch zero inside the dataset.
+        """
+
+        if not isinstance(epoch, int) or isinstance(epoch, bool) or epoch < 0:
+            raise ValueError("epoch must be a non-negative integer.")
+        if not isinstance(shuffle, bool):
+            raise TypeError("shuffle must be a boolean.")
+        if (
+            self.dataloader is not None
+            and self.dataloader.iteration_active
+        ):
+            raise RuntimeError(
+                "Cannot change DataLoader epoch or mode while an iterator is "
+                "active. Finish or close the current iterator first."
+            )
         if self.dataset is None:
             self.set_dataset()
 
@@ -194,7 +218,7 @@ class DataLoaderManager:
         self.dataset.build_batches(plan_epoch, mode=mode)
 
         if self.dataloader is None:
-            self.dataloader = DataLoader(
+            self.dataloader = ReusableDataLoader(
                 self.dataset,
                 **self._loader_options(),
             )
