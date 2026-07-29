@@ -1167,6 +1167,33 @@ def test_external_loader_without_normalization_initializes_automatically(tmp_pat
     )
 
 
+def test_zero_context_preserves_batch_shapes_and_index_dtypes(tmp_path):
+    data_directory = tmp_path / "test"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    manager = DataLoaderManager(
+        mode="test",
+        config_file=_make_config(
+            data_directory,
+            file_format="csv",
+            context_ratio=0.0,
+        ),
+    )
+
+    batch = next(iter(manager.set_loader(epoch=0, mode="test")))
+
+    assert batch.context.theta.shape == (1, 0, 1)
+    assert batch.context.phi.shape == (1, 0, 1)
+    assert batch.context.y.shape == (1, 0, 1)
+    assert batch.context.idx.shape == (0,)
+    assert batch.context.file_indices.shape == (1, 0)
+    assert batch.context.theta.dtype == batch.query.theta.dtype
+    assert batch.context.phi.dtype == batch.query.phi.dtype
+    assert batch.context.y.dtype == batch.target_y.dtype
+    assert batch.context.idx.dtype == batch.query.idx.dtype == torch.long
+    assert batch.context.file_indices.dtype == torch.long
+
+
 @pytest.mark.parametrize("file_format", ("csv", "h5"))
 def test_inference_loader_accepts_unlabeled_data(tmp_path, file_format):
     data_directory = tmp_path / file_format
@@ -1219,6 +1246,10 @@ def test_inference_loader_accepts_unlabeled_data(tmp_path, file_format):
     assert sorted(
         torch.cat([batch.query.idx for batch in batches]).tolist()
     ) == list(range(len(rows)))
+    theta, phi, target = manager.dataset.get_data("inference")
+    assert theta.shape == (len(rows), 1)
+    assert phi.shape == (len(rows), 1)
+    assert target is None
 
 
 def test_unlabeled_inference_rejects_positive_context_ratio(tmp_path):
@@ -1531,6 +1562,43 @@ def test_loader_rejects_plan_changes_during_active_iteration(tmp_path):
     iterator.close()
     assert manager.set_loader(epoch=1) is loader
     assert list(loader)
+
+
+def test_unavailable_mode_does_not_change_current_iteration_state(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(
+        data_directory / "part_0.csv",
+        _make_rows(0, count=20),
+    )
+    manager = DataLoaderManager(
+        mode="train",
+        config_file=_make_config(
+            data_directory,
+            file_format="csv",
+            context_ratio=0.25,
+        ),
+    )
+    loader = manager.set_loader(epoch=2, mode="train")
+    expected = [
+        batch.query.idx.tolist()
+        for batch in loader
+    ]
+    previous_mode = manager.dataset.mode
+    previous_iteration_mode = manager.dataset._iteration_mode.item()
+    previous_iteration_epoch = manager.dataset._iteration_epoch.item()
+
+    with pytest.raises(ValueError, match="has no data"):
+        manager.set_loader(epoch=3, mode="validate")
+
+    assert manager.dataset.mode == previous_mode
+    assert manager.dataset._iteration_mode.item() == previous_iteration_mode
+    assert manager.dataset._iteration_epoch.item() == previous_iteration_epoch
+    assert len(loader) == len(expected)
+    assert [
+        batch.query.idx.tolist()
+        for batch in loader
+    ] == expected
 
 
 @pytest.mark.parametrize("epoch", (-1, 1.5, "1", True))

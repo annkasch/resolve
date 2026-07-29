@@ -214,8 +214,8 @@ class DataLoaderManager:
             if shuffle
             else self.dataset._built_epochs.get(mode, 0)
         )
-        self.dataset.set_iteration(mode, plan_epoch)
         self.dataset.build_batches(plan_epoch, mode=mode)
+        self.dataset.set_iteration(mode, plan_epoch)
 
         if self.dataloader is None:
             self.dataloader = ReusableDataLoader(

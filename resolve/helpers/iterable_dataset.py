@@ -550,11 +550,15 @@ class InMemoryIterableData(IterableDataset):
                 )
                 b_file_idx_ctx = file_indices.index_select(0, idx_ctx).unsqueeze(0)
             else:
-                b_theta_ctx = torch.empty(0)
-                b_phi_ctx = torch.empty(0)
-                b_y_ctx = torch.empty(0) if y is not None else None
-                idx_ctx = torch.empty(0)
-                b_file_idx_ctx = torch.empty(0)
+                b_theta_ctx = theta.new_empty((1, 0, theta.shape[-1]))
+                b_phi_ctx = phi.new_empty((1, 0, phi.shape[-1]))
+                b_y_ctx = (
+                    y.new_empty((1, 0, y.shape[-1]))
+                    if y is not None
+                    else None
+                )
+                idx_ctx = idx_tgt.new_empty((0,))
+                b_file_idx_ctx = file_indices.new_empty((1, 0))
 
 
             batch = BatchCollection(
@@ -600,7 +604,10 @@ class InMemoryIterableData(IterableDataset):
     def num_samples(self) -> int:
         return self.data["data"]["phi"].shape[-2]
     
-    def get_data(self, key: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_data(
+        self,
+        key: str,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Get all data tensors for a given key ('train','test', 'validate')."""
         if key not in self.data.keys():
             raise ValueError(f"Invalid key: {key}. Must be one of {list(self.data.keys())}.")
@@ -618,7 +625,11 @@ class InMemoryIterableData(IterableDataset):
         phi = self.data["data"]["phi"]
         y = self.data["data"]["y"]
 
-        return theta.index_select(0, idx), phi.index_select(0, idx), y.index_select(0, idx)
+        return (
+            theta.index_select(0, idx),
+            phi.index_select(0, idx),
+            y.index_select(0, idx) if y is not None else None,
+        )
     
     def get_positives(self, key: str):
         theta, phi, y = self.get_data(key)
