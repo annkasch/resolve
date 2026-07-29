@@ -94,6 +94,7 @@ class LoaderSpecification:
 class ColumnSelection:
     name: str
     dataset_key: str | None
+    selected_labels: tuple[str, ...]
     physical_indices: tuple[int, ...]
     configured_order: tuple[int, ...]
     source_ndim: int
@@ -117,6 +118,11 @@ class ValidatedDataSource:
     @property
     def paths(self) -> tuple[Path, ...]:
         return tuple(item.path for item in self.files)
+
+    def selected_labels(self, name: str) -> tuple[str, ...]:
+        if not self.files:
+            raise ValueError("Cannot resolve labels from an empty data source.")
+        return self.files[0].selection(name).selected_labels
 
     def load(
         self,
@@ -792,6 +798,7 @@ def _selection(
     return ColumnSelection(
         name=parameter.name,
         dataset_key=dataset_key,
+        selected_labels=parameter.selected_labels,
         physical_indices=tuple(item[1] for item in sorted_pairs),
         configured_order=tuple(configured_order),
         source_ndim=source_ndim,

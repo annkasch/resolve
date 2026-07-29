@@ -105,6 +105,14 @@ class InMemoryIterableData(IterableDataset):
             )
         if canonical_method is not None:
             normalizer.validate_fitted()
+            normalizer.validate_schema(
+                "theta",
+                self.data_source.selected_labels("theta"),
+            )
+            normalizer.validate_schema(
+                "phi",
+                self.data_source.selected_labels("phi"),
+            )
         return normalizer
         
     def _set_data(self, theta: torch.Tensor, phi: torch.Tensor, y: torch.Tensor, fidx: torch.Tensor):
@@ -165,8 +173,16 @@ class InMemoryIterableData(IterableDataset):
             self._normalizer = Normalizer(
                 self.dataset_config.use_feature_normalization
             )
-            self._normalizer.fit(theta.index_select(0, idx), "theta")
-            self._normalizer.fit(phi.index_select(0, idx), "phi")
+            self._normalizer.fit(
+                theta.index_select(0, idx),
+                "theta",
+                self.data_source.selected_labels("theta"),
+            )
+            self._normalizer.fit(
+                phi.index_select(0, idx),
+                "phi",
+                self.data_source.selected_labels("phi"),
+            )
             theta = self._normalizer.transform(theta, "theta").float().contiguous()
             phi = self._normalizer.transform(phi, "phi").float().contiguous()
 

@@ -881,6 +881,81 @@ def test_external_loader_uses_fitted_training_normalizer(tmp_path, injection):
     )
 
 
+def test_external_loader_defaults_to_its_manager_mode(tmp_path):
+    data_directory = tmp_path / "test"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    manager = DataLoaderManager(
+        mode="test",
+        config_file=_make_config(
+            data_directory,
+            file_format="csv",
+            context_ratio=0.0,
+        ),
+    )
+
+    batches = list(manager.set_loader(epoch=0))
+
+    assert batches
+    assert manager.dataset.mode == "test"
+
+
+@pytest.mark.parametrize(
+    "test_theta_labels",
+    (
+        ["theta_b", "theta_a"],
+        ["theta_a"],
+    ),
+)
+def test_external_loader_rejects_mismatched_feature_schema(
+    tmp_path,
+    test_theta_labels,
+):
+    data_directory = tmp_path / "data"
+    data_directory.mkdir()
+    rows = [
+        {
+            "theta_a": float(index),
+            "theta_b": float(index + 100),
+            "phi_value": float(index + 200),
+            "signal": float(index % 2),
+        }
+        for index in range(12)
+    ]
+    _write_hdf5(
+        data_directory / "part_0.h5",
+        rows,
+        feature_labels=("theta_a", "theta_b", "phi_value"),
+    )
+    train_config = _make_config(
+        data_directory,
+        file_format="h5",
+        context_ratio=0.0,
+    )
+    train_config["simulation_settings"]["theta_labels"] = [
+        "theta_a",
+        "theta_b",
+    ]
+    train_config["model_settings"]["train"]["dataset"][
+        "use_feature_normalization"
+    ] = "zscore"
+    train_manager = DataLoaderManager(
+        mode="train",
+        config_file=train_config,
+    )
+    train_manager.set_dataset()
+
+    test_config = copy.deepcopy(train_config)
+    test_config["simulation_settings"]["theta_labels"] = test_theta_labels
+
+    with pytest.raises(ValueError, match="feature labels"):
+        DataLoaderManager(
+            mode="test",
+            config_file=test_config,
+            normalizer=train_manager.normalizer,
+        )
+
+
 @pytest.mark.parametrize("mode", ("test", "inference"))
 def test_external_loader_requires_normalizer_when_enabled(tmp_path, mode):
     data_directory = tmp_path / mode

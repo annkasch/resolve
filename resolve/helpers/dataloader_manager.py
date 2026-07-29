@@ -65,6 +65,14 @@ class DataLoaderManager:
             )
         if self._canonical_normalization_method(configured_method) is not None:
             normalizer.validate_fitted()
+            normalizer.validate_schema(
+                "theta",
+                self._data_source.selected_labels("theta"),
+            )
+            normalizer.validate_schema(
+                "phi",
+                self._data_source.selected_labels("phi"),
+            )
         self._normalizer = normalizer
 
     def set_dataset(self, normalizer=None):
@@ -136,10 +144,11 @@ class DataLoaderManager:
             if self.dataset is dataset:
                 self.dataset = None
 
-    def set_loader(self, epoch, mode="train", shuffle=True):
+    def set_loader(self, epoch, mode=None, shuffle=True):
         if self.dataset is None:
             self.set_dataset()
 
+        mode = self.mode if mode is None else mode
         plan_epoch = (
             epoch
             if shuffle
