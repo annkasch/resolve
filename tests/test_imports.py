@@ -1,3 +1,4 @@
+import ast
 import importlib
 import py_compile
 import random
@@ -73,12 +74,31 @@ def test_importing_dataloader_manager_does_not_change_global_rng_state():
 
 
 def test_training_wrapper_has_valid_python_syntax():
-    py_compile.compile(
-        str(
-            Path(__file__).parents[1]
-            / "resolve"
-            / "helpers"
-            / "training_wrapper.py"
-        ),
-        doraise=True,
+    path = (
+        Path(__file__).parents[1]
+        / "resolve"
+        / "helpers"
+        / "training_wrapper.py"
     )
+    py_compile.compile(str(path), doraise=True)
+
+
+def test_training_validation_depends_on_available_dataset_split():
+    path = (
+        Path(__file__).parents[1]
+        / "resolve"
+        / "helpers"
+        / "training_wrapper.py"
+    )
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    validation_guards = [
+        node.test
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Constant)
+        and node.test.left.value == "validate"
+        and any(isinstance(operator, ast.In) for operator in node.test.ops)
+    ]
+
+    assert validation_guards

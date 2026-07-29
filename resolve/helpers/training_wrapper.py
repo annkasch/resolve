@@ -474,7 +474,7 @@ class Trainer:
 
             
             # Early stopping / checkpointing
-            if "validate":
+            if "validate" in dataloader.dataset.data:
                 score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch)
                 improved = (score > best_score) if mode == "max" else (score < best_score)
                 loss_tolerance = 0.05  # 5% tolerance on loss for checkpointing
