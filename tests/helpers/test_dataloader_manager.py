@@ -1166,6 +1166,96 @@ def test_external_loader_without_normalization_initializes_automatically(tmp_pat
     )
 
 
+@pytest.mark.parametrize("file_format", ("csv", "h5"))
+def test_inference_loader_accepts_unlabeled_data(tmp_path, file_format):
+    data_directory = tmp_path / file_format
+    data_directory.mkdir()
+    rows = _make_rows(0)
+    if file_format == "csv":
+        path = data_directory / "part_0.csv"
+        with path.open("w", newline="") as output:
+            writer = csv.DictWriter(output, fieldnames=FEATURE_LABELS)
+            writer.writeheader()
+            writer.writerows(
+                {
+                    label: row[label]
+                    for label in FEATURE_LABELS
+                }
+                for row in rows
+            )
+    else:
+        path = data_directory / "part_0.h5"
+        feature_values = np.asarray(
+            [[row[label] for label in FEATURE_LABELS] for row in rows],
+            dtype=np.float32,
+        )
+        with h5py.File(path, "w") as output:
+            features = output.create_group("features").create_dataset(
+                "values",
+                data=feature_values,
+            )
+            features.attrs["labels"] = np.asarray(
+                FEATURE_LABELS,
+                dtype="S",
+            )
+
+    config = _make_config(
+        data_directory,
+        file_format=file_format,
+        context_ratio=0.0,
+    )
+    del config["simulation_settings"]["target_labels"]
+    del config["simulation_settings"]["signal_condition"]
+    manager = DataLoaderManager(mode="inference", config_file=config)
+
+    batches = list(manager.set_loader(epoch=0))
+
+    assert batches
+    assert "target" not in manager.parameters
+    assert manager.dataset.data["data"]["y"] is None
+    assert all(batch.target_y is None for batch in batches)
+    assert all(batch.context.y is None for batch in batches)
+    assert sorted(
+        torch.cat([batch.query.idx for batch in batches]).tolist()
+    ) == list(range(len(rows)))
+
+
+def test_unlabeled_inference_rejects_positive_context_ratio(tmp_path):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    path = data_directory / "part_0.csv"
+    path.write_text(
+        "theta_value,phi_value,unused\n1,2,3\n",
+        encoding="utf-8",
+    )
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.5,
+    )
+    del config["simulation_settings"]["target_labels"]
+    del config["simulation_settings"]["signal_condition"]
+
+    with pytest.raises(DataValidationError, match="must be 0"):
+        DataLoaderManager(mode="inference", config_file=config)
+
+
+@pytest.mark.parametrize("mode", ("train", "test"))
+def test_labeled_modes_still_require_target_configuration(tmp_path, mode):
+    data_directory = tmp_path / "csv"
+    data_directory.mkdir()
+    _write_csv(data_directory / "part_0.csv", _make_rows(0))
+    config = _make_config(
+        data_directory,
+        file_format="csv",
+        context_ratio=0.0,
+    )
+    del config["simulation_settings"]["target_labels"]
+
+    with pytest.raises(DataValidationError, match="target_labels"):
+        DataLoaderManager(mode=mode, config_file=config)
+
+
 def test_context_ratio_is_preserved_for_small_batches(tmp_path):
     data_directory = tmp_path / "csv"
     data_directory.mkdir()

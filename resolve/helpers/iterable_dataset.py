@@ -125,9 +125,10 @@ class InMemoryIterableData(IterableDataset):
         row_counts = {
             "theta": theta.shape[0],
             "phi": phi.shape[0],
-            "target": y.shape[0],
             "file_indices": fidx.shape[0],
         }
+        if y is not None:
+            row_counts["target"] = y.shape[0]
         issues = []
         if len(set(row_counts.values())) != 1:
             issues.append(
@@ -136,7 +137,7 @@ class InMemoryIterableData(IterableDataset):
                     f"has inconsistent row counts: {row_counts}",
                 )
             )
-        if not row_counts["target"]:
+        if not row_counts["phi"]:
             issues.append(
                 ValidationIssue(
                     "loaded data",
@@ -225,8 +226,20 @@ class InMemoryIterableData(IterableDataset):
             else self.batch_size - self.batch_size_ctx
         )
 
-        pos_mask = self.sampler.get_positive_indices(y)
-        positive_ratio_data = pos_mask.sum(dim=0)/y.shape[0]
+        if self.mode != "inference" and y is None:
+            raise DataValidationError(
+                (
+                    ValidationIssue(
+                        "loaded data.target",
+                        f"is required for {self.mode} mode",
+                    ),
+                )
+            )
+        if y is not None and self.sampler.positive_fn is not None:
+            pos_mask = self.sampler.get_positive_indices(y)
+            positive_ratio_data = pos_mask.sum(dim=0) / y.shape[0]
+        else:
+            positive_ratio_data = None
         splitter = Splitter(self.shuffle, seed=self.seed)
         idx = torch.arange(phi.shape[0])
         data = {}
@@ -512,30 +525,56 @@ class InMemoryIterableData(IterableDataset):
             return iter(())
         theta = self.data["data"]["theta"]
         phi   = self.data["data"]["phi"]
-        y     = self.data["data"]["y"]
+        y = self.data["data"]["y"]
         file_indices = self.data["data"]["file_indices"]
 
         for b in range(b_start, b_end):
             idx_tgt = self.data[mode]["target"]["batches"][b]
             b_phi_tgt = phi.index_select(0, idx_tgt).unsqueeze(0)
             b_theta_tgt = theta.index_select(0, idx_tgt).unsqueeze(0)
-            b_y_tgt     = y.index_select(0, idx_tgt).unsqueeze(0)
+            b_y_tgt = (
+                y.index_select(0, idx_tgt).unsqueeze(0)
+                if y is not None
+                else None
+            )
             b_file_idx_tgt = file_indices.index_select(0, idx_tgt).unsqueeze(0)
 
             if self.context_ratio > 0.:
                 idx_ctx = self.data[mode]["context"]["batches"][b]
                 b_phi_ctx = phi.index_select(0, idx_ctx).unsqueeze(0)
                 b_theta_ctx = theta.index_select(0, idx_ctx).unsqueeze(0)
-                b_y_ctx     = y.index_select(0, idx_ctx).unsqueeze(0)
+                b_y_ctx = (
+                    y.index_select(0, idx_ctx).unsqueeze(0)
+                    if y is not None
+                    else None
+                )
                 b_file_idx_ctx = file_indices.index_select(0, idx_ctx).unsqueeze(0)
             else:
-                b_theta_ctx, b_phi_ctx, b_y_ctx, idx_ctx, b_file_idx_ctx = torch.empty(0), torch.empty(0), torch.empty(0),torch.empty(0), torch.empty(0) 
+                b_theta_ctx = torch.empty(0)
+                b_phi_ctx = torch.empty(0)
+                b_y_ctx = torch.empty(0) if y is not None else None
+                idx_ctx = torch.empty(0)
+                b_file_idx_ctx = torch.empty(0)
 
 
             batch = BatchCollection(
-                context=ContextSet(theta=b_theta_ctx.contiguous(), phi=b_phi_ctx.contiguous(), y=b_y_ctx.contiguous(), idx=idx_ctx, file_indices=b_file_idx_ctx),
+                context=ContextSet(
+                    theta=b_theta_ctx.contiguous(),
+                    phi=b_phi_ctx.contiguous(),
+                    y=(
+                        b_y_ctx.contiguous()
+                        if b_y_ctx is not None
+                        else None
+                    ),
+                    idx=idx_ctx,
+                    file_indices=b_file_idx_ctx,
+                ),
                 query=QuerySet(theta=b_theta_tgt.contiguous(), phi=b_phi_tgt.contiguous(), idx=idx_tgt, file_indices=b_file_idx_tgt),
-                target_y=b_y_tgt.contiguous(),
+                target_y=(
+                    b_y_tgt.contiguous()
+                    if b_y_tgt is not None
+                    else None
+                ),
             )
             yield batch
 
@@ -583,12 +622,16 @@ class InMemoryIterableData(IterableDataset):
     
     def get_positives(self, key: str):
         theta, phi, y = self.get_data(key)
+        if y is None:
+            raise ValueError("Positive samples require target labels.")
         pos_mask = self.sampler.get_positive_indices(y)
         pos_idx = pos_mask.nonzero(as_tuple=False).view(-1)
         return theta.index_select(0, pos_idx), phi.index_select(0, pos_idx), y.index_select(0, pos_idx)
     
     def get_negatives(self, key: str):
         theta, phi, y = self.get_data(key)
+        if y is None:
+            raise ValueError("Negative samples require target labels.")
         pos_mask = self.sampler.get_positive_indices(y)
         neg_idx = (~pos_mask).nonzero(as_tuple=False).view(-1)
         return theta.index_select(0, neg_idx), phi.index_select(0, neg_idx), y.index_select(0, neg_idx)

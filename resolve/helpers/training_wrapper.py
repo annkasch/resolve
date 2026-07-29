@@ -283,6 +283,7 @@ class Trainer:
 
         # Keep these only if you need eval metrics; otherwise skip
         y_true_all, y_pred_all, y_score_all, sigma_all = [], [], [], []
+        batches_seen = 0
         accum_steps = math.ceil(500./loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]) if train==True else 1.
 
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
@@ -300,17 +301,29 @@ class Trainer:
                 query_x = torch.cat([query.theta, query.phi], dim=2)
                 query_x = _to_dev(query_x, self.device, non_blocking=(self.device.type == "cuda"))
 
-                # Keep loss numerically stable: do loss in fp32 if needed
-                # fp32 is safer with custom losses
-                if logit[0].dtype != torch.float32:
-                    logit32 = [x.float() for x in logit]
-                    targets32 = targets.float()
-                    qx32 = query_x.float()
+                if targets is None:
+                    if train:
+                        raise ValueError("Training batches require target labels.")
+                    loss = torch.as_tensor(
+                        kl_term + add_loss,
+                        device=self.device,
+                        dtype=torch.float32,
+                    )
                 else:
-                    logit32, targets32, qx32 = logit, targets, query_x
+                    # Keep loss numerically stable: do loss in fp32 if needed.
+                    if logit[0].dtype != torch.float32:
+                        logit32 = [x.float() for x in logit]
+                        targets32 = targets.float()
+                        qx32 = query_x.float()
+                    else:
+                        logit32, targets32, qx32 = logit, targets, query_x
 
-                loss1 = self.criterion(logit32, targets32, targets_x=qx32)
-                loss = loss1 + kl_term + add_loss
+                    loss1 = self.criterion(
+                        logit32,
+                        targets32,
+                        targets_x=qx32,
+                    )
+                    loss = loss1 + kl_term + add_loss
 
             # backward only in training
             if train and self.criterion.base_loss_fn is not skip_loss:
@@ -331,6 +344,7 @@ class Trainer:
             #    self.model.memory_bank.ema_update()
 
             running_loss += float(loss.detach().cpu())
+            batches_seen += 1
 
             # === compute prediction tensor ===
             gauss = output.get("Norm", None)
@@ -372,13 +386,14 @@ class Trainer:
                 )
 
             # If you still want metric arrays, keep these; otherwise remove to save RAM
-            y_true_all.append(targets.reshape(-1).detach().cpu())
+            if targets is not None:
+                y_true_all.append(targets.reshape(-1).detach().cpu())
             y_pred_all.append(pred_t.detach().cpu())
             y_score_all.append(score.detach().reshape(-1).cpu())
             if sigma_t is not None:
                 sigma_all.append(sigma_t.detach().cpu())
 
-            pbar.set_postfix(loss=f"{running_loss/len(y_true_all):.4f}")
+            pbar.set_postfix(loss=f"{running_loss/batches_seen:.4f}")
 
         # return metrics as before (or simplify for inference)
         y_true = torch.cat(y_true_all).float().cpu().numpy() if y_true_all else np.array([])
@@ -638,7 +653,9 @@ class Trainer:
         n_total = dataloader.dataset.num_samples()        # total samples across all files
 
         # Infer d_theta/d_phi from one batch (or store them in dataset config)
-        batch0 = next(iter(dataloader))
+        preview = iter(dataloader)
+        batch0 = next(preview)
+        preview.close()
         _, query0, _ = batch0
         d_theta = query0.theta.shape[-1]
         d_phi   = query0.phi.shape[-1]
@@ -651,6 +668,7 @@ class Trainer:
             chunks=200_000,
             compressor=compressor,
             trainer=self,
+            include_target=dataloader.dataset.data["data"]["y"] is not None,
         )
 
         with torch.inference_mode():
@@ -690,7 +708,11 @@ class Trainer:
             
             self.dataset.config_file["model_settings"]["train"]["dataset"]["positive_ratio_train"]=ratio
             self.dataset.set_dataset()
-            print(f"----- Initializing warm-up phase — positives set to {self.dataset.dataset.data["train"]["meta"]["pos_frac"]:.2f} of the batch.----")
+            print(
+                "----- Initializing warm-up phase — positives set to "
+                f"{self.dataset.dataset.data['train']['meta']['pos_frac']:.2f} "
+                "of the batch.----"
+            )
             self.fit(optimizer=optimizer, patience = patience, writer=writer, ckpt_dir=ckpt_dir, ckpt_name=ckpt_name,
             monitor=monitor, mode=mode)
             counter += self.nepochs
@@ -729,6 +751,7 @@ class ZarrPredWriter:
         dtype_x="f4",
         buffer_rows: int | None = None,  # default: 2 * chunk rows
         trainer: Trainer | None = None,
+        include_target: bool = True,
     ):
         if compressor == "none":
             comp = None
@@ -747,8 +770,18 @@ class ZarrPredWriter:
         self.trainer = trainer
 
 
-        self.target = root.create_dataset("target", shape=(n_total,), chunks=(c0,), dtype=dtype_pred,
-                                        compressor=comp, overwrite=True)
+        self.target = (
+            root.create_dataset(
+                "target",
+                shape=(n_total,),
+                chunks=(c0,),
+                dtype=dtype_pred,
+                compressor=comp,
+                overwrite=True,
+            )
+            if include_target
+            else None
+        )
 
         self.pred = root.create_dataset("pred", shape=(n_total,), chunks=(c0,), dtype=dtype_pred,
                                         compressor=comp, overwrite=True)
@@ -775,7 +808,11 @@ class ZarrPredWriter:
         self._buf_n = 0
         self._b_row = np.empty(self._buf_cap, dtype=np.int64)
         self._b_pred = np.empty(self._buf_cap, dtype=self.pred.dtype)
-        self._b_tgt = np.empty(self._buf_cap, dtype=self.pred.dtype)
+        self._b_tgt = (
+            np.empty(self._buf_cap, dtype=self.pred.dtype)
+            if include_target
+            else None
+        )
         self._b_theta = np.empty((self._buf_cap, d_theta), dtype=self.theta.dtype)
         self._b_phi   = np.empty((self._buf_cap, d_phi),   dtype=self.phi.dtype)
         self._b_fid = np.empty(self._buf_cap, dtype=np.int32)
@@ -816,7 +853,10 @@ class ZarrPredWriter:
             
             self._b_pred[j:j+take] = pred[i:i+take]
             self._b_sig[j:j+take] = sigma[i:i+take] if sigma is not None else None
-            self._b_tgt[j:j+take] = target[i:i+take] if target is not None else None
+            if self._b_tgt is not None:
+                self._b_tgt[j:j+take] = (
+                    target[i:i+take] if target is not None else np.nan
+                )
 
             self._buf_n += take
             i += take
@@ -890,17 +930,34 @@ class ZarrPredWriter:
                 labels = self.trainer.dataset.parameters["theta"]["selected_labels"]+self.trainer.dataset.parameters["phi"]["selected_labels"]
                 dx.attrs["labels"] = np.array(labels, dtype="S")
 
+            prediction_count = (
+                pred.shape[1]
+                if np.asarray(pred).ndim > 1
+                else 1
+            )
+            target_parameter = (
+                self.trainer.dataset.parameters.get("target")
+                if self.trainer is not None
+                else None
+            )
+            labels = (
+                target_parameter["selected_labels"]
+                if target_parameter is not None
+                else [
+                    f"prediction_{index}"
+                    for index in range(prediction_count)
+                ]
+            )
+
             glabels = f.create_group("prediction")
             dpred = glabels.create_dataset("values", data=pred, chunks=(min(chunk_rows, n),),compression=compression)
             if sigma is not None:
                 dsigma = glabels.create_dataset("sigma", data=sigma, chunks=(min(chunk_rows, n),),compression=compression)
             if tgt is not None:
                 dsim = f.create_group("labels").create_dataset("values", data=tgt, chunks=(min(chunk_rows, n),),compression=compression)
-            if self.trainer is not None:
-                labels = self.trainer.dataset.parameters["target"]["selected_labels"]
-                dpred.attrs["labels"] = np.array(labels, dtype="S")
-                if tgt is not None:
-                    dsim.attrs["labels"] = np.array(labels, dtype="S")
+            dpred.attrs["labels"] = np.array(labels, dtype="S")
+            if tgt is not None:
+                dsim.attrs["labels"] = np.array(labels, dtype="S")
 
             
             pred = np.asarray(pred)
@@ -927,14 +984,19 @@ class ZarrPredWriter:
                 counts = (rate_pred * N).astype(int)
                 rate_pred_var = counts / (N**2)
 
-            rate_sim = tgt.mean(axis=0)                # shape (dy,)
-            rate_sim_var = (rate_sim * N).astype(int) / (N**2)   # same semantics as your int(sum)/N^2
+            if tgt is not None:
+                rate_sim = tgt.mean(axis=0)
+                rate_sim_var = (rate_sim * N).astype(int) / (N**2)
             
             # Get label strings (decode bytes if needed)
-            if self.trainer is not None:
-                labels = [x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x) for x in dpred.attrs["labels"]]
-            else:
-                labels = [str(i) for i in range(dy)]
+            labels = [
+                (
+                    value.decode("utf-8")
+                    if isinstance(value, (bytes, np.bytes_))
+                    else str(value)
+                )
+                for value in dpred.attrs["labels"]
+            ]
 
             # Write attributes
 
@@ -981,7 +1043,7 @@ class ZarrPredWriter:
         pbar = tqdm(files, total=len(files), leave=True, disable=in_slurm)
         for fidx, path in enumerate(pbar):
             path = Path(path)
-            filename = f"{self.store_path}/{Path(path.stem + "_out.h5")}"
+            filename = f"{self.store_path}/{Path(path.stem + '_out.h5')}"
 
             out = []
             mask = (file_id[:] == fidx)

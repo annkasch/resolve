@@ -1,6 +1,8 @@
 import importlib
+import py_compile
 import random
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -68,3 +70,15 @@ def test_importing_dataloader_manager_does_not_change_global_rng_state():
     torch.testing.assert_close(actual[2], expected[2])
     assert torch.backends.cudnn.deterministic == deterministic
     assert torch.backends.cudnn.benchmark == benchmark
+
+
+def test_training_wrapper_has_valid_python_syntax():
+    py_compile.compile(
+        str(
+            Path(__file__).parents[1]
+            / "resolve"
+            / "helpers"
+            / "training_wrapper.py"
+        ),
+        doraise=True,
+    )

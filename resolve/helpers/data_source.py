@@ -124,9 +124,21 @@ class ValidatedDataSource:
             raise ValueError("Cannot resolve labels from an empty data source.")
         return self.files[0].selection(name).selected_labels
 
+    @property
+    def has_targets(self) -> bool:
+        return bool(self.files and any(
+            selection.name == "target"
+            for selection in self.files[0].columns
+        ))
+
     def load(
         self,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor,
+    ]:
         theta_parts = []
         phi_parts = []
         target_parts = []
@@ -140,12 +152,17 @@ class ValidatedDataSource:
 
             theta = _as_float_tensor(arrays["theta"])
             phi = _as_float_tensor(arrays["phi"])
-            target = _as_float_tensor(arrays["target"])
+            target = (
+                _as_float_tensor(arrays["target"])
+                if "target" in arrays
+                else None
+            )
             row_counts = {
                 "theta": theta.shape[0],
                 "phi": phi.shape[0],
-                "target": target.shape[0],
             }
+            if target is not None:
+                row_counts["target"] = target.shape[0]
             if len(set(row_counts.values())) != 1:
                 raise ValueError(
                     f"Inconsistent row counts while loading "
@@ -154,7 +171,8 @@ class ValidatedDataSource:
 
             theta_parts.append(theta)
             phi_parts.append(phi)
-            target_parts.append(target)
+            if target is not None:
+                target_parts.append(target)
             file_indices.append(
                 torch.full(
                     (phi.shape[0],),
@@ -166,7 +184,11 @@ class ValidatedDataSource:
         return (
             torch.cat(theta_parts, dim=0).contiguous(),
             torch.cat(phi_parts, dim=0).contiguous(),
-            torch.cat(target_parts, dim=0).contiguous(),
+            (
+                torch.cat(target_parts, dim=0).contiguous()
+                if target_parts
+                else None
+            ),
             torch.cat(file_indices, dim=0).contiguous(),
         )
 
@@ -410,9 +432,8 @@ def _validate_configuration(
     for name, dataset_key in (
         ("phi", "features/values"),
         ("theta", "features/values"),
-        ("target", "labels/values"),
     ):
-        config_key = f"{name}_labels" if name != "target" else "target_labels"
+        config_key = f"{name}_labels"
         selected = _labels(
             _required(
                 simulation,
@@ -428,14 +449,60 @@ def _validate_configuration(
                 ParameterSpec(name, dataset_key, selected)
             )
 
-    raw_conditions = _required(
-        simulation,
-        "signal_condition",
-        "simulation_settings",
-        issues,
+    target_value = (
+        simulation.get("target_labels")
+        if mode == "inference" and simulation is not None
+        else _required(
+            simulation,
+            "target_labels",
+            "simulation_settings",
+            issues,
+        )
     )
-    positive_condition = None
-    if not isinstance(raw_conditions, (list, tuple)):
+    target_labels = None
+    if mode == "inference" and target_value in (None, []):
+        target_labels = None
+    else:
+        target_labels = _labels(
+            target_value,
+            "simulation_settings.target_labels",
+            issues,
+        )
+    if target_labels is not None:
+        parameter_specs.append(
+            ParameterSpec("target", "labels/values", target_labels)
+        )
+
+    target_spec = next(
+        (
+            item
+            for item in parameter_specs
+            if item.name == "target"
+        ),
+        None,
+    )
+    raw_conditions = (
+        simulation.get("signal_condition")
+        if mode == "inference" and simulation is not None
+        else _required(
+            simulation,
+            "signal_condition",
+            "simulation_settings",
+            issues,
+        )
+    )
+    positive_condition = ()
+    if target_spec is None:
+        if raw_conditions not in (None, [], ()):
+            issues.append(
+                ValidationIssue(
+                    "simulation_settings.signal_condition",
+                    "must be omitted when inference targets are omitted",
+                )
+            )
+    elif mode == "inference" and raw_conditions in (None, [], ()):
+        positive_condition = ()
+    elif not isinstance(raw_conditions, (list, tuple)):
         issues.append(
             ValidationIssue(
                 "simulation_settings.signal_condition",
@@ -457,14 +524,6 @@ def _validate_configuration(
                     "entries must look like '== 1', '< 0.5', or '>= 1e-3'",
                 )
             )
-        target_spec = next(
-            (
-                item
-                for item in parameter_specs
-                if item.name == "target"
-            ),
-            None,
-        )
         if (
             target_spec is not None
             and len(positive_condition) != len(target_spec.selected_labels)
@@ -550,6 +609,18 @@ def _validate_configuration(
         "model_settings.train.dataset.context_is_subset",
         issues,
     )
+    if (
+        mode == "inference"
+        and target_spec is None
+        and context_ratio is not None
+        and context_ratio > 0.0
+    ):
+        issues.append(
+            ValidationIssue(
+                "model_settings.train.dataset.context_ratio",
+                "must be 0 for inference data without target labels",
+            )
+        )
     mixup_ratio = _number(
         dataset.get("mixup_ratio", 0.0) if dataset is not None else None,
         "model_settings.train.dataset.mixup_ratio",
@@ -686,7 +757,7 @@ def _validate_configuration(
         mode_is_valid,
         data_directory is not None,
         file_format in _SUPPORTED_FORMATS,
-        len(parameter_specs) == 3,
+        len(parameter_specs) == (2 if mode == "inference" and target_spec is None else 3),
         positive_condition is not None,
         batch_size is not None,
         seed is not None,
