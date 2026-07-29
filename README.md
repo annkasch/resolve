@@ -113,10 +113,37 @@ After training, you'll find the following files in your output directory:
 
 ### Memory Management
 
-The training process includes automatic memory management:
-- Dataset cleanup after training
-- CUDA cache clearing (if using GPU)
-- Garbage collection for unused objects
+The dataloader supports interchangeable in-memory and streaming storage:
+
+```yaml
+model_settings:
+  train:
+    dataset:
+      storage_mode: auto          # auto, memory, streaming
+      memory_budget_bytes: null   # optional absolute override
+      memory_budget_fraction: 0.25
+      stream_chunk_rows: 65536
+      cache_directory: null
+```
+
+`auto` estimates initialization peak memory before allocating tensors. It uses
+the in-memory backend when the estimate fits the configured budget and streams
+larger datasets directly from HDF5. CSV streaming creates a reusable,
+manifest-keyed HDF5 cache under `path_out_model/.resolve-cache` (or
+`~/.cache/resolve` when no model output path is configured).
+
+Both backends preserve the same deterministic row-level shuffle, split,
+normalization, context/query, positive-sampling, and mixup behavior. HDF5
+schemas may arrange columns differently in each file; configured label order
+is restored when reading.
+
+`shuffle_dataset: batch_wise` and full-tensor models such as the GNN and
+normalizing-flow classifier require `storage_mode: memory`. Other models can
+use automatic selection. Keep `dataloader_number_of_workers: 0` as the default
+unless the benchmark on the target model and hardware shows a benefit.
+
+The training process also cleans up dataset resources, HDF5 worker handles,
+CUDA cache state, and persistent workers through the manager lifecycle.
 
 ### Troubleshooting
 

@@ -1,0 +1,509 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-29T21:29:19.865918+00:00",
+  "platform": {
+    "system": "Darwin",
+    "release": "24.6.0",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.11.13",
+    "torch": "2.9.0",
+    "numpy": "1.26.4",
+    "cpu_count": 10,
+    "cuda_available": false
+  },
+  "settings": {
+    "rows": 250000,
+    "large_rows": 5000000,
+    "features": 14,
+    "batch_size": 1000,
+    "warmups": 2,
+    "epochs": 7,
+    "consumer_delay_ms": 5.0,
+    "seed": 42
+  },
+  "acceptance": {
+    "memory_fast_path_batches_per_second": 18498.078833908065,
+    "historical_baseline_batches_per_second": 17946.0,
+    "memory_fast_path_regression_percent": -3.076333633723752,
+    "within_five_percent_fast_path_regression": true
+  },
+  "results": [
+    {
+      "scenario": {
+        "name": "memory-hdf5",
+        "rows": 250000,
+        "source_format": "h5",
+        "storage_mode": "memory",
+        "shuffle": false,
+        "compressed": false,
+        "normalization": null,
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": null,
+        "warmups_override": null,
+        "epochs_override": null
+      },
+      "measurement": {
+        "backend": "memory",
+        "estimated_peak_mb": 27.52716064453125,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 0.19873399997595698,
+        "preparation_cpu_seconds": 0.058251000000000275,
+        "baseline_rss_mb": 314.875,
+        "parent_peak_rss_mb": 385.84375,
+        "baseline_adjusted_peak_rss_mb": 70.96875,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": null,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.0006949999951757491,
+            "epoch_seconds": [
+              0.013514916994608939,
+              0.013464083021972328,
+              0.01476699998602271,
+              0.013518417021259665,
+              0.013439707981888205,
+              0.01368179201381281,
+              0.013325790991075337
+            ],
+            "median_epoch_seconds": 0.013514916994608939,
+            "median_batches_per_second": 18498.078833908065,
+            "median_cpu_seconds": 0.013514999999999944,
+            "batches_per_epoch": 250
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.0027289160061627626,
+            "epoch_seconds": [
+              1.8963295830180869,
+              1.8898072090232745,
+              1.8661245830007829,
+              1.8983517920132726,
+              1.874926999968011,
+              1.888410333020147,
+              1.8768501250306144
+            ],
+            "median_epoch_seconds": 1.888410333020147,
+            "median_batches_per_second": 132.38648170293231,
+            "median_cpu_seconds": 0.10451299999999986,
+            "batches_per_epoch": 250
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-hdf5",
+        "rows": 250000,
+        "source_format": "h5",
+        "storage_mode": "streaming",
+        "shuffle": false,
+        "compressed": false,
+        "normalization": null,
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": null,
+        "warmups_override": null,
+        "epochs_override": null
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 27.52716064453125,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 0.27842845796840265,
+        "preparation_cpu_seconds": 0.17890300000000003,
+        "baseline_rss_mb": 314.359375,
+        "parent_peak_rss_mb": 404.09375,
+        "baseline_adjusted_peak_rss_mb": 89.734375,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.001552124973386526,
+            "epoch_seconds": [
+              0.17392916599055752,
+              0.17254800000227988,
+              0.171042166010011,
+              0.17048975004581735,
+              0.1725768749602139,
+              0.1710369159700349,
+              0.17019779101246968
+            ],
+            "median_epoch_seconds": 0.171042166010011,
+            "median_batches_per_second": 1461.6278887942033,
+            "median_cpu_seconds": 0.17251300000000036,
+            "batches_per_epoch": 250
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.0067577920272015035,
+            "epoch_seconds": [
+              2.675154874974396,
+              2.7028669999563135,
+              2.7255379580310546,
+              2.7241204169695266,
+              2.730563583027106,
+              2.7163045829511248,
+              2.7181602909695357
+            ],
+            "median_epoch_seconds": 2.7181602909695357,
+            "median_batches_per_second": 91.97397255436616,
+            "median_cpu_seconds": 0.9518979999999999,
+            "batches_per_epoch": 250
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-hdf5-workers",
+        "rows": 250000,
+        "source_format": "h5",
+        "storage_mode": "streaming",
+        "shuffle": "global",
+        "compressed": false,
+        "normalization": null,
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 2,
+        "persistent_workers": true,
+        "pin_cuda_transfer": false,
+        "cache_state": null,
+        "warmups_override": null,
+        "epochs_override": null
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 27.52716064453125,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 0.2786289579817094,
+        "preparation_cpu_seconds": 0.18206699999999998,
+        "baseline_rss_mb": 315.15625,
+        "parent_peak_rss_mb": 395.828125,
+        "baseline_adjusted_peak_rss_mb": 80.671875,
+        "child_peak_rss_mb": 334.328125,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.023543457966297865,
+            "epoch_seconds": [
+              2.5709827080136165,
+              2.545454124978278,
+              2.5445107080158778,
+              2.621421082993038,
+              2.7543925829813816,
+              2.640306083019823,
+              2.5228618329856545
+            ],
+            "median_epoch_seconds": 2.5709827080136165,
+            "median_batches_per_second": 97.23908263589766,
+            "median_cpu_seconds": 0.07686700000000002,
+            "batches_per_epoch": 250
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.022501375002320856,
+            "epoch_seconds": [
+              2.57854854199104,
+              2.4034920830163173,
+              2.39668000000529,
+              2.393994999991264,
+              2.3999000000185333,
+              2.3959507499821484,
+              2.3877680840087123
+            ],
+            "median_epoch_seconds": 2.39668000000529,
+            "median_batches_per_second": 104.31096349927742,
+            "median_cpu_seconds": 0.07253499999999935,
+            "batches_per_epoch": 250
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-hdf5-compressed",
+        "rows": 250000,
+        "source_format": "h5",
+        "storage_mode": "streaming",
+        "shuffle": "global",
+        "compressed": true,
+        "normalization": null,
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": null,
+        "warmups_override": 0,
+        "epochs_override": 1
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 27.52716064453125,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 0.4637752079870552,
+        "preparation_cpu_seconds": 0.3677400000000004,
+        "baseline_rss_mb": 315.59375,
+        "parent_peak_rss_mb": 427.875,
+        "baseline_adjusted_peak_rss_mb": 112.28125,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.11392516596242785,
+            "epoch_seconds": [
+              28.56750970799476
+            ],
+            "median_epoch_seconds": 28.56750970799476,
+            "median_batches_per_second": 8.751200316562288,
+            "median_cpu_seconds": 28.569934,
+            "batches_per_epoch": 250
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.11342445900663733,
+            "epoch_seconds": [
+              30.414079374982975
+            ],
+            "median_epoch_seconds": 30.414079374982975,
+            "median_batches_per_second": 8.219877278469815,
+            "median_cpu_seconds": 28.543024000000003,
+            "batches_per_epoch": 250
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-csv-cold-cache",
+        "rows": 250000,
+        "source_format": "csv",
+        "storage_mode": "streaming",
+        "shuffle": "global",
+        "compressed": false,
+        "normalization": null,
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": "cold",
+        "warmups_override": 0,
+        "epochs_override": 2
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 138.18694496154785,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 1.0509850839735009,
+        "preparation_cpu_seconds": 0.9185870000000005,
+        "baseline_rss_mb": 314.40625,
+        "parent_peak_rss_mb": 420.96875,
+        "baseline_adjusted_peak_rss_mb": 106.5625,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.04017166601261124,
+            "epoch_seconds": [
+              9.067207665997557,
+              9.054124417016283
+            ],
+            "median_epoch_seconds": 9.06066604150692,
+            "median_batches_per_second": 27.59180496983216,
+            "median_cpu_seconds": 9.0614475,
+            "batches_per_epoch": 250
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.04081870900699869,
+            "epoch_seconds": [
+              11.047735917032696,
+              11.082130125025287
+            ],
+            "median_epoch_seconds": 11.064933021028992,
+            "median_batches_per_second": 22.593955463597823,
+            "median_cpu_seconds": 9.191650500000002,
+            "batches_per_epoch": 250
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-csv-hot-cache",
+        "rows": 250000,
+        "source_format": "csv",
+        "storage_mode": "streaming",
+        "shuffle": "global",
+        "compressed": false,
+        "normalization": null,
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": "hot",
+        "warmups_override": 1,
+        "epochs_override": 2
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 138.18694496154785,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 0.6729106249986216,
+        "preparation_cpu_seconds": 0.5443170000000004,
+        "baseline_rss_mb": 317.09375,
+        "parent_peak_rss_mb": 376.25,
+        "baseline_adjusted_peak_rss_mb": 59.15625,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.041220500017516315,
+            "epoch_seconds": [
+              8.892271124990657,
+              9.198877417016774
+            ],
+            "median_epoch_seconds": 9.045574271003716,
+            "median_batches_per_second": 27.645765834997885,
+            "median_cpu_seconds": 9.047035500000003,
+            "batches_per_epoch": 250
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.04087508301017806,
+            "epoch_seconds": [
+              10.859657790977508,
+              11.163323374988977
+            ],
+            "median_epoch_seconds": 11.011490582983242,
+            "median_batches_per_second": 22.707873958754824,
+            "median_cpu_seconds": 9.139352500000001,
+            "batches_per_epoch": 250
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-normalized-sampled-mixup",
+        "rows": 250000,
+        "source_format": "h5",
+        "storage_mode": "streaming",
+        "shuffle": "global",
+        "compressed": false,
+        "normalization": "zscore",
+        "positive_ratio": 0.25,
+        "mixup_ratio": 0.25,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": null,
+        "warmups_override": null,
+        "epochs_override": null
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 42.54753112792969,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 0.30970958300167695,
+        "preparation_cpu_seconds": 0.23772900000000075,
+        "baseline_rss_mb": 315.234375,
+        "parent_peak_rss_mb": 408.765625,
+        "baseline_adjusted_peak_rss_mb": 93.53125,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.035087125026620924,
+            "epoch_seconds": [
+              8.806730042037088,
+              8.809068416012451,
+              8.793012207956053,
+              8.763680916978046,
+              8.770040416973643,
+              8.770958792010788,
+              8.897541999991518
+            ],
+            "median_epoch_seconds": 8.793012207956053,
+            "median_batches_per_second": 42.76122801919795,
+            "median_cpu_seconds": 8.826007999999995,
+            "batches_per_epoch": 376
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.03508908301591873,
+            "epoch_seconds": [
+              11.716119040967897,
+              11.594344999990426,
+              11.600328166037798,
+              11.620781749952585,
+              11.689587667002343,
+              11.650652915996034,
+              11.625031208037399
+            ],
+            "median_epoch_seconds": 11.625031208037399,
+            "median_batches_per_second": 32.34399919202267,
+            "median_cpu_seconds": 8.845735000000019,
+            "batches_per_epoch": 376
+          }
+        }
+      }
+    },
+    {
+      "scenario": {
+        "name": "streaming-hdf5-5m",
+        "rows": 5000000,
+        "source_format": "h5",
+        "storage_mode": "streaming",
+        "shuffle": "global",
+        "compressed": false,
+        "normalization": "zscore",
+        "positive_ratio": null,
+        "mixup_ratio": 0.0,
+        "num_workers": 0,
+        "persistent_workers": false,
+        "pin_cuda_transfer": false,
+        "cache_state": null,
+        "warmups_override": 0,
+        "epochs_override": 1
+      },
+      "measurement": {
+        "backend": "streaming",
+        "estimated_peak_mb": 675.072021484375,
+        "memory_budget_mb": 512.0,
+        "preparation_seconds": 2.6218188329949044,
+        "preparation_cpu_seconds": 3.528530999999999,
+        "baseline_rss_mb": 315.46875,
+        "parent_peak_rss_mb": 627.421875,
+        "baseline_adjusted_peak_rss_mb": 311.953125,
+        "child_peak_rss_mb": 0.0,
+        "within_streaming_budget_plus_20_percent": true,
+        "workloads": {
+          "loader_only": {
+            "first_batch_seconds": 0.02276204200461507,
+            "epoch_seconds": [
+              102.0720820419956
+            ],
+            "median_epoch_seconds": 102.0720820419956,
+            "median_batches_per_second": 48.9849908023121,
+            "median_cpu_seconds": 102.049001,
+            "batches_per_epoch": 5000
+          },
+          "consumer_5ms": {
+            "first_batch_seconds": 0.020018542010802776,
+            "epoch_seconds": [
+              139.92828795901733
+            ],
+            "median_epoch_seconds": 139.92828795901733,
+            "median_batches_per_second": 35.732588977751355,
+            "median_cpu_seconds": 102.50585899999999,
+            "batches_per_epoch": 5000
+          }
+        }
+      }
+    }
+  ]
+}

@@ -92,6 +92,11 @@ model_settings:
       val_ratio: 0.2
       test_ratio: 0.2
       shuffle_dataset: global # batch_wise, global, false
+      storage_mode: auto # auto, memory, streaming; GNN and normalizing-flow models require memory
+      memory_budget_bytes: null # optional absolute override
+      memory_budget_fraction: 0.25 # used by auto when no byte override is set
+      stream_chunk_rows: 65536
+      cache_directory: null # CSV streaming cache; defaults below path_out_model
       mixup_ratio: 0.0 # ratio of samples to apply mixup augmentation to; if 0, no mixup is applied
       mixup_margin: 0.0
       use_beta: [0.1, 0.1] # parameters for beta distribution if mixup_ratio > 0

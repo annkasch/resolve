@@ -715,6 +715,42 @@ class InMemoryIterableData(Dataset):
 
     def __len__(self) -> int:
         return self.data[self.mode]["meta"]["num_batches"]
+
+    @property
+    def storage_mode(self):
+        return self.store.backend
+
+    @property
+    def has_targets(self):
+        return self.store.has_targets
+
+    @property
+    def available_modes(self):
+        return tuple(mode for mode in self.data if mode != "data")
+
+    def has_mode(self, mode):
+        return mode in self.data and mode != "data"
+
+    def target_batch_size(self, mode=None):
+        mode = self.mode if mode is None else mode
+        return self.data[mode]["target"]["batch_size"]
+
+    def sampling_epochs(self, mode="train"):
+        return self.data[mode]["meta"]["num_epochs"]
+
+    def positive_fraction(self, mode="train"):
+        return self.data[mode]["meta"]["pos_frac"]
+
+    def require_memory_backend(self, consumer):
+        if self.store.backend != "memory":
+            raise StreamingMaterializationError(
+                f"{consumer} requires complete dataset tensors. Configure "
+                "model_settings.train.dataset.storage_mode: memory."
+            )
+
+    def materialized_tensors(self, consumer="Full-tensor access"):
+        self.require_memory_backend(consumer)
+        return self.store.materialize()
     
     def num_samples(self) -> int:
         return self.store.num_samples

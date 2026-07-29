@@ -1381,8 +1381,19 @@ def test_streaming_store_refuses_full_materialization(tmp_path):
     manager.set_dataset()
 
     assert isinstance(manager.dataset.store, StreamingDataStore)
+    assert manager.dataset.storage_mode == "streaming"
+    assert manager.dataset.has_targets is True
+    assert manager.dataset.has_mode("train")
+    assert manager.dataset.available_modes == ("train",)
+    assert manager.dataset.target_batch_size("train") == 10
+    assert manager.dataset.sampling_epochs("train") == 1
     with pytest.raises(StreamingMaterializationError, match="complete dataset"):
         manager.dataset.store.materialize()
+    with pytest.raises(
+        StreamingMaterializationError,
+        match="ExampleFullTensorModel.*storage_mode: memory",
+    ):
+        manager.dataset.materialized_tensors("ExampleFullTensorModel")
     with pytest.raises(StreamingMaterializationError, match="get_data"):
         manager.dataset.get_data("train")
 

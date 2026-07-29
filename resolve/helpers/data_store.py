@@ -179,6 +179,18 @@ class InMemoryDataStore(DataStore):
 
     def read_rows(self, indices):
         indices = indices.to(dtype=torch.long, device="cpu")
+        row_slice = _contiguous_row_slice(indices)
+        if row_slice is not None:
+            return (
+                self._theta[row_slice],
+                self._phi[row_slice],
+                (
+                    self._target[row_slice]
+                    if self._target is not None
+                    else None
+                ),
+                self._file_indices[row_slice],
+            )
         return (
             self._theta.index_select(0, indices),
             self._phi.index_select(0, indices),
@@ -376,6 +388,21 @@ class StreamingDataStore(DataStore):
 
     def _read_cached(self, indices):
         handle = self._handle(self.cache_path)
+        row_slice = _contiguous_row_slice(indices)
+        if row_slice is not None:
+            theta = torch.from_numpy(np.asarray(handle["theta"][row_slice]))
+            phi = torch.from_numpy(np.asarray(handle["phi"][row_slice]))
+            target = (
+                torch.from_numpy(
+                    np.asarray(handle["target"][row_slice])
+                )
+                if self.has_targets
+                else None
+            )
+            file_indices = torch.from_numpy(
+                np.asarray(handle["file_indices"][row_slice])
+            )
+            return theta, phi, target, file_indices
         unique, inverse = torch.unique(
             indices,
             sorted=True,
@@ -480,6 +507,20 @@ class StreamingDataStore(DataStore):
         if not len(rows):
             return output
         buckets = rows // self.chunk_rows
+        span_rows = sum(
+            int(selected[-1] - selected[0] + 1)
+            for bucket in np.unique(buckets)
+            for selected in (rows[buckets == bucket],)
+        )
+        if span_rows > len(rows) * 4:
+            if columns is None:
+                return np.asarray(dataset[rows])
+            column_start = min(columns)
+            column_stop = max(columns) + 1
+            block = np.asarray(
+                dataset[rows, column_start:column_stop]
+            )
+            return block[:, [column - column_start for column in columns]]
         for bucket in np.unique(buckets):
             positions = np.flatnonzero(buckets == bucket)
             selected_rows = rows[positions]
@@ -729,6 +770,20 @@ def physical_memory_bytes() -> int | None:
     if page_size <= 0 or page_count <= 0:
         return None
     return page_size * page_count
+
+
+def _contiguous_row_slice(indices):
+    if indices.numel() == 0:
+        return slice(0, 0)
+    start = int(indices[0])
+    stop = start + indices.numel()
+    if int(indices[-1]) != stop - 1:
+        return None
+    if indices.numel() > 1 and not bool(
+        torch.all(indices[1:] - indices[:-1] == 1)
+    ):
+        return None
+    return slice(start, stop)
 
 
 def memory_budget_bytes(settings: DatasetSettings) -> int:

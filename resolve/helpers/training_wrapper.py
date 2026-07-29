@@ -284,7 +284,11 @@ class Trainer:
         # Keep these only if you need eval metrics; otherwise skip
         y_true_all, y_pred_all, y_score_all, sigma_all = [], [], [], []
         batches_seen = 0
-        accum_steps = math.ceil(500./loader.dataset.data[loader.dataset.mode]["target"]["batch_size"]) if train==True else 1.
+        accum_steps = (
+            math.ceil(500.0 / loader.dataset.target_batch_size())
+            if train
+            else 1
+        )
 
         pbar = tqdm(loader, total=len(loader), desc=desc, leave=True, disable=in_slurm)
 
@@ -439,7 +443,13 @@ class Trainer:
         best_model_saved = False
         no_improve = 0
 
-        num_epochs = int(self.nepochs*self.dataset.set_loader(0, "train").dataset.data["train"]["meta"]["num_epochs"])
+        training_dataset = self.dataset.set_loader(
+            0,
+            "train",
+        ).dataset
+        num_epochs = int(
+            self.nepochs * training_dataset.sampling_epochs("train")
+        )
 
         for epoch in range(self.epoch_start, self.epoch_start + num_epochs):
             # TRAIN
@@ -474,7 +484,7 @@ class Trainer:
 
             
             # Early stopping / checkpointing
-            if "validate" in dataloader.dataset.data:
+            if dataloader.dataset.has_mode("validate"):
                 score = self.evaluate(writer=writer, dataset_name="validate", monitor=monitor, epoch=epoch)
                 improved = (score > best_score) if mode == "max" else (score < best_score)
                 loss_tolerance = 0.05  # 5% tolerance on loss for checkpointing
@@ -528,7 +538,7 @@ class Trainer:
             self.criterion.to(self.device)
 
         dataloader = self.dataset.set_loader(epoch, dataset_name)
-        if dataset_name not in dataloader.dataset.data: 
+        if not dataloader.dataset.has_mode(dataset_name):
             return
         with torch.inference_mode():
             loss, y_true_v, y_pred_v, y_score_v, sigma = self._run_epoch(dataloader, optimizer=None, train=False, desc=f"{dataset_name} {epoch+1}")
@@ -668,7 +678,7 @@ class Trainer:
             chunks=200_000,
             compressor=compressor,
             trainer=self,
-            include_target=dataloader.dataset.data["data"]["y"] is not None,
+            include_target=dataloader.dataset.has_targets,
         )
 
         with torch.inference_mode():
@@ -702,7 +712,7 @@ class Trainer:
         if self.model._get_name() == 'TreeConditionedCNP' and self.model.tree._fitted == False:
                 self.model.fit(loader=dataloader)
                 self.model.tree.enable_leaf_cache(dataloader.dataset.num_samples())
-        self.dataset.dataset = None
+        self.dataset.close_loader()
         counter = 0 
         for ratio in target_pos_frac:
             
@@ -710,7 +720,7 @@ class Trainer:
             self.dataset.set_dataset()
             print(
                 "----- Initializing warm-up phase — positives set to "
-                f"{self.dataset.dataset.data['train']['meta']['pos_frac']:.2f} "
+                f"{self.dataset.dataset.positive_fraction('train'):.2f} "
                 "of the batch.----"
             )
             self.fit(optimizer=optimizer, patience = patience, writer=writer, ckpt_dir=ckpt_dir, ckpt_name=ckpt_name,
@@ -720,7 +730,7 @@ class Trainer:
             
         
         self.dataset.config_file["model_settings"]["train"]["dataset"]["positive_ratio_train"] = None
-        self.dataset.dataset = None
+        self.dataset.close_loader()
         self.epoch_start = counter
         self.nepochs = num_epochs
         print(f"----- End of warm up -----")

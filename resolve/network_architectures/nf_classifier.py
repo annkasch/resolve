@@ -52,6 +52,9 @@ class NormalizingFlowClassifier(nn.Module):
     ):
 
         loader = trainer.dataset.set_loader(0, "train")
+        loader.dataset.require_memory_backend(
+            "NormalizingFlowClassifier.fit"
+        )
         batch_size = loader.dataset.batch_size
         theta_neg, phi_neg, _ = loader.dataset.get_negatives("train")
         n_neg = phi_neg.shape[0]

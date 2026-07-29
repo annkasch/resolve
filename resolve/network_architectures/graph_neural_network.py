@@ -109,8 +109,11 @@ class GNNBinaryClassifier(nn.Module):
         k=5, metric="euclidean", add_loops=True
     ):
         if loader is not None:
-            theta = loader.dataset.data["data"]["theta"]
-            phi = loader.dataset.data["data"]["phi"]
+            theta, phi, y, _file_indices = (
+                loader.dataset.materialized_tensors(
+                    "GNNBinaryClassifier.fit"
+                )
+            )
             # Move to CPU and build feature matrix X = [theta | phi]
             if theta.device != torch.device("cpu"):
                 theta_np = theta.cpu().numpy()
@@ -123,7 +126,6 @@ class GNNBinaryClassifier(nn.Module):
                 phi_np = phi.numpy()
 
             X = np.concatenate([theta_np, phi_np], axis=-1)  # shape (N, d_theta + d_phi)
-            y = loader.dataset.data["data"]["y"]
         self.edge_index = self.build_rare_event_graph_hnsw(X, y)
 
     '''

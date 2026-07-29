@@ -95,10 +95,12 @@ def test_training_validation_depends_on_available_dataset_split():
         node.test
         for node in ast.walk(tree)
         if isinstance(node, ast.If)
-        and isinstance(node.test, ast.Compare)
-        and isinstance(node.test.left, ast.Constant)
-        and node.test.left.value == "validate"
-        and any(isinstance(operator, ast.In) for operator in node.test.ops)
+        and isinstance(node.test, ast.Call)
+        and isinstance(node.test.func, ast.Attribute)
+        and node.test.func.attr == "has_mode"
+        and len(node.test.args) == 1
+        and isinstance(node.test.args[0], ast.Constant)
+        and node.test.args[0].value == "validate"
     ]
 
     assert validation_guards
